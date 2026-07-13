@@ -1,0 +1,446 @@
+"""CDK stack for the bedrock-mantle per-user quota gateway.
+
+Resources:
+- DynamoDB: users table (limits/status per JWT subject), usage table (TTL)
+- Gateway Lambda: FastAPI behind the AWS Lambda Web Adapter, exposed via a
+  Function URL in RESPONSE_STREAM mode so SSE streaming passes through
+- JWT identity: bring your own OIDC issuer via ``-c jwt_issuer=...``
+  (optionally ``-c jwt_audience=...``), or let the stack create a demo
+  Cognito User Pool
+- Admin key in Secrets Manager
+- Reconciler Lambda on a 5-minute EventBridge schedule + SNS alert topic
+- CloudWatch dashboard over the gateway's EMF metrics
+"""
+
+import aws_cdk as cdk
+from aws_cdk import (
+    Duration,
+    RemovalPolicy,
+    Stack,
+    aws_cloudwatch as cw,
+    aws_cognito as cognito,
+    aws_dynamodb as ddb,
+    aws_events as events,
+    aws_events_targets as targets,
+    aws_iam as iam,
+    aws_lambda as lambda_,
+    aws_logs as logs,
+    aws_secretsmanager as sm,
+    aws_sns as sns,
+    aws_sns_subscriptions as subs,
+    custom_resources as cr,
+)
+from constructs import Construct
+
+METRICS_NAMESPACE = "BedrockMantleGateway"
+
+
+class QuotaGatewayStack(Stack):
+    def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
+        super().__init__(scope, construct_id, **kwargs)
+
+        alert_email = self.node.try_get_context("alert_email")
+        jwt_issuer = self.node.try_get_context("jwt_issuer")
+        jwt_audience = self.node.try_get_context("jwt_audience") or ""
+        jwt_user_claim = self.node.try_get_context("jwt_user_claim") or "sub"
+        # -c snapstart=true: resume the gateway from a Firecracker microVM
+        # snapshot instead of cold-starting (Python SnapStart). Requires
+        # publishing versions; the Function URL then targets an alias.
+        use_snapstart = str(self.node.try_get_context("snapstart")).lower() == "true"
+
+        # ------------------------------------------------------------------
+        # Identity: BYO OIDC issuer, or a demo Cognito User Pool
+        # ------------------------------------------------------------------
+        user_pool = None
+        if not jwt_issuer:
+            user_pool = cognito.UserPool(
+                self, "DemoUserPool",
+                self_sign_up_enabled=False,
+                sign_in_aliases=cognito.SignInAliases(username=True, email=True),
+                removal_policy=RemovalPolicy.DESTROY,
+            )
+            user_pool_client = user_pool.add_client(
+                "DemoAppClient",
+                auth_flows=cognito.AuthFlow(user_password=True, user_srp=True),
+                generate_secret=False,
+                id_token_validity=Duration.hours(12),
+            )
+            jwt_issuer = (
+                f"https://cognito-idp.{self.region}.amazonaws.com/{user_pool.user_pool_id}"
+            )
+            # ID tokens carry the app client id as `aud`.
+            jwt_audience = user_pool_client.user_pool_client_id
+
+        # ------------------------------------------------------------------
+        # DynamoDB
+        # ------------------------------------------------------------------
+        users_table = ddb.Table(
+            self, "UsersTable",
+            partition_key=ddb.Attribute(name="user_id", type=ddb.AttributeType.STRING),
+            billing_mode=ddb.BillingMode.PAY_PER_REQUEST,
+            removal_policy=RemovalPolicy.DESTROY,  # sample: destroy on teardown
+        )
+
+        usage_table = ddb.Table(
+            self, "UsageTable",
+            partition_key=ddb.Attribute(name="user_id", type=ddb.AttributeType.STRING),
+            sort_key=ddb.Attribute(name="window", type=ddb.AttributeType.STRING),
+            billing_mode=ddb.BillingMode.PAY_PER_REQUEST,
+            time_to_live_attribute="expires_at",
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
+        # ------------------------------------------------------------------
+        # Admin key
+        # ------------------------------------------------------------------
+        admin_secret = sm.Secret(
+            self, "AdminApiKey",
+            description="Admin key for the quota gateway /admin API",
+            generate_secret_string=sm.SecretStringGenerator(
+                exclude_punctuation=True, password_length=40,
+            ),
+        )
+
+        # ------------------------------------------------------------------
+        # Gateway Lambda (FastAPI + Lambda Web Adapter, streaming)
+        # ------------------------------------------------------------------
+        # AWS Lambda Web Adapter public layer (zip packaging). Name/version
+        # per https://github.com/awslabs/aws-lambda-web-adapter — override
+        # with -c adapter_layer_arn=... if a newer version ships.
+        adapter_layer_arn = self.node.try_get_context("adapter_layer_arn") or (
+            f"arn:aws:lambda:{self.region}:753240598075:layer:LambdaAdapterLayerX86:28"
+        )
+        adapter_layer = lambda_.LayerVersion.from_layer_version_arn(
+            self, "WebAdapterLayer", adapter_layer_arn,
+        )
+
+        gateway_fn = lambda_.Function(
+            self, "GatewayFn",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            architecture=lambda_.Architecture.X86_64,
+            memory_size=1024,
+            timeout=Duration.minutes(5),
+            handler="run.sh",
+            layers=[adapter_layer],
+            snap_start=lambda_.SnapStartConf.ON_PUBLISHED_VERSIONS if use_snapstart else None,
+            code=lambda_.Code.from_asset(
+                "../gateway",
+                bundling=cdk.BundlingOptions(
+                    image=lambda_.Runtime.PYTHON_3_12.bundling_image,
+                    command=[
+                        "bash", "-c",
+                        # Force x86_64 manylinux wheels so bundling on
+                        # arm64 hosts (Apple Silicon) can't produce
+                        # aarch64 native deps for this x86_64 function.
+                        "pip install -r requirements.txt "
+                        "--platform manylinux2014_x86_64 --implementation cp "
+                        "--python-version 3.12 --only-binary=:all: "
+                        "--target /asset-output "
+                        "&& cp -r app run.sh /asset-output/ "
+                        "&& chmod +x /asset-output/run.sh",
+                    ],
+                ),
+            ),
+            environment={
+                # Lambda Web Adapter wiring
+                "AWS_LAMBDA_EXEC_WRAPPER": "/opt/bootstrap",
+                "AWS_LWA_INVOKE_MODE": "response_stream",
+                "PORT": "8080",
+                # App config
+                "USERS_TABLE": users_table.table_name,
+                "USAGE_TABLE": usage_table.table_name,
+                "METRICS_NAMESPACE": METRICS_NAMESPACE,
+                "ADMIN_KEY_SECRET_ARN": admin_secret.secret_arn,
+                # JWT auth
+                "JWT_ISSUER": jwt_issuer,
+                "JWT_AUDIENCE": jwt_audience,
+                "JWT_USER_CLAIM": jwt_user_claim,
+            },
+        )
+
+        users_table.grant_read_write_data(gateway_fn)
+        usage_table.grant_read_write_data(gateway_fn)
+        admin_secret.grant_read(gateway_fn)
+        # Permissions to mint short-term Bedrock API keys from the role and
+        # call the bedrock-mantle endpoint. Scope the project resource down
+        # if you use dedicated mantle Projects.
+        gateway_fn.role.add_managed_policy(
+            iam.ManagedPolicy.from_aws_managed_policy_name("AmazonBedrockMantleInferenceAccess")
+        )
+
+        # ------------------------------------------------------------------
+        # Per-user vended role (the API-agnostic enforcement path)
+        #
+        # The broker assumes this role on behalf of an in-budget user, with
+        # RoleSessionName + SourceIdentity = the JWT sub. The user then calls
+        # Bedrock NATIVELY (InvokeModel / Converse / streaming, any provider)
+        # with the short-lived creds. Scoped to Bedrock invoke actions on all
+        # models in this account/region; tighten `resources` to specific
+        # model ARNs to restrict which models users may call.
+        # ------------------------------------------------------------------
+        bedrock_user_role = iam.Role(
+            self, "BedrockUserRole",
+            # Only the gateway (broker) Lambda role may assume this, and only
+            # while setting a SourceIdentity + session tag it can't forge for
+            # another user. Users never hold static Bedrock access (the
+            # deny-direct policy below enforces "must go through the broker").
+            assumed_by=iam.ArnPrincipal(gateway_fn.role.role_arn),
+            max_session_duration=Duration.hours(1),
+            description="Short-lived, per-user Bedrock access vended by the quota broker.",
+        )
+        bedrock_user_role.add_to_policy(
+            iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                actions=[
+                    "bedrock:InvokeModel",
+                    "bedrock:InvokeModelWithResponseStream",
+                    "bedrock:Converse",
+                    "bedrock:ConverseStream",
+                    # mantle (OpenAI/Anthropic-compatible) inference
+                    "bedrock-mantle:CreateInference",
+                    "bedrock-mantle:CallWithBearerToken",
+                ],
+                # All models in this account/region (sample default).
+                resources=["*"],
+            )
+        )
+        # Let the gateway role assume the vended role AND stamp the per-user
+        # identity/tag. SetSourceIdentity + TagSession must be granted on the
+        # *caller* side too, not just allowed by the trust policy.
+        gateway_fn.role.add_to_principal_policy(
+            iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                actions=["sts:AssumeRole", "sts:SetSourceIdentity", "sts:TagSession"],
+                resources=[bedrock_user_role.role_arn],
+            )
+        )
+        gateway_fn.add_environment("BEDROCK_USER_ROLE_ARN", bedrock_user_role.role_arn)
+
+        # ------------------------------------------------------------------
+        # Bedrock model-invocation logging -> CloudWatch Logs.
+        #
+        # This is the ONLY source with per-call token counts across every
+        # invoke path/provider, and each record's identity.arn carries the
+        # RoleSessionName (= sanitized JWT sub) so the reconciler can meter
+        # per user. It is an account/region-level Bedrock setting, applied
+        # here via a custom resource.
+        # ------------------------------------------------------------------
+        invocation_log_group = logs.LogGroup(
+            self, "BedrockInvocationLogs",
+            log_group_name="/bedrock/quota-gateway/model-invocations",
+            retention=logs.RetentionDays.TWO_WEEKS,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+        # Role Bedrock uses to write the invocation logs.
+        bedrock_logging_role = iam.Role(
+            self, "BedrockLoggingRole",
+            assumed_by=iam.ServicePrincipal("bedrock.amazonaws.com"),
+        )
+        invocation_log_group.grant_write(bedrock_logging_role)
+        # Enable model-invocation logging account/region-wide.
+        cr.AwsCustomResource(
+            self, "EnableBedrockInvocationLogging",
+            on_create=cr.AwsSdkCall(
+                service="Bedrock",
+                action="putModelInvocationLoggingConfiguration",
+                parameters={
+                    "loggingConfig": {
+                        "cloudWatchConfig": {
+                            "logGroupName": invocation_log_group.log_group_name,
+                            "roleArn": bedrock_logging_role.role_arn,
+                        },
+                        "textDataDeliveryEnabled": False,
+                        "imageDataDeliveryEnabled": False,
+                        "embeddingDataDeliveryEnabled": False,
+                    }
+                },
+                physical_resource_id=cr.PhysicalResourceId.of("bedrock-invocation-logging"),
+            ),
+            # Best-effort cleanup so teardown restores the prior state.
+            on_delete=cr.AwsSdkCall(
+                service="Bedrock",
+                action="deleteModelInvocationLoggingConfiguration",
+            ),
+            policy=cr.AwsCustomResourcePolicy.from_statements([
+                iam.PolicyStatement(
+                    actions=[
+                        "bedrock:PutModelInvocationLoggingConfiguration",
+                        "bedrock:DeleteModelInvocationLoggingConfiguration",
+                        "bedrock:GetModelInvocationLoggingConfiguration",
+                    ],
+                    resources=["*"],
+                ),
+                # Required so Bedrock can validate it may pass the logging role.
+                iam.PolicyStatement(actions=["iam:PassRole"],
+                                    resources=[bedrock_logging_role.role_arn]),
+            ]),
+            install_latest_aws_sdk=False,
+        )
+
+        # SnapStart only applies to published versions, so with it enabled
+        # the Function URL targets a "live" alias of the current version;
+        # otherwise it targets $LATEST directly.
+        if use_snapstart:
+            url_target = lambda_.Alias(
+                self, "GatewayLiveAlias",
+                alias_name="live",
+                version=gateway_fn.current_version,
+            )
+        else:
+            url_target = gateway_fn
+
+        # The Function URL enforces IAM (SigV4) auth: callers must be
+        # signed AWS principals, so the URL is not anonymously reachable
+        # (required by the Palisade "world accessible Lambda" slat —
+        # AuthType NONE is a Sev-2 finding). The end-user's JWT still rides
+        # in the Authorization/x-api-key header and drives the per-user
+        # quota: SigV4 at the edge (who may call the gateway) + JWT in the
+        # app (which user is spending). Defense in depth.
+        fn_url = url_target.add_function_url(
+            auth_type=lambda_.FunctionUrlAuthType.AWS_IAM,
+            invoke_mode=lambda_.InvokeMode.RESPONSE_STREAM,
+        )
+
+        # Principals allowed to invoke the URL (your app-server/backend
+        # roles, or your own role for the demo). Grant via
+        # -c invoker_principal_arns=arn1,arn2 ; defaults to this account's
+        # root so any IAM principal in the account can be granted normally.
+        invoker_arns = self.node.try_get_context("invoker_principal_arns")
+        if invoker_arns:
+            for arn in [a.strip() for a in invoker_arns.split(",") if a.strip()]:
+                fn_url.grant_invoke_url(iam.ArnPrincipal(arn))
+        else:
+            fn_url.grant_invoke_url(iam.AccountRootPrincipal())
+
+        # ------------------------------------------------------------------
+        # Lockdown helper: attach this policy to every role that should NOT
+        # be able to bypass the gateway (dev roles, notebook roles, CI, ...).
+        # For org-wide enforcement use the SCP in the README instead.
+        # ------------------------------------------------------------------
+        deny_direct = iam.ManagedPolicy(
+            self, "DenyDirectBedrockInvocation",
+            managed_policy_name="deny-direct-bedrock-invocation",
+            description=(
+                "Denies direct Bedrock model invocation so that inference must "
+                "go through the quota gateway. Attach to non-gateway roles."
+            ),
+            statements=[
+                iam.PolicyStatement(
+                    effect=iam.Effect.DENY,
+                    actions=[
+                        "bedrock-mantle:CreateInference",
+                        "bedrock-mantle:CallWithBearerToken",
+                        "bedrock:InvokeModel",
+                        "bedrock:InvokeModelWithResponseStream",
+                        "bedrock:Converse",
+                        "bedrock:ConverseStream",
+                    ],
+                    resources=["*"],
+                ),
+            ],
+        )
+
+        # ------------------------------------------------------------------
+        # Reconciler + alerting
+        # ------------------------------------------------------------------
+        alert_topic = sns.Topic(self, "QuotaAlerts", display_name="Bedrock quota gateway alerts")
+        if alert_email:
+            alert_topic.add_subscription(subs.EmailSubscription(alert_email))
+
+        reconciler_fn = lambda_.Function(
+            self, "ReconcilerFn",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            memory_size=256,
+            timeout=Duration.minutes(2),
+            handler="handler.handler",
+            code=lambda_.Code.from_asset("../reconciler"),
+            environment={
+                "USERS_TABLE": users_table.table_name,
+                "USAGE_TABLE": usage_table.table_name,
+                "SNS_TOPIC_ARN": alert_topic.topic_arn,
+                "WARN_THRESHOLD": "0.8",
+                # Source of per-user token counts (any Bedrock API/provider).
+                "INVOCATION_LOG_GROUP": invocation_log_group.log_group_name,
+            },
+        )
+        users_table.grant_read_write_data(reconciler_fn)
+        # Reconciler now WRITES authoritative metered usage (was read-only).
+        usage_table.grant_read_write_data(reconciler_fn)
+        alert_topic.grant_publish(reconciler_fn)
+        # Query the model-invocation logs via CloudWatch Logs Insights.
+        reconciler_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                actions=["logs:StartQuery", "logs:GetQueryResults", "logs:StopQuery"],
+                resources=["*"],  # Insights StartQuery does not support ARN scoping well
+            )
+        )
+
+        events.Rule(
+            self, "ReconcilerSchedule",
+            schedule=events.Schedule.rate(Duration.minutes(5)),
+            targets=[targets.LambdaFunction(reconciler_fn)],
+        )
+
+        # ------------------------------------------------------------------
+        # Dashboard
+        # ------------------------------------------------------------------
+        dashboard = cw.Dashboard(self, "Dashboard", dashboard_name="bedrock-mantle-quota-gateway")
+
+        def search_widget(title: str, metric: str, stat: str = "Sum") -> cw.GraphWidget:
+            return cw.GraphWidget(
+                title=title,
+                width=12,
+                left=[cw.MathExpression(
+                    expression=(
+                        f"SEARCH('{{{METRICS_NAMESPACE},UserId}} "
+                        f"MetricName=\"{metric}\"', '{stat}')"
+                    ),
+                    using_metrics={},
+                    label="",
+                    period=Duration.minutes(5),
+                )],
+            )
+
+        dashboard.add_widgets(
+            search_widget("Estimated spend (USD) per user", "EstimatedCostUSD"),
+            search_widget("Requests per user", "Requests"),
+        )
+        dashboard.add_widgets(
+            search_widget("Quota throttles (429) per user", "Throttles"),
+            cw.GraphWidget(
+                title="Tokens (all users)",
+                width=12,
+                left=[
+                    cw.Metric(namespace=METRICS_NAMESPACE, metric_name="InputTokens",
+                              statistic="Sum", period=Duration.minutes(5)),
+                    cw.Metric(namespace=METRICS_NAMESPACE, metric_name="OutputTokens",
+                              statistic="Sum", period=Duration.minutes(5)),
+                ],
+            ),
+        )
+
+        # ------------------------------------------------------------------
+        # Outputs
+        # ------------------------------------------------------------------
+        cdk.CfnOutput(self, "GatewayUrl", value=fn_url.url,
+                      description="Set this (plus /v1) as base_url in OpenAI/Anthropic SDKs")
+        cdk.CfnOutput(self, "AdminKeySecretArn", value=admin_secret.secret_arn)
+        cdk.CfnOutput(self, "UsersTableName", value=users_table.table_name)
+        cdk.CfnOutput(self, "UsageTableName", value=usage_table.table_name)
+        cdk.CfnOutput(self, "AlertTopicArn", value=alert_topic.topic_arn)
+        cdk.CfnOutput(self, "BedrockUserRoleArn", value=bedrock_user_role.role_arn,
+                      description="Role the broker vends to users for native Bedrock calls.")
+        cdk.CfnOutput(self, "InvocationLogGroup", value=invocation_log_group.log_group_name,
+                      description="Bedrock model-invocation logs used for per-user metering.")
+        cdk.CfnOutput(self, "JwtIssuer", value=jwt_issuer,
+                      description="OIDC issuer whose JWTs the gateway accepts")
+        cdk.CfnOutput(self, "DenyDirectBedrockPolicyArn", value=deny_direct.managed_policy_arn,
+                      description="Attach to non-gateway roles to prevent bypassing the gateway")
+        cdk.CfnOutput(self, "GatewayRoleArn", value=gateway_fn.role.role_arn,
+                      description="The only principal that should be allowed to invoke Bedrock directly")
+        if user_pool is not None:
+            cdk.CfnOutput(self, "DemoUserPoolId", value=user_pool.user_pool_id)
+            cdk.CfnOutput(self, "DemoUserPoolClientId",
+                          value=user_pool_client.user_pool_client_id,
+                          description="App client for the demo notebook to obtain JWTs")

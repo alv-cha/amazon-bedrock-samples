@@ -66,3 +66,6 @@ config.py
 # ignore hypothesis and pytest cache directories
 **/.pytest_cache/
 **/.hypothesis/
+
+# CDK synth output for bedrock-mantle-per-user-quotas sample
+poc-to-prod/bedrock-mantle-per-user-quotas/cdk/cdk.out/

@@ -1,0 +1,159 @@
+<mxfile host="app.diagrams.net">
+  <diagram id="quota-gateway-arch" name="Architecture">
+    <mxGraphModel dx="1600" dy="950" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1650" pageHeight="1000" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- Title -->
+        <mxCell id="title" value="Per-user quota monitoring and enforcement for any Amazon Bedrock inference (credential broker)" style="text;html=1;fontSize=20;fontStyle=1;fontColor=#232F3E;align=left;" vertex="1" parent="1">
+          <mxGeometry x="60" y="10" width="1100" height="30" as="geometry" />
+        </mxCell>
+
+        <!-- AWS Cloud boundary -->
+        <mxCell id="awscloud" value="AWS Cloud (customer account)" style="points=[[0,0],[0.25,0],[0.5,0],[0.75,0],[1,0],[1,0.25],[1,0.5],[1,0.75],[1,1],[0.75,1],[0.5,1],[0.25,1],[0,1],[0,0.75],[0,0.5],[0,0.25]];outlineConnect=0;gradientColor=none;html=1;whiteSpace=wrap;fontSize=13;fontStyle=1;container=0;pointerEvents=0;shape=mxgraph.aws4.group;grIcon=mxgraph.aws4.group_aws_cloud_alt;strokeColor=#232F3E;fillColor=none;verticalAlign=top;align=left;spacingLeft=40;spacingTop=4;fontColor=#232F3E;dashed=0;" vertex="1" parent="1">
+          <mxGeometry x="470" y="60" width="1120" height="880" as="geometry" />
+        </mxCell>
+
+        <!-- Actors (outside cloud) -->
+        <mxCell id="users" value="Users / app backend&#10;native AWS SDK (boto3), OpenAI or&#10;Anthropic SDK, Claude Code, Codex CLI&#10;JWT from your IdP" style="sketch=0;outlineConnect=0;fontColor=#232F3E;gradientColor=none;fillColor=#232F3E;strokeColor=none;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;aspect=fixed;shape=mxgraph.aws4.users;" vertex="1" parent="1">
+          <mxGeometry x="90" y="290" width="70" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="admin" value="Platform admin" style="sketch=0;outlineConnect=0;fontColor=#232F3E;gradientColor=none;fillColor=#232F3E;strokeColor=none;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;aspect=fixed;shape=mxgraph.aws4.user;" vertex="1" parent="1">
+          <mxGeometry x="90" y="700" width="70" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- IdP -->
+        <mxCell id="idp" value="OIDC identity provider&#10;(Okta / Entra / Auth0 / ...&#10;or demo Cognito pool)" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;gradientColor=#F54749;gradientDirection=north;fillColor=#C7131F;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.cognito;" vertex="1" parent="1">
+          <mxGeometry x="240" y="80" width="70" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- Broker Lambda -->
+        <mxCell id="gateway" value="Quota gateway / credential broker&#10;AWS Lambda (FastAPI + Web Adapter)&#10;Function URL — IAM (SigV4) auth" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;gradientColor=#F78E04;gradientDirection=north;fillColor=#D05C17;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda;" vertex="1" parent="1">
+          <mxGeometry x="620" y="290" width="78" height="78" as="geometry" />
+        </mxCell>
+
+        <!-- STS / vended role -->
+        <mxCell id="sts" value="AWS STS + IAM&#10;BedrockUserRole (vended, short TTL)&#10;Bedrock invoke only — all models in region" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;gradientColor=#F54749;gradientDirection=north;fillColor=#C7131F;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.identity_and_access_management;" vertex="1" parent="1">
+          <mxGeometry x="900" y="100" width="70" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- Vend refusal callout -->
+        <mxCell id="callout429" value="Over budget or blocked ⇒ 403/429:&#10;no credentials issued.&#10;Bounded overspend = credential TTL + log lag" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF2CC;strokeColor=#D6B656;fontSize=11;fontStyle=2;" vertex="1" parent="1">
+          <mxGeometry x="500" y="150" width="250" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- Bedrock -->
+        <mxCell id="bedrock" value="Amazon Bedrock&#10;runtime + mantle endpoints&#10;InvokeModel / Converse / streaming&#10;— any model provider" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;gradientColor=#4AB29A;gradientDirection=north;fillColor=#116D5B;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.bedrock;" vertex="1" parent="1">
+          <mxGeometry x="1360" y="290" width="78" height="78" as="geometry" />
+        </mxCell>
+
+        <!-- DynamoDB tables -->
+        <mxCell id="ddbusers" value="DynamoDB: users&#10;limits + status per JWT subject&#10;+ session → user map" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;gradientColor=#4D72F3;gradientDirection=north;fillColor=#3334B9;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.dynamodb;" vertex="1" parent="1">
+          <mxGeometry x="560" y="540" width="78" height="78" as="geometry" />
+        </mxCell>
+        <mxCell id="ddbusage" value="DynamoDB: usage&#10;metered daily counters (TTL)" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;gradientColor=#4D72F3;gradientDirection=north;fillColor=#3334B9;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.dynamodb;" vertex="1" parent="1">
+          <mxGeometry x="770" y="540" width="78" height="78" as="geometry" />
+        </mxCell>
+
+        <!-- Invocation logs -->
+        <mxCell id="invlogs" value="CloudWatch Logs&#10;Bedrock model-invocation logs&#10;per-call tokens + caller session (= user)" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;gradientColor=#F34482;gradientDirection=north;fillColor=#BC1356;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.cloudwatch_2;" vertex="1" parent="1">
+          <mxGeometry x="1180" y="540" width="78" height="78" as="geometry" />
+        </mxCell>
+
+        <!-- Secrets Manager -->
+        <mxCell id="secrets" value="Secrets Manager&#10;admin API key" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;gradientColor=#F54749;gradientDirection=north;fillColor=#C7131F;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.secrets_manager;" vertex="1" parent="1">
+          <mxGeometry x="560" y="760" width="78" height="78" as="geometry" />
+        </mxCell>
+
+        <!-- CloudWatch metrics -->
+        <mxCell id="cloudwatch" value="CloudWatch&#10;per-user metrics + dashboard&#10;(spend, tokens, vends, throttles)" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;gradientColor=#F34482;gradientDirection=north;fillColor=#BC1356;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.cloudwatch_2;" vertex="1" parent="1">
+          <mxGeometry x="1400" y="540" width="78" height="78" as="geometry" />
+        </mxCell>
+
+        <!-- Reconciler chain -->
+        <mxCell id="eventbridge" value="EventBridge&#10;rate(5 min)" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;gradientColor=#F34482;gradientDirection=north;fillColor=#BC1356;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.eventbridge;" vertex="1" parent="1">
+          <mxGeometry x="880" y="760" width="78" height="78" as="geometry" />
+        </mxCell>
+        <mxCell id="reconciler" value="Reconciler&#10;AWS Lambda&#10;meter per user, block / auto-unblock" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;gradientColor=#F78E04;gradientDirection=north;fillColor=#D05C17;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda;" vertex="1" parent="1">
+          <mxGeometry x="1080" y="760" width="78" height="78" as="geometry" />
+        </mxCell>
+        <mxCell id="sns" value="SNS&#10;80% warnings + block alerts&#10;(email)" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;gradientColor=#F34482;gradientDirection=north;fillColor=#BC1356;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.simple_notification_service;" vertex="1" parent="1">
+          <mxGeometry x="1280" y="760" width="78" height="78" as="geometry" />
+        </mxCell>
+
+        <!-- Governance note -->
+        <mxCell id="lockdown" value="Governance: deny policy / SCP blocks direct&#10;Bedrock access for all other principals —&#10;the broker-vended role is the only path" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8CECC;strokeColor=#B85450;fontSize=11;fontStyle=2;" vertex="1" parent="1">
+          <mxGeometry x="1290" y="150" width="270" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- Mode B note -->
+        <mxCell id="modeb" value="Optional Mode B: the same Lambda also proxies&#10;OpenAI/Anthropic (mantle) calls inline for a hard&#10;pre-spend 429 — zero overspend (see README)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=11;fontStyle=2;" vertex="1" parent="1">
+          <mxGeometry x="180" y="560" width="290" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- Edges -->
+        <mxCell id="e1" value="1. Sign in, get JWT" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#232F3E;fontSize=11;fontColor=#232F3E;exitX=1;exitY=0.25;entryX=0;entryY=0.75;" edge="1" parent="1" source="users" target="idp">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" value="2. POST /v1/credentials — JWT in header&#10;(request SigV4-signed by the app's role)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#232F3E;fontSize=11;fontColor=#232F3E;exitX=1;exitY=0.4;entryX=0;entryY=0.4;" edge="1" parent="1" source="users" target="gateway">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2r" value="5. Short-lived per-user AWS creds (TTL ~15 min)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#D05C17;fontSize=11;fontColor=#D05C17;dashed=1;exitX=0;exitY=0.65;entryX=1;entryY=0.65;" edge="1" parent="1" source="gateway" target="users">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e3" value="verify JWT via issuer JWKS (cached)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#C7131F;fontSize=11;fontColor=#C7131F;dashed=1;exitX=0.25;exitY=0;entryX=1;entryY=0.5;" edge="1" parent="1" source="gateway" target="idp">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e4" value="3. Budget gate: status/limits +&#10;record session → user map" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#3334B9;fontSize=10;fontColor=#3334B9;dashed=1;exitX=0.25;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="gateway" target="ddbusers">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e4b" value="read today's metered spend" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#3334B9;fontSize=10;fontColor=#3334B9;dashed=1;exitX=0.75;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="gateway" target="ddbusage">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e5" value="4. sts:AssumeRole — RoleSessionName +&#10;SourceIdentity = JWT sub, short TTL" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#C7131F;fontSize=11;fontColor=#C7131F;exitX=0.75;exitY=0;entryX=0;entryY=0.75;" edge="1" parent="1" source="gateway" target="sts">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e6" value="6. Native Bedrock calls with vended creds — any API, any provider (gateway NOT in the data path)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#116D5B;fontSize=12;fontColor=#116D5B;strokeWidth=2;exitX=0.5;exitY=1;entryX=0.25;entryY=1;" edge="1" parent="1" source="users" target="bedrock">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="125" y="470" />
+              <mxPoint x="1379" y="470" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e7" value="7. Model-invocation logs&#10;(tokens + caller session)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#BC1356;fontSize=11;fontColor=#BC1356;exitX=0.25;exitY=1;entryX=0.75;entryY=0;" edge="1" parent="1" source="bedrock" target="invlogs">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e8" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#232F3E;fontSize=11;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="eventbridge" target="reconciler">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e9" value="8. Logs Insights: sum tokens per user, price" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#BC1356;fontSize=10;fontColor=#BC1356;dashed=1;exitX=0.75;exitY=0;entryX=0.5;entryY=1;" edge="1" parent="1" source="reconciler" target="invlogs">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e10" value="9. Write metered usage" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#3334B9;fontSize=10;fontColor=#3334B9;exitX=0.25;exitY=0;entryX=0.75;entryY=1;" edge="1" parent="1" source="reconciler" target="ddbusage">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e10b" value="10. Block / auto-unblock after reset" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#3334B9;fontSize=10;fontColor=#3334B9;dashed=1;exitX=0;exitY=0.25;entryX=0.75;entryY=1;" edge="1" parent="1" source="reconciler" target="ddbusers">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e11" value="11. Alerts" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#BC1356;fontSize=11;fontColor=#BC1356;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="reconciler" target="sns">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e12" value="12. /admin API: set limits, block, usage" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#232F3E;fontSize=11;fontColor=#232F3E;exitX=1;exitY=0.25;entryX=0;entryY=0.9;" edge="1" parent="1" source="admin" target="gateway">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e12b" value="admin key" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#C7131F;fontSize=10;fontColor=#C7131F;dashed=1;exitX=0;exitY=0.5;entryX=1;entryY=0.5;" edge="1" parent="1" source="secrets" target="admin">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e13" value="EMF metrics (vends, throttles)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#BC1356;fontSize=10;fontColor=#BC1356;dashed=1;exitX=1;exitY=0.25;entryX=0.5;entryY=0;" edge="1" parent="1" source="gateway" target="cloudwatch">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1439" y="250" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
