@@ -193,6 +193,17 @@ def test_native_ingestion_is_idempotent_and_composes_with_proxy(fake_dynamodb, m
     assert int(row3["input_tokens"]) == 5 + 1500
 
 
+def test_native_bedrock_model_id_uses_known_price():
+    prices = reconciler._prices()
+    native = reconciler._cost_micro(
+        prices, "openai.gpt-oss-20b-1:0", 1_000_000, 1_000_000
+    )
+    mantle = reconciler._cost_micro(
+        prices, "openai.gpt-oss-20b", 1_000_000, 1_000_000
+    )
+    assert native == mantle == 370_000
+
+
 def test_blocks_at_exact_limit_boundary(fake_dynamodb, fake_sns, monkeypatch):
     """#6: usage exactly == limit must block (>=), matching the vend gate, so
     the user doesn't flap blocked/active every cycle."""

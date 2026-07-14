@@ -73,9 +73,13 @@ def _emit_emf(user_id: str, d_cost_micro: int, d_in: int, d_out: int, d_req: int
 # Getting cache-accurate native metering requires enabling text-data delivery
 # and parsing inputBodyJson (heavier + privacy-sensitive). See the note in the
 # CDK MODEL_PRICES definition for the accuracy tradeoff.
+_GPT_OSS_120B_PRICE = (0.15, 0.60)
+_GPT_OSS_20B_PRICE = (0.07, 0.30)
 _DEFAULT_PRICES = {
-    "openai.gpt-oss-120b": (0.15, 0.60),
-    "openai.gpt-oss-20b": (0.07, 0.30),
+    "openai.gpt-oss-120b": _GPT_OSS_120B_PRICE,
+    "openai.gpt-oss-120b-1:0": _GPT_OSS_120B_PRICE,
+    "openai.gpt-oss-20b": _GPT_OSS_20B_PRICE,
+    "openai.gpt-oss-20b-1:0": _GPT_OSS_20B_PRICE,
     "anthropic.claude-opus-4-7": (15.00, 75.00),
 }
 # Unknown models bill at the most expensive known rate so a missing entry

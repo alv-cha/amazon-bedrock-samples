@@ -22,6 +22,17 @@ def test_known_model_cost():
     assert micro == int((0.15 + 0.60) * MICRO)
 
 
+@pytest.mark.parametrize(
+    ("mantle_id", "native_id"),
+    [
+        ("openai.gpt-oss-120b", "openai.gpt-oss-120b-1:0"),
+        ("openai.gpt-oss-20b", "openai.gpt-oss-20b-1:0"),
+    ],
+)
+def test_native_bedrock_ids_share_mantle_prices(mantle_id, native_id):
+    assert get_price(native_id) == get_price(mantle_id)
+
+
 def test_unknown_model_uses_most_expensive_fallback():
     assert get_price("some.future-model") == FALLBACK_PRICE
     micro = cost_micro_usd("some.future-model", 1_000_000, 0)

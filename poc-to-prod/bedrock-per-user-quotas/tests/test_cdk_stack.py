@@ -32,6 +32,37 @@ def test_invocation_logging_requires_explicit_choice():
 def test_managed_logging_stack_has_ttl_serial_reconciler_and_retention():
     template = _template({"manage_invocation_logging": "true"})
 
+    template.has_resource_properties(
+        "Custom::BedrockModelPriceSnapshot",
+        {
+            "RegionCode": "us-east-1",
+            "CatalogModels": {
+                "gpt-oss-120b": [
+                    "openai.gpt-oss-120b",
+                    "openai.gpt-oss-120b-1:0",
+                ],
+                "gpt-oss-20b": [
+                    "openai.gpt-oss-20b",
+                    "openai.gpt-oss-20b-1:0",
+                ],
+            },
+        },
+    )
+    template.has_resource_properties(
+        "AWS::IAM::Policy",
+        {
+            "PolicyDocument": {
+                "Statement": Match.array_with([
+                    Match.object_like({
+                        "Action": "pricing:GetProducts",
+                        "Effect": "Allow",
+                        "Resource": "*",
+                    })
+                ])
+            }
+        },
+    )
+
     template.resource_properties_count_is(
         "AWS::DynamoDB::Table",
         {
@@ -81,6 +112,44 @@ def test_managed_logging_stack_has_ttl_serial_reconciler_and_retention():
             }),
         },
     )
+
+    roles = template.find_resources("AWS::IAM::Role")
+    logging_role = next(
+        role for role in roles.values()
+        if role.get("Properties", {}).get("Policies", [{}])[0].get(
+            "PolicyName"
+        ) == "WriteInvocationLogs"
+    )
+    log_stream_arn = (
+        logging_role["Properties"]["Policies"][0]["PolicyDocument"]
+        ["Statement"][0]["Resource"]
+    )
+    assert log_stream_arn == {
+        "Fn::Join": [
+            "",
+            [
+                "arn:",
+                {"Ref": "AWS::Partition"},
+                ":logs:us-east-1:111122223333:log-group:",
+                {"Ref": "BedrockInvocationLogs9E813CF7"},
+                ":log-stream:aws/bedrock/modelinvocations",
+            ],
+        ]
+    }
+
+    functions = template.find_resources("AWS::Lambda::Function")
+    metered_functions = [
+        function for function in functions.values()
+        if function["Properties"].get("Handler") == "run.sh"
+        or function["Properties"].get("ReservedConcurrentExecutions") == 1
+    ]
+    assert len(metered_functions) == 2
+    for function in metered_functions:
+        price_value = (
+            function["Properties"]["Environment"]["Variables"]
+            ["MODEL_PRICES_JSON"]
+        )
+        assert price_value["Fn::GetAtt"][1] == "ModelPricesJson"
 
 
 def test_existing_log_group_avoids_account_wide_custom_resource():

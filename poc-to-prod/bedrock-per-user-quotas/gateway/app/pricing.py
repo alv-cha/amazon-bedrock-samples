@@ -24,9 +24,13 @@ class ModelPrice:
 
 
 # --- PLACEHOLDER prices: verify against the Bedrock pricing page. ---
+GPT_OSS_120B_PRICE = ModelPrice(input_per_mtok=0.15, output_per_mtok=0.60)
+GPT_OSS_20B_PRICE = ModelPrice(input_per_mtok=0.07, output_per_mtok=0.30)
 DEFAULT_PRICES: dict[str, ModelPrice] = {
-    "openai.gpt-oss-120b": ModelPrice(input_per_mtok=0.15, output_per_mtok=0.60),
-    "openai.gpt-oss-20b": ModelPrice(input_per_mtok=0.07, output_per_mtok=0.30),
+    "openai.gpt-oss-120b": GPT_OSS_120B_PRICE,
+    "openai.gpt-oss-120b-1:0": GPT_OSS_120B_PRICE,
+    "openai.gpt-oss-20b": GPT_OSS_20B_PRICE,
+    "openai.gpt-oss-20b-1:0": GPT_OSS_20B_PRICE,
     "anthropic.claude-opus-4-7": ModelPrice(input_per_mtok=15.00, output_per_mtok=75.00),
 }
 

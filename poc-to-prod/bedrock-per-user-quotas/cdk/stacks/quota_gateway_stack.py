@@ -12,8 +12,6 @@ Resources:
 - CloudWatch dashboard over the gateway's EMF metrics
 """
 
-import json
-
 import aws_cdk as cdk
 from aws_cdk import (
     Duration,
@@ -36,14 +34,32 @@ from constructs import Construct
 
 METRICS_NAMESPACE = "BedrockQuotaGateway"
 
-# Single source of truth for model prices (USD per 1M tokens), injected as
-# MODEL_PRICES_JSON into BOTH the gateway and reconciler Lambdas. Both already
-# treat this env var as authoritative over their in-code fallback tables, so
-# defining it once here prevents the two from drifting (the gateway prices at
-# settle time; the reconciler is authoritative for native-vended traffic).
-# NOTE: these are PLACEHOLDERS — verify against the Amazon Bedrock pricing page
-# for the models you enable. Keys are model IDs as they appear in Bedrock
-# model-invocation logs / mantle responses.
+# Price List model names mapped to every ID the gateway and Bedrock invocation
+# logs can emit. A deployment-time custom resource resolves these into one
+# immutable USD-per-MTok snapshot shared by the gateway and reconciler.
+PRICE_CATALOG_MODELS = {
+    "gpt-oss-120b": [
+        "openai.gpt-oss-120b",
+        "openai.gpt-oss-120b-1:0",
+    ],
+    "gpt-oss-20b": [
+        "openai.gpt-oss-20b",
+        "openai.gpt-oss-20b-1:0",
+    ],
+}
+
+# Price List API does not yet expose recent Claude models. Keep explicit
+# deployment-time overrides for those gaps; unknown models still use the
+# conservative runtime fallback.
+PINNED_PRICE_OVERRIDES = {
+    "anthropic.claude-opus-4-7": {
+        "input_per_mtok": 15.00,
+        "output_per_mtok": 75.00,
+    },
+}
+
+# MODEL_PRICES_JSON is injected into BOTH Lambdas. The gateway prices at
+# settle time; the reconciler is authoritative for native-vended traffic.
 #
 # CACHE-PRICING CAVEAT (Mode A): Bedrock model-invocation logs record only
 # input.inputTokenCount / output.outputTokenCount — there are NO cache-token
@@ -53,11 +69,6 @@ METRICS_NAMESPACE = "BedrockQuotaGateway"
 # coding-agent workloads the two pricers differ and native dollar enforcement
 # is approximate. Cache-accurate native metering would require enabling
 # text-data delivery and parsing inputBodyJson. See README for the tradeoff.
-MODEL_PRICES = {
-    "openai.gpt-oss-120b": {"input_per_mtok": 0.15, "output_per_mtok": 0.60},
-    "openai.gpt-oss-20b": {"input_per_mtok": 0.07, "output_per_mtok": 0.30},
-    "anthropic.claude-opus-4-7": {"input_per_mtok": 15.00, "output_per_mtok": 75.00},
-}
 
 
 class QuotaGatewayStack(Stack):
@@ -86,6 +97,39 @@ class QuotaGatewayStack(Stack):
         # snapshot instead of cold-starting (Python SnapStart). Requires
         # publishing versions; the Function URL then targets an alias.
         use_snapstart = str(self.node.try_get_context("snapstart")).lower() == "true"
+
+        # ------------------------------------------------------------------
+        # Deployment-time Bedrock price snapshot
+        # ------------------------------------------------------------------
+        price_resolver_fn = lambda_.Function(
+            self, "PriceResolverFn",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            memory_size=256,
+            timeout=Duration.minutes(1),
+            handler="handler.handler",
+            code=lambda_.Code.from_asset("pricing_resolver"),
+        )
+        price_resolver_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["pricing:GetProducts"],
+                resources=["*"],
+            )
+        )
+        price_provider = cr.Provider(
+            self, "PriceResolverProvider",
+            on_event_handler=price_resolver_fn,
+        )
+        price_snapshot = cdk.CustomResource(
+            self, "BedrockModelPriceSnapshot",
+            service_token=price_provider.service_token,
+            resource_type="Custom::BedrockModelPriceSnapshot",
+            properties={
+                "RegionCode": self.region,
+                "CatalogModels": PRICE_CATALOG_MODELS,
+                "PinnedPrices": PINNED_PRICE_OVERRIDES,
+            },
+        )
+        model_prices_json = price_snapshot.get_att_string("ModelPricesJson")
 
         # ------------------------------------------------------------------
         # Identity: BYO OIDC issuer, or a demo Cognito User Pool
@@ -192,7 +236,7 @@ class QuotaGatewayStack(Stack):
                 "METRICS_NAMESPACE": METRICS_NAMESPACE,
                 "ADMIN_KEY_SECRET_ARN": admin_secret.secret_arn,
                 # Single price source shared with the reconciler (prevents drift).
-                "MODEL_PRICES_JSON": json.dumps(MODEL_PRICES),
+                "MODEL_PRICES_JSON": model_prices_json,
                 # JWT auth
                 "JWT_ISSUER": jwt_issuer,
                 "JWT_AUDIENCE": jwt_audience,
@@ -373,8 +417,15 @@ class QuotaGatewayStack(Stack):
                         iam.PolicyStatement(
                             actions=["logs:CreateLogStream", "logs:PutLogEvents"],
                             resources=[
-                                f"{invocation_log_group.log_group_arn}:"
-                                "log-stream:aws/bedrock/modelinvocations",
+                                self.format_arn(
+                                    service="logs",
+                                    resource="log-group",
+                                    resource_name=(
+                                        f"{invocation_log_group.log_group_name}:"
+                                        "log-stream:aws/bedrock/modelinvocations"
+                                    ),
+                                    arn_format=cdk.ArnFormat.COLON_RESOURCE_NAME,
+                                ),
                             ],
                         )
                     ])
@@ -506,7 +557,7 @@ class QuotaGatewayStack(Stack):
                 "METRICS_NAMESPACE": METRICS_NAMESPACE,
                 # Same price source as the gateway so the authoritative
                 # reconciler cost can't drift from the gateway's settle cost.
-                "MODEL_PRICES_JSON": json.dumps(MODEL_PRICES),
+                "MODEL_PRICES_JSON": model_prices_json,
                 # Source of per-user token counts (any Bedrock API/provider).
                 "INVOCATION_LOG_GROUP": invocation_log_group.log_group_name,
             },
@@ -587,6 +638,11 @@ class QuotaGatewayStack(Stack):
                       description="Attach to non-gateway roles to prevent bypassing the gateway")
         cdk.CfnOutput(self, "GatewayRoleArn", value=gateway_fn.role.role_arn,
                       description="The only principal that should be allowed to invoke Bedrock directly")
+        cdk.CfnOutput(
+            self, "ModelPriceSnapshot",
+            value=model_prices_json,
+            description="Standard on-demand USD-per-MTok prices captured at stack deployment",
+        )
         if user_pool is not None:
             cdk.CfnOutput(self, "DemoUserPoolId", value=user_pool.user_pool_id)
             cdk.CfnOutput(self, "DemoUserPoolClientId",

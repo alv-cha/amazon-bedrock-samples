@@ -382,6 +382,8 @@ TPM quotas, applied per user.
   `openai.gpt-oss-120b`; check `GET /v1/models`)
 - Python 3.12+, Node.js (for the CDK CLI), Docker (for CDK asset bundling)
 - Bootstrapped CDK environment (`cdk bootstrap`)
+- Permission to call `pricing:GetProducts` while the stack captures its
+  deployment-time Bedrock price snapshot
 - `pip install -r gateway/requirements.txt` for the signed client examples
 
 ## Deploy
@@ -403,6 +405,13 @@ cdk deploy \
 `jwt_audience`, `jwt_user_claim`, and `alert_email` are optional. OIDC
 discovery supplies `jwks_uri`; use `-c jwt_jwks_url=https://...` only when
 the provider does not expose a standard discovery document.
+
+The stack queries AWS Price List API once when the price-snapshot custom
+resource is created. It selects standard on-demand input/output token prices
+for the configured catalog models and injects the resulting JSON into both
+Lambdas. It does not refresh prices periodically or query Pricing during
+inference. `ModelPriceSnapshot` in the stack outputs records the exact rates
+captured by that deployment.
 
 **Without an IdP**, omit `jwt_issuer` and the stack creates a **demo Cognito
 User Pool** and wires the gateway to it (outputs `DemoUserPoolId` /
@@ -592,10 +601,12 @@ You can cross-check gateway numbers against the service-side
   dev/tests only. Note the gateway checks token *validity*, not revocation —
   keep token lifetimes short, and use the admin block endpoint for immediate
   cut-off.
-- **Prices are placeholders.** Edit `gateway/app/pricing.py` (or set the
-  `MODEL_PRICES_JSON` Lambda environment variable) with current values from
-  the Bedrock pricing page. Unknown models are billed at the most expensive
-  known rate on purpose.
+- **Prices are a deployment-time snapshot.** AWS Price List API supplies the
+  standard on-demand rates for configured catalog models. Recent models not
+  yet published by that API require an explicit pinned override in the CDK
+  stack. Unknown models are billed at the most expensive known rate on
+  purpose. Price List rates are estimates and do not include private
+  discounts, commitments, or credits.
 - **Upstream auth**: the gateway mints short-term Bedrock API keys from its
   own IAM role (`aws-bedrock-token-generator`); no long-term secrets are
   stored. The role uses the `AmazonBedrockMantleInferenceAccess` managed
