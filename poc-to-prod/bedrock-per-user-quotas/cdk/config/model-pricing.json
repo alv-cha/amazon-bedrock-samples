@@ -1,0 +1,22 @@
+{
+  "catalog_models": {
+    "gpt-oss-120b": [
+      "openai.gpt-oss-120b",
+      "openai.gpt-oss-120b-1:0"
+    ],
+    "gpt-oss-20b": [
+      "openai.gpt-oss-20b",
+      "openai.gpt-oss-20b-1:0"
+    ]
+  },
+  "price_overrides": {
+    "anthropic.claude-opus-4-7": {
+      "input_per_mtok": 15.0,
+      "output_per_mtok": 75.0
+    }
+  },
+  "fallback_price": {
+    "input_per_mtok": 15.0,
+    "output_per_mtok": 75.0
+  }
+}

@@ -51,8 +51,9 @@ def current_window(now: datetime | None = None) -> str:
     return now.strftime("%Y-%m-%d")
 
 
-def window_ttl_epoch(now: datetime | None = None, keep_days: int = 35) -> int:
+def window_ttl_epoch(now: datetime | None = None, keep_days: int | None = None) -> int:
     now = now or datetime.now(timezone.utc)
+    keep_days = keep_days or settings.usage_retention_days
     return int(now.timestamp()) + keep_days * 86400
 
 

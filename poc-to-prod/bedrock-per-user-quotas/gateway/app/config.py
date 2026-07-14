@@ -4,12 +4,26 @@ Everything is driven by environment variables so the same code runs in
 Lambda (set by CDK) and locally (uvicorn + a .env file).
 """
 
+import json
 import os
 from dataclasses import dataclass, field
 
 
 def _env(name: str, default: str) -> str:
     return os.environ.get(name, default)
+
+
+def _env_string_set(name: str) -> frozenset[str]:
+    raw = _env(name, "[]")
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{name} must contain a JSON array") from exc
+    if not isinstance(parsed, list) or any(
+        not isinstance(item, str) or not item for item in parsed
+    ):
+        raise ValueError(f"{name} must contain a JSON array of non-empty strings")
+    return frozenset(parsed)
 
 
 @dataclass(frozen=True)
@@ -55,6 +69,15 @@ class Settings:
     default_daily_usd: float = field(default_factory=lambda: float(_env("DEFAULT_DAILY_USD", "1.0")))
     default_daily_input_tokens: int = field(default_factory=lambda: int(_env("DEFAULT_DAILY_INPUT_TOKENS", "1000000")))
     default_daily_output_tokens: int = field(default_factory=lambda: int(_env("DEFAULT_DAILY_OUTPUT_TOKENS", "200000")))
+    # DynamoDB TTL for daily usage rows. Deletion is asynchronous after this
+    # timestamp; it is not the quota-window reset mechanism.
+    usage_retention_days: int = field(
+        default_factory=lambda: int(_env("USAGE_RETENTION_DAYS", "35")))
+
+    # Mode B application allowlist. Empty preserves compatibility by allowing
+    # every model ID; Mode A uses a separate IAM resource-ARN allowlist.
+    mode_b_allowed_model_ids: frozenset[str] = field(
+        default_factory=lambda: _env_string_set("MODE_B_ALLOWED_MODEL_IDS_JSON"))
 
     # Output-token reservation used when the request does not specify
     # max_tokens / max_output_tokens. Deliberately conservative.

@@ -204,6 +204,25 @@ def test_native_bedrock_model_id_uses_known_price():
     assert native == mantle == 370_000
 
 
+def test_configured_fallback_and_usage_retention(monkeypatch):
+    monkeypatch.setenv(
+        "MODEL_FALLBACK_PRICE_JSON",
+        '{"input_per_mtok": 40.0, "output_per_mtok": 90.0}',
+    )
+    monkeypatch.setenv(
+        "MODEL_PRICES_JSON",
+        '{"configured.model":{"input_per_mtok":1.0,"output_per_mtok":2.0}}',
+    )
+    assert set(reconciler._prices()) == {"configured.model"}
+    assert reconciler._cost_micro(
+        {}, "unknown.model", 1_000_000, 1_000_000
+    ) == 130_000_000
+
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    monkeypatch.setenv("USAGE_RETENTION_DAYS", "90")
+    assert reconciler._window_ttl_epoch(now) == int(now.timestamp()) + 90 * 86400
+
+
 def test_blocks_at_exact_limit_boundary(fake_dynamodb, fake_sns, monkeypatch):
     """#6: usage exactly == limit must block (>=), matching the vend gate, so
     the user doesn't flap blocked/active every cycle."""

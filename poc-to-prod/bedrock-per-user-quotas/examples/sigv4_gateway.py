@@ -7,7 +7,10 @@ travel in dedicated headers:
 - X-Quota-Admin-Key: Secrets Manager-backed admin key
 """
 
+import argparse
+import json
 import os
+from urllib.parse import quote
 
 import boto3
 import httpx
@@ -84,3 +87,135 @@ def signed_request(method: str, url: str, *, region: str | None = None,
         return http_client.send(request)
     with httpx.Client() as client:
         return client.send(request)
+
+
+def _admin_request_args(args) -> tuple[str, str, dict]:
+    base = args.gateway_url.rstrip("/")
+    if args.command == "create-user":
+        return "POST", f"{base}/admin/users", {
+            "json": {
+                "user_id": args.user_id,
+                "name": args.name or args.user_id,
+                "daily_usd": args.daily_usd,
+                "daily_input_tokens": args.daily_input_tokens,
+                "daily_output_tokens": args.daily_output_tokens,
+            }
+        }
+    if args.command == "list-users":
+        return "GET", f"{base}/admin/users", {}
+
+    user_id = quote(args.user_id, safe="")
+    if args.command == "update-user":
+        limits = {
+            name: getattr(args, name)
+            for name in (
+                "daily_usd",
+                "daily_input_tokens",
+                "daily_output_tokens",
+            )
+            if getattr(args, name) is not None
+        }
+        if not limits:
+            raise ValueError(
+                "update-user requires at least one daily quota option"
+            )
+        return "PUT", f"{base}/admin/users/{user_id}/limits", {"json": limits}
+    if args.command in {"block-user", "unblock-user"}:
+        status = "blocked" if args.command == "block-user" else "active"
+        return "PUT", f"{base}/admin/users/{user_id}/status", {
+            "json": {"status": status, "reason": args.reason}
+        }
+    if args.command == "get-usage":
+        params = {"window": args.window} if args.window else {}
+        return "GET", f"{base}/admin/users/{user_id}/usage", {"params": params}
+    raise ValueError(f"Unsupported command: {args.command}")
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="SigV4-signed administrative client for the quota gateway."
+    )
+    parser.add_argument(
+        "--gateway-url",
+        default=os.environ.get("GATEWAY_URL"),
+        help="GatewayUrl stack output (or GATEWAY_URL).",
+    )
+    parser.add_argument(
+        "--region",
+        default=os.environ.get("AWS_REGION", "us-east-1"),
+    )
+    parser.add_argument(
+        "--profile",
+        default=os.environ.get("AWS_PROFILE"),
+        help="AWS CLI profile used for SigV4 credentials.",
+    )
+    parser.add_argument(
+        "--admin-key",
+        default=os.environ.get("ADMIN_KEY"),
+        help="Admin API key (or ADMIN_KEY).",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    create = commands.add_parser("create-user")
+    create.add_argument("user_id")
+    create.add_argument("--name")
+    create.add_argument("--daily-usd", type=float, required=True)
+    create.add_argument("--daily-input-tokens", type=int, required=True)
+    create.add_argument("--daily-output-tokens", type=int, required=True)
+
+    commands.add_parser("list-users")
+
+    update = commands.add_parser("update-user")
+    update.add_argument("user_id")
+    update.add_argument("--daily-usd", type=float)
+    update.add_argument("--daily-input-tokens", type=int)
+    update.add_argument("--daily-output-tokens", type=int)
+
+    block = commands.add_parser("block-user")
+    block.add_argument("user_id")
+    block.add_argument("--reason", default="admin CLI")
+
+    unblock = commands.add_parser("unblock-user")
+    unblock.add_argument("user_id")
+    unblock.add_argument("--reason", default="admin CLI")
+
+    usage = commands.add_parser("get-usage")
+    usage.add_argument("user_id")
+    usage.add_argument("--window", help="UTC window in YYYY-MM-DD format.")
+    return parser
+
+
+def main() -> None:
+    parser = _parser()
+    args = parser.parse_args()
+    if not args.gateway_url:
+        parser.error("--gateway-url or GATEWAY_URL is required")
+    if not args.admin_key:
+        parser.error("--admin-key or ADMIN_KEY is required")
+    try:
+        method, url, request_kwargs = _admin_request_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    session = boto3.Session(
+        profile_name=args.profile,
+        region_name=args.region,
+    )
+    response = signed_request(
+        method,
+        url,
+        region=args.region,
+        admin_key=args.admin_key,
+        aws_session=session,
+        **request_kwargs,
+    )
+    try:
+        body = response.json()
+    except ValueError:
+        body = {"status_code": response.status_code, "body": response.text}
+    print(json.dumps(body, indent=2, sort_keys=True))
+    response.raise_for_status()
+
+
+if __name__ == "__main__":
+    main()

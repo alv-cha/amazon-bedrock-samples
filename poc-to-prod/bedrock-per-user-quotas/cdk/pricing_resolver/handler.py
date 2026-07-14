@@ -84,6 +84,16 @@ def resolve_snapshot(
     return snapshot
 
 
+def conservative_fallback(snapshot: dict, configured: dict) -> dict:
+    """Keep unknown models at least as expensive as every known model."""
+    fallback = {}
+    for field in ("input_per_mtok", "output_per_mtok"):
+        candidates = [float(configured[field])]
+        candidates.extend(float(price[field]) for price in snapshot.values())
+        fallback[field] = max(candidates)
+    return fallback
+
+
 def handler(event, _context):
     properties = event["ResourceProperties"]
     physical_id = f"bedrock-model-prices-{properties['RegionCode']}"
@@ -97,11 +107,21 @@ def handler(event, _context):
         properties["CatalogModels"],
         properties.get("PinnedPrices", {}),
     )
+    fallback = conservative_fallback(
+        snapshot,
+        properties.get("FallbackPrice", {
+            "input_per_mtok": 15.0,
+            "output_per_mtok": 75.0,
+        }),
+    )
     return {
         "PhysicalResourceId": physical_id,
         "Data": {
             "ModelPricesJson": json.dumps(
                 snapshot, sort_keys=True, separators=(",", ":")
-            )
+            ),
+            "FallbackPriceJson": json.dumps(
+                fallback, sort_keys=True, separators=(",", ":")
+            ),
         },
     }

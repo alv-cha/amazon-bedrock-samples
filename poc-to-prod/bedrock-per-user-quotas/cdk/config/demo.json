@@ -1,0 +1,21 @@
+{
+  "alert_email": "",
+  "auto_provision_users": true,
+  "default_daily_usd": 1.0,
+  "default_daily_input_tokens": 1000000,
+  "default_daily_output_tokens": 200000,
+  "warn_threshold": 0.8,
+  "usage_retention_days": 35,
+  "retain_tables_on_delete": false,
+  "manage_invocation_logging": true,
+  "invoker_principal_arns": [],
+  "mode_b_allowed_model_ids": [
+    "openai.gpt-oss-120b",
+    "openai.gpt-oss-20b",
+    "anthropic.claude-opus-4-7"
+  ],
+  "mode_a_allowed_model_arns": [
+    "*"
+  ],
+  "model_config": "model-pricing.json"
+}

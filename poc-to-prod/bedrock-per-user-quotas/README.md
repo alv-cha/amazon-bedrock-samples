@@ -149,7 +149,13 @@ from examples.sigv4_gateway import signed_request
 
 signed_request(
     "POST", f"{GATEWAY_URL}/admin/users", admin_key=ADMIN_KEY,
-    json={"user_id": "tenant-acme", "name": "ACME Corp", "daily_usd": 200},
+    json={
+        "user_id": "tenant-acme",
+        "name": "ACME Corp",
+        "daily_usd": 200,
+        "daily_input_tokens": 50_000_000,
+        "daily_output_tokens": 10_000_000,
+    },
 )
 ```
 
@@ -167,9 +173,9 @@ signed_request(
   identity. Make the claim a **required, IdP-populated** attribute — not one
   the client can set — so tenant A cannot mint a token claiming tenant B.
 - **Cross-tenant isolation is by budget, not by model.** Per-tenant *spend*
-  is isolated, but by default every tenant may call every enabled model. To
-  give tenants (or tiers) different model access, scope the vended role
-  (Mode A) or add a model allowlist — see [Trust model](#trust-model).
+  is isolated, while model access is deployment-wide. Configure
+  `mode_a_allowed_model_arns` and `mode_b_allowed_model_ids`; per-tenant model
+  tiers require an additional policy layer.
 
 ## Trust model
 
@@ -369,70 +375,33 @@ TPM quotas, applied per user.
 | `reconciler/` | Scheduled Lambda: per-user metering from Bedrock model-invocation logs, drift blocking, auto-unblock, SNS alerts |
 | `cdk/` | CDK app (Python): broker/gateway Lambda + IAM-auth Function URL, vended Bedrock role, model-invocation logging, DynamoDB, optional demo Cognito pool, EventBridge, SNS, dashboard |
 | `examples/demo_native_calls.py` | Mode A demo: fetch per-user creds from the broker, call Bedrock natively (Converse + InvokeModel) |
-| `examples/sigv4_gateway.py` | SigV4 adapters for `httpx`, OpenAI/Anthropic Python SDKs, and signed admin calls |
-| `tests/` | 96 unit + end-to-end tests, no AWS account needed |
-| `notebook/per_user_quota_demo.ipynb` | Walkthrough: deploy, sign in users, watch a 429 happen |
+| `examples/sigv4_gateway.py` | SigV4 adapters plus a signed administrative CLI |
+| `tests/` | Unit + end-to-end tests, no AWS account needed |
+| `notebook/per_user_quota_demo.ipynb` | Complete capability walkthrough: identity, admin API, Mode A, Mode B, quotas, reconciliation, monitoring, and cleanup |
 | `assets/architecture.drawio` | Editable architecture diagram (draw.io) |
+| `DEPLOYMENT.md` | Canonical deployment, configuration, security, and operations guide |
 | `DEMO.md` | 12-minute demo script + pre-demo runbook + failure playbook |
 
-## Prerequisites
+## Quickstart
 
-- An AWS account with access to the [`bedrock-mantle` endpoint](https://docs.aws.amazon.com/bedrock/latest/userguide/bedrock-mantle.html)
-  and model access enabled for the models you route (defaults assume
-  `openai.gpt-oss-120b`; check `GET /v1/models`)
-- Python 3.12+, Node.js (for the CDK CLI), Docker (for CDK asset bundling)
-- Bootstrapped CDK environment (`cdk bootstrap`)
-- Permission to call `pricing:GetProducts` while the stack captures its
-  deployment-time Bedrock price snapshot
-- `pip install -r gateway/requirements.txt` for the signed client examples
-
-## Deploy
-
-**With your own IdP** (recommended — quotas follow the identities your app
-already has):
+The demo profile creates a Cognito user pool, manages model-invocation logging,
+auto-provisions users, and uses deletable DynamoDB tables:
 
 ```bash
+python3 -m venv cdk/.venv
+source cdk/.venv/bin/activate
+pip install -r cdk/requirements.txt -r gateway/requirements.txt
+
 cd cdk
-pip install -r requirements.txt
-cdk deploy \
-  -c jwt_issuer=https://your-idp.example.com/... \
-  -c jwt_audience=YOUR_APP_CLIENT_ID \
-  -c jwt_user_claim=sub \
-  -c manage_invocation_logging=true \
-  -c alert_email=you@example.com
+cdk synth -c deployment_config=config/demo.json
+cdk deploy -c deployment_config=config/demo.json
 ```
 
-`jwt_audience`, `jwt_user_claim`, and `alert_email` are optional. OIDC
-discovery supplies `jwks_uri`; use `-c jwt_jwks_url=https://...` only when
-the provider does not expose a standard discovery document.
-
-The stack queries AWS Price List API once when the price-snapshot custom
-resource is created. It selects standard on-demand input/output token prices
-for the configured catalog models and injects the resulting JSON into both
-Lambdas. It does not refresh prices periodically or query Pricing during
-inference. `ModelPriceSnapshot` in the stack outputs records the exact rates
-captured by that deployment.
-
-**Without an IdP**, omit `jwt_issuer` and the stack creates a **demo Cognito
-User Pool** and wires the gateway to it (outputs `DemoUserPoolId` /
-`DemoUserPoolClientId`; the demo notebook uses these).
-
-`manage_invocation_logging=true` explicitly acknowledges that Bedrock model
-invocation logging is one account-and-region-wide setting. In shared
-accounts, preserve the existing configuration instead:
-
-```bash
--c manage_invocation_logging=false \
--c invocation_log_group_name=/your/existing/bedrock/log-group
-```
-
-Outputs include the **GatewayUrl** and the **AdminKeySecretArn**. Fetch the
-admin key:
-
-```bash
-aws secretsmanager get-secret-value --secret-id <AdminKeySecretArn> \
-  --query SecretString --output text
-```
+Read [DEPLOYMENT.md](DEPLOYMENT.md) before deploying. It contains the
+production/shared-account profile, decision table, IdP and tenant-claim
+configuration, logging ownership, separate Mode A/Mode B allowlists, price
+configuration, `RETAIN` behavior, bypass prevention, outputs, SNS
+confirmation, smoke tests, and administrative commands.
 
 ## Use it
 
@@ -440,16 +409,21 @@ Users (or tenants — whatever `jwt_user_claim` resolves to) are
 **auto-provisioned at default limits on their first request**. Convenient for
 onboarding, but it means a newly-seen identity silently gets the default
 budget: in a multi-tenant deployment, decide whether you want tenants to
-appear automatically or be provisioned deliberately at onboarding. Disable
-lazy creation with `AUTO_PROVISION_USERS=false` on the Lambda, then
-pre-provision each identity by its claim value:
+appear automatically or be provisioned deliberately at onboarding. Set
+`auto_provision_users` in the deployment JSON; no post-deploy Lambda edits
+are required. Pre-provision each identity by its claim value:
 
 ```python
 from examples.sigv4_gateway import signed_request
 
 signed_request(
     "POST", f"{GATEWAY_URL}/admin/users", admin_key=ADMIN_KEY,
-    json={"user_id": "<sub-claim-value>", "daily_usd": 0.5},
+    json={
+        "user_id": "<claim-value>",
+        "daily_usd": 0.5,
+        "daily_input_tokens": 1_000_000,
+        "daily_output_tokens": 200_000,
+    },
 ).raise_for_status()
 ```
 
@@ -495,8 +469,8 @@ The gateway can only govern traffic that goes **through** it. Any IAM
 principal in the account that holds `bedrock:InvokeModel*` or
 `bedrock-mantle:*` permissions can still call the endpoints directly and
 bypass the quotas. To make per-user limits authoritative for the account,
-close the direct path so the **gateway's Lambda role is the only principal
-allowed to invoke models**:
+close the direct path so only the **gateway role and Mode A vended role**
+can invoke models:
 
 **Option A — attach the shipped deny policy (single account).** The stack
 creates a customer-managed IAM policy (output
@@ -575,8 +549,8 @@ Practical notes for agent workloads:
 - Set token validity in your IdP to cover a work session (the demo Cognito
   client issues 12-hour ID tokens), or wire a refresh helper.
 - When a developer hits their budget the agent receives a clean HTTP 429
-  with the reset time in the message; the reconciler's SNS warning at 80%
-  gives them advance notice.
+  with the reset time in the message; the reconciler's configurable SNS
+  threshold gives them advance notice.
 
 ## Monitoring
 
@@ -602,11 +576,13 @@ You can cross-check gateway numbers against the service-side
   keep token lifetimes short, and use the admin block endpoint for immediate
   cut-off.
 - **Prices are a deployment-time snapshot.** AWS Price List API supplies the
-  standard on-demand rates for configured catalog models. Recent models not
-  yet published by that API require an explicit pinned override in the CDK
-  stack. Unknown models are billed at the most expensive known rate on
-  purpose. Price List rates are estimates and do not include private
-  discounts, commitments, or credits.
+  standard on-demand rates configured in `cdk/config/model-pricing.json`;
+  recent models use JSON overrides. GPT OSS is resolved dynamically and
+  Claude Opus 4.7 has the default override. There is no periodic refresh.
+  Unknown models use the configured conservative fallback, which can
+  overstate USD usage and throttle earlier rather than leave spend unpriced.
+  Price List rates remain estimates and exclude private discounts,
+  commitments, and credits.
 - **Upstream auth**: the gateway mints short-term Bedrock API keys from its
   own IAM role (`aws-bedrock-token-generator`); no long-term secrets are
   stored. The role uses the `AmazonBedrockMantleInferenceAccess` managed
@@ -619,10 +595,11 @@ You can cross-check gateway numbers against the service-side
   reachable**, satisfying the Palisade "world-accessible Lambda" policy.
   SigV4 owns `Authorization`; the end-user JWT travels in
   `X-Quota-User-Token`, and the admin key in `X-Quota-Admin-Key`. Grant
-  specific caller roles with
-  `-c invoker_principal_arns=arn1,arn2` (defaults to the account root).
-- Daily windows reset at **00:00 UTC**; usage records expire from DynamoDB
-  after 35 days, and broker session-map rows after two days (DynamoDB TTL).
+  specific caller roles with `invoker_principal_arns`; production should not
+  retain the account-root default.
+- Daily windows reset at **00:00 UTC**; usage records use the configured
+  `usage_retention_days` DynamoDB TTL, and broker session-map rows expire
+  after two days.
 - Warning notifications are emitted once per user per UTC window, not every
   reconciler run.
 
@@ -630,18 +607,15 @@ You can cross-check gateway numbers against the service-side
 
 ```bash
 pip install fastapi httpx pytest boto3 'PyJWT[crypto]'
-pytest tests/ -q     # 96 tests, no AWS account or network needed
+pytest tests/ -q
 ```
 
 ## Cleanup
 
-```bash
-cd cdk && cdk destroy
-```
-
-If the stack managed Bedrock invocation logging, that regional configuration,
-its log group, and its writer role are retained intentionally. Review or
-remove them manually only after confirming no other workload depends on them.
+See [DEPLOYMENT.md](DEPLOYMENT.md#verification-and-teardown). Demo tables use
+`DESTROY`; production can use `RETAIN`. If the stack managed Bedrock
+invocation logging, the regional configuration, log group, and writer role
+are retained intentionally.
 
 ## Related samples
 

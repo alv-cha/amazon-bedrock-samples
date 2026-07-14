@@ -144,6 +144,47 @@ def test_missing_model_is_400(client, alice):
     assert r.status_code == 400
 
 
+def test_mode_b_model_allowlist_rejects_before_upstream(
+        client, alice, upstream, monkeypatch):
+    from app.config import Settings
+    monkeypatch.setenv(
+        "MODE_B_ALLOWED_MODEL_IDS_JSON",
+        '["anthropic.claude-opus-4-7"]',
+    )
+    monkeypatch.setattr(gateway, "settings", Settings())
+
+    r = _post(client, alice, {"model": MODEL, "input": "hello"})
+    assert r.status_code == 403
+    assert r.json()["error"]["type"] == "model_not_allowed"
+    assert upstream.requests == []
+
+
+def test_mode_b_model_allowlist_filters_models_and_count_tokens(
+        client, alice, upstream, monkeypatch):
+    from app.config import Settings
+    allowed = "anthropic.claude-opus-4-7"
+    monkeypatch.setenv("MODE_B_ALLOWED_MODEL_IDS_JSON", json.dumps([allowed]))
+    monkeypatch.setattr(gateway, "settings", Settings())
+    upstream.response_factory = lambda req: httpx.Response(200, json={
+        "data": [
+            {"id": allowed, "object": "model"},
+            {"id": MODEL, "object": "model"},
+        ]
+    })
+
+    listed = client.get(
+        "/v1/models", headers={"Authorization": f"Bearer {alice}"}
+    )
+    assert [model["id"] for model in listed.json()["data"]] == [allowed]
+
+    rejected = client.post(
+        "/v1/messages/count_tokens",
+        json={"model": MODEL, "messages": []},
+        headers={"Authorization": f"Bearer {alice}"},
+    )
+    assert rejected.status_code == 403
+
+
 def test_multi_tenant_budget_keys_on_tenant_claim(client, monkeypatch, fake_dynamodb):
     """Multi-tenant: budgeting on a tenant claim (not sub) shares one budget
     across a tenant's users and isolates spend between tenants."""
@@ -353,13 +394,28 @@ def test_dedicated_admin_header_coexists_with_sigv4_authorization(client):
 
 def test_admin_preprovision_with_custom_limits(client, upstream, fake_dynamodb):
     r = client.post("/admin/users",
-                    json={"user_id": "carol", "daily_usd": 2.5},
+                    json={
+                        "user_id": "carol",
+                        "daily_usd": 2.5,
+                        "daily_input_tokens": 250_000,
+                        "daily_output_tokens": 50_000,
+                    },
                     headers={"Authorization": "Bearer admin-secret"})
     assert r.status_code == 200
-    assert r.json() == {"user_id": "carol", "provisioned": True}
+    assert r.json() == {
+        "user_id": "carol",
+        "provisioned": True,
+        "limits": {
+            "daily_usd": 2.5,
+            "daily_input_tokens": 250_000,
+            "daily_output_tokens": 50_000,
+        },
+    }
 
     user = QuotaStore(dynamodb=fake_dynamodb).get_user("carol")
     assert user.daily_usd_micro == 2_500_000
+    assert user.daily_input_tokens == 250_000
+    assert user.daily_output_tokens == 50_000
 
     # Carol calls with her JWT; her pre-set limits apply (not defaults).
     r2 = _post(client, make_jwt("carol"), {"model": MODEL, "input": "hello"})
@@ -374,6 +430,80 @@ def test_admin_create_requires_user_id(client):
     r = client.post("/admin/users", json={"daily_usd": 1},
                     headers={"Authorization": "Bearer admin-secret"})
     assert r.status_code == 400
+
+
+@pytest.mark.parametrize("path", [
+    "/admin/users",
+    "/admin/users/carol/limits",
+    "/admin/users/carol/status",
+])
+def test_admin_rejects_malformed_json(client, path):
+    r = client.request(
+        "POST" if path == "/admin/users" else "PUT",
+        path,
+        content="{",
+        headers={
+            "Authorization": "Bearer admin-secret",
+            "Content-Type": "application/json",
+        },
+    )
+    assert r.status_code == 400
+    assert r.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_admin_updates_all_quota_dimensions(client, fake_dynamodb):
+    QuotaStore(dynamodb=fake_dynamodb).put_user(
+        "carol", "Carol", daily_usd=1,
+        daily_input_tokens=100, daily_output_tokens=50,
+    )
+    r = client.put(
+        "/admin/users/carol/limits",
+        json={
+            "daily_usd": 3.5,
+            "daily_input_tokens": 900_000,
+            "daily_output_tokens": 120_000,
+        },
+        headers={"Authorization": "Bearer admin-secret"},
+    )
+    assert r.status_code == 200
+    assert r.json()["limits"] == {
+        "daily_usd": 3.5,
+        "daily_input_tokens": 900_000,
+        "daily_output_tokens": 120_000,
+    }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"daily_usd": -1},
+        {"daily_usd": True},
+        {"daily_input_tokens": -1},
+        {"daily_input_tokens": 1.5},
+        {"daily_output_tokens": False},
+        {},
+    ],
+)
+def test_admin_rejects_invalid_limit_updates(client, fake_dynamodb, payload):
+    QuotaStore(dynamodb=fake_dynamodb).put_user(
+        "carol", "Carol", daily_usd=1,
+        daily_input_tokens=100, daily_output_tokens=50,
+    )
+    r = client.put(
+        "/admin/users/carol/limits",
+        json=payload,
+        headers={"Authorization": "Bearer admin-secret"},
+    )
+    assert r.status_code == 400
+
+
+def test_admin_update_requires_existing_user(client):
+    r = client.put(
+        "/admin/users/missing/limits",
+        json={"daily_usd": 1},
+        headers={"Authorization": "Bearer admin-secret"},
+    )
+    assert r.status_code == 404
 
 
 def test_admin_block_user(client, alice):

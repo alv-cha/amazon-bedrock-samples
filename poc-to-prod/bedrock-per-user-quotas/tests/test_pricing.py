@@ -51,6 +51,17 @@ def test_env_override(monkeypatch):
     )
     reset_price_cache()
     assert cost_micro_usd("my.model", 1_000_000, 1_000_000) == 3 * MICRO
+    # A deployment snapshot is authoritative; local defaults are not overlaid.
+    assert get_price("openai.gpt-oss-120b") == FALLBACK_PRICE
+
+
+def test_configured_unknown_model_fallback(monkeypatch):
+    monkeypatch.setenv(
+        "MODEL_FALLBACK_PRICE_JSON",
+        '{"input_per_mtok": 40.0, "output_per_mtok": 90.0}',
+    )
+    reset_price_cache()
+    assert cost_micro_usd("unknown.model", 1_000_000, 1_000_000) == 130 * MICRO
 
 
 def test_cache_tokens_priced_with_multipliers():

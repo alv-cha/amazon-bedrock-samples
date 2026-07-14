@@ -112,6 +112,19 @@ def test_snapshot_rejects_ambiguous_standard_price():
         )
 
 
+def test_fallback_is_never_lower_than_known_snapshot_prices():
+    assert resolver.conservative_fallback(
+        {
+            "cheap": {"input_per_mtok": 1, "output_per_mtok": 2},
+            "premium": {"input_per_mtok": 20, "output_per_mtok": 80},
+        },
+        {"input_per_mtok": 15, "output_per_mtok": 100},
+    ) == {
+        "input_per_mtok": 20.0,
+        "output_per_mtok": 100.0,
+    }
+
+
 def test_delete_does_not_query_pricing(monkeypatch):
     monkeypatch.setattr(
         resolver.boto3,

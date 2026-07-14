@@ -60,9 +60,9 @@ def _emit_emf(user_id: str, d_cost_micro: int, d_in: int, d_out: int, d_req: int
 # --- pricing (self-contained; the reconciler is a separate Lambda asset and
 # cannot import gateway/app/pricing.py at runtime) ---
 # USD per 1M tokens. In a real deploy the CDK injects MODEL_PRICES_JSON (the
-# SAME table given to the gateway) which _prices() overlays on top of these,
-# so the two Lambdas price identically and can't drift. This dict is only the
-# local/offline fallback when MODEL_PRICES_JSON is unset.
+# SAME table given to the gateway), which _prices() uses as the complete
+# authoritative snapshot so the two Lambdas cannot drift. This dict is only
+# the local/offline fallback when MODEL_PRICES_JSON is unset.
 #
 # CACHE CAVEAT: unlike the gateway, this pricer has no prompt-cache
 # multipliers, because Bedrock model-invocation logs carry no cache-token
@@ -87,17 +87,29 @@ _DEFAULT_PRICES = {
 _FALLBACK_PRICE = (15.00, 75.00)
 
 
+def _fallback_price() -> tuple[float, float]:
+    raw = os.environ.get("MODEL_FALLBACK_PRICE_JSON")
+    if not raw:
+        return _FALLBACK_PRICE
+    parsed = json.loads(raw)
+    return (
+        float(parsed["input_per_mtok"]),
+        float(parsed["output_per_mtok"]),
+    )
+
+
 def _prices() -> dict:
-    prices = dict(_DEFAULT_PRICES)
     raw = os.environ.get("MODEL_PRICES_JSON")
-    if raw:
-        for model_id, p in json.loads(raw).items():
-            prices[model_id] = (float(p["input_per_mtok"]), float(p["output_per_mtok"]))
+    if not raw:
+        return dict(_DEFAULT_PRICES)
+    prices = {}
+    for model_id, p in json.loads(raw).items():
+        prices[model_id] = (float(p["input_per_mtok"]), float(p["output_per_mtok"]))
     return prices
 
 
 def _cost_micro(prices: dict, model_id: str, in_tok: int, out_tok: int) -> int:
-    in_rate, out_rate = prices.get(model_id, _FALLBACK_PRICE)
+    in_rate, out_rate = prices.get(model_id, _fallback_price())
     usd = (max(in_tok, 0) * in_rate + max(out_tok, 0) * out_rate) / 1_000_000
     micro = int(usd * MICRO)
     return micro + 1 if usd * MICRO > micro else micro  # round up
@@ -164,7 +176,8 @@ def _mark_warning_sent(users_table, user_id: str, window: str) -> None:
     )
 
 
-def _window_ttl_epoch(now: datetime, keep_days: int = 35) -> int:
+def _window_ttl_epoch(now: datetime, keep_days: int | None = None) -> int:
+    keep_days = keep_days or int(os.environ.get("USAGE_RETENTION_DAYS", "35"))
     return int(now.timestamp()) + keep_days * 86400
 
 

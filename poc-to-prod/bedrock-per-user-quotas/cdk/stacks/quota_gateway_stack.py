@@ -12,6 +12,8 @@ Resources:
 - CloudWatch dashboard over the gateway's EMF metrics
 """
 
+import json
+
 import aws_cdk as cdk
 from aws_cdk import (
     Duration,
@@ -32,31 +34,9 @@ from aws_cdk import (
 )
 from constructs import Construct
 
+from .configuration import DeploymentConfig
+
 METRICS_NAMESPACE = "BedrockQuotaGateway"
-
-# Price List model names mapped to every ID the gateway and Bedrock invocation
-# logs can emit. A deployment-time custom resource resolves these into one
-# immutable USD-per-MTok snapshot shared by the gateway and reconciler.
-PRICE_CATALOG_MODELS = {
-    "gpt-oss-120b": [
-        "openai.gpt-oss-120b",
-        "openai.gpt-oss-120b-1:0",
-    ],
-    "gpt-oss-20b": [
-        "openai.gpt-oss-20b",
-        "openai.gpt-oss-20b-1:0",
-    ],
-}
-
-# Price List API does not yet expose recent Claude models. Keep explicit
-# deployment-time overrides for those gaps; unknown models still use the
-# conservative runtime fallback.
-PINNED_PRICE_OVERRIDES = {
-    "anthropic.claude-opus-4-7": {
-        "input_per_mtok": 15.00,
-        "output_per_mtok": 75.00,
-    },
-}
 
 # MODEL_PRICES_JSON is injected into BOTH Lambdas. The gateway prices at
 # settle time; the reconciler is authoritative for native-vended traffic.
@@ -75,28 +55,24 @@ class QuotaGatewayStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        alert_email = self.node.try_get_context("alert_email")
-        jwt_issuer = self.node.try_get_context("jwt_issuer")
-        jwt_audience = self.node.try_get_context("jwt_audience") or ""
-        jwt_jwks_url = self.node.try_get_context("jwt_jwks_url") or ""
-        jwt_user_claim = self.node.try_get_context("jwt_user_claim") or "sub"
+        config = DeploymentConfig.from_node(self.node)
+        alert_email = config.alert_email
+        jwt_issuer = config.jwt_issuer
+        jwt_audience = config.jwt_audience
+        jwt_jwks_url = config.jwt_jwks_url
+        jwt_user_claim = config.jwt_user_claim
         # Vended-credential lifetime = the broker's AssumeRole DurationSeconds
         # (VENDED_CREDENTIAL_TTL_SECONDS env). STS bounds AssumeRole duration to
         # 900s–43200s. The vended role's max_session_duration is derived from it
         # (see below) so DurationSeconds can never exceed the role's ceiling.
-        vended_ttl_seconds = int(self.node.try_get_context("vended_ttl_seconds") or 900)
-        if not 900 <= vended_ttl_seconds <= 43200:
-            raise ValueError(
-                "vended_ttl_seconds must be between 900 (15 min) and 43200 "
-                f"(12h, the STS AssumeRole duration limit); got {vended_ttl_seconds}."
-            )
+        vended_ttl_seconds = config.vended_ttl_seconds
         # A role's max_session_duration floor is 3600s (STS), independent of the
         # AssumeRole duration floor (900s), so lift the ceiling to at least 1h.
         max_session_seconds = max(vended_ttl_seconds, 3600)
         # -c snapstart=true: resume the gateway from a Firecracker microVM
         # snapshot instead of cold-starting (Python SnapStart). Requires
         # publishing versions; the Function URL then targets an alias.
-        use_snapstart = str(self.node.try_get_context("snapstart")).lower() == "true"
+        use_snapstart = config.snapstart
 
         # ------------------------------------------------------------------
         # Deployment-time Bedrock price snapshot
@@ -125,11 +101,13 @@ class QuotaGatewayStack(Stack):
             resource_type="Custom::BedrockModelPriceSnapshot",
             properties={
                 "RegionCode": self.region,
-                "CatalogModels": PRICE_CATALOG_MODELS,
-                "PinnedPrices": PINNED_PRICE_OVERRIDES,
+                "CatalogModels": config.model_pricing.catalog_models,
+                "PinnedPrices": config.model_pricing.price_overrides,
+                "FallbackPrice": config.model_pricing.fallback_price,
             },
         )
         model_prices_json = price_snapshot.get_att_string("ModelPricesJson")
+        fallback_price_json = price_snapshot.get_att_string("FallbackPriceJson")
 
         # ------------------------------------------------------------------
         # Identity: BYO OIDC issuer, or a demo Cognito User Pool
@@ -157,12 +135,17 @@ class QuotaGatewayStack(Stack):
         # ------------------------------------------------------------------
         # DynamoDB
         # ------------------------------------------------------------------
+        table_removal_policy = (
+            RemovalPolicy.RETAIN
+            if config.retain_tables_on_delete
+            else RemovalPolicy.DESTROY
+        )
         users_table = ddb.Table(
             self, "UsersTable",
             partition_key=ddb.Attribute(name="user_id", type=ddb.AttributeType.STRING),
             billing_mode=ddb.BillingMode.PAY_PER_REQUEST,
             time_to_live_attribute="expires_at",
-            removal_policy=RemovalPolicy.DESTROY,  # sample: destroy on teardown
+            removal_policy=table_removal_policy,
         )
 
         usage_table = ddb.Table(
@@ -171,7 +154,7 @@ class QuotaGatewayStack(Stack):
             sort_key=ddb.Attribute(name="window", type=ddb.AttributeType.STRING),
             billing_mode=ddb.BillingMode.PAY_PER_REQUEST,
             time_to_live_attribute="expires_at",
-            removal_policy=RemovalPolicy.DESTROY,
+            removal_policy=table_removal_policy,
         )
 
         # ------------------------------------------------------------------
@@ -191,7 +174,7 @@ class QuotaGatewayStack(Stack):
         # AWS Lambda Web Adapter public layer (zip packaging). Name/version
         # per https://github.com/awslabs/aws-lambda-web-adapter — override
         # with -c adapter_layer_arn=... if a newer version ships.
-        adapter_layer_arn = self.node.try_get_context("adapter_layer_arn") or (
+        adapter_layer_arn = config.adapter_layer_arn or (
             f"arn:aws:lambda:{self.region}:753240598075:layer:LambdaAdapterLayerX86:28"
         )
         adapter_layer = lambda_.LayerVersion.from_layer_version_arn(
@@ -235,8 +218,22 @@ class QuotaGatewayStack(Stack):
                 "USAGE_TABLE": usage_table.table_name,
                 "METRICS_NAMESPACE": METRICS_NAMESPACE,
                 "ADMIN_KEY_SECRET_ARN": admin_secret.secret_arn,
+                "AUTO_PROVISION_USERS": str(config.auto_provision_users).lower(),
+                "DEFAULT_DAILY_USD": str(config.default_daily_usd),
+                "DEFAULT_DAILY_INPUT_TOKENS": str(
+                    config.default_daily_input_tokens
+                ),
+                "DEFAULT_DAILY_OUTPUT_TOKENS": str(
+                    config.default_daily_output_tokens
+                ),
+                "USAGE_RETENTION_DAYS": str(config.usage_retention_days),
+                "MODE_B_ALLOWED_MODEL_IDS_JSON": json.dumps(
+                    config.mode_b_allowed_model_ids,
+                    separators=(",", ":"),
+                ),
                 # Single price source shared with the reconciler (prevents drift).
                 "MODEL_PRICES_JSON": model_prices_json,
+                "MODEL_FALLBACK_PRICE_JSON": fallback_price_json,
                 # JWT auth
                 "JWT_ISSUER": jwt_issuer,
                 "JWT_AUDIENCE": jwt_audience,
@@ -262,9 +259,8 @@ class QuotaGatewayStack(Stack):
         # RoleSessionName + SourceIdentity = a sanitized id derived from the
         # identity claim (reverse-mapped for metering). The user then calls
         # Bedrock NATIVELY (InvokeModel / Converse / streaming, any provider)
-        # with the short-lived creds. Scoped to Bedrock invoke actions on all
-        # models in this account/region; tighten `resources` to specific
-        # model ARNs to restrict which models users may call.
+        # with the short-lived creds. The configured Mode A IAM resource ARNs
+        # determine which models users may call.
         # ------------------------------------------------------------------
         bedrock_user_role = iam.Role(
             self, "BedrockUserRole",
@@ -306,10 +302,9 @@ class QuotaGatewayStack(Stack):
                 # let a user spend via vended creds with ZERO metering and no
                 # enforcement. Mode A's native path must stay on the logged
                 # endpoint. (Mode B proxies mantle in-band and meters there.)
-                # All models in this account/region (sample default); tighten
-                # `resources` to specific model ARNs to restrict which models
-                # users may call.
-                resources=["*"],
+                # This IAM resource allowlist is intentionally independent
+                # from Mode B's request-body model ID allowlist.
+                resources=list(config.mode_a_allowed_model_arns),
             )
         )
         # Let the gateway role assume the vended role AND stamp the per-user
@@ -349,36 +344,13 @@ class QuotaGatewayStack(Stack):
         # account-wide setting. That group must already receive model-
         # invocation logs whose identity.arn carries the vended session name.
         # ------------------------------------------------------------------
-        manage_logging_context = self.node.try_get_context("manage_invocation_logging")
-        manage_logging = str(manage_logging_context).lower() == "true"
-        existing_log_group_name = self.node.try_get_context("invocation_log_group_name")
+        manage_logging = config.manage_invocation_logging
+        existing_log_group_name = config.invocation_log_group_name
 
         if existing_log_group_name:
             # Bring-your-own group: never mutate the account-wide setting.
             invocation_log_group = logs.LogGroup.from_log_group_name(
                 self, "BedrockInvocationLogs", existing_log_group_name
-            )
-            manage_logging = False
-        elif manage_logging_context is None:
-            raise ValueError(
-                "Bedrock model-invocation logging is an account + region-wide "
-                "setting, so this stack will not change it without explicit "
-                "consent. Use -c manage_invocation_logging=true to let this "
-                "sample manage it, or use -c manage_invocation_logging=false "
-                "-c invocation_log_group_name=<existing-group>."
-            )
-        elif not manage_logging:
-            # No group given AND not managing the account-wide config: the
-            # reconciler would query a log group that receives nothing, so
-            # Mode A native spend is metered as zero and never enforced. Fail
-            # loudly rather than deploy a gateway that silently meters nothing.
-            raise ValueError(
-                "manage_invocation_logging=false requires "
-                "-c invocation_log_group_name=<an existing log group that "
-                "already receives Bedrock model-invocation logs>. Without it "
-                "the reconciler has no usage source and Mode A budgets would "
-                "not be enforced. To let this stack manage logging itself, "
-                "set -c manage_invocation_logging=true explicitly."
             )
         else:
             invocation_log_group = logs.LogGroup(
@@ -497,9 +469,8 @@ class QuotaGatewayStack(Stack):
         # roles, or your own role for the demo). Grant via
         # -c invoker_principal_arns=arn1,arn2 ; defaults to this account's
         # root so any IAM principal in the account can be granted normally.
-        invoker_arns = self.node.try_get_context("invoker_principal_arns")
-        if invoker_arns:
-            for arn in [a.strip() for a in invoker_arns.split(",") if a.strip()]:
+        if config.invoker_principal_arns:
+            for arn in config.invoker_principal_arns:
                 fn_url.grant_invoke_url(iam.ArnPrincipal(arn))
         else:
             fn_url.grant_invoke_url(iam.AccountRootPrincipal())
@@ -551,13 +522,15 @@ class QuotaGatewayStack(Stack):
                 "USERS_TABLE": users_table.table_name,
                 "USAGE_TABLE": usage_table.table_name,
                 "SNS_TOPIC_ARN": alert_topic.topic_arn,
-                "WARN_THRESHOLD": "0.8",
+                "WARN_THRESHOLD": str(config.warn_threshold),
+                "USAGE_RETENTION_DAYS": str(config.usage_retention_days),
                 # Native-vended usage EMF is emitted under the same namespace
                 # as the gateway's so the dashboard reflects Mode A traffic too.
                 "METRICS_NAMESPACE": METRICS_NAMESPACE,
                 # Same price source as the gateway so the authoritative
                 # reconciler cost can't drift from the gateway's settle cost.
                 "MODEL_PRICES_JSON": model_prices_json,
+                "MODEL_FALLBACK_PRICE_JSON": fallback_price_json,
                 # Source of per-user token counts (any Bedrock API/provider).
                 "INVOCATION_LOG_GROUP": invocation_log_group.log_group_name,
             },
@@ -637,11 +610,16 @@ class QuotaGatewayStack(Stack):
         cdk.CfnOutput(self, "DenyDirectBedrockPolicyArn", value=deny_direct.managed_policy_arn,
                       description="Attach to non-gateway roles to prevent bypassing the gateway")
         cdk.CfnOutput(self, "GatewayRoleArn", value=gateway_fn.role.role_arn,
-                      description="The only principal that should be allowed to invoke Bedrock directly")
+                      description="Role used by the Mode B gateway to invoke Bedrock")
         cdk.CfnOutput(
             self, "ModelPriceSnapshot",
             value=model_prices_json,
             description="Standard on-demand USD-per-MTok prices captured at stack deployment",
+        )
+        cdk.CfnOutput(
+            self, "ModelFallbackPrice",
+            value=fallback_price_json,
+            description="Conservative USD-per-MTok fallback for unknown model IDs",
         )
         if user_pool is not None:
             cdk.CfnOutput(self, "DemoUserPoolId", value=user_pool.user_pool_id)

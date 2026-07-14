@@ -26,6 +26,7 @@ IdP — Cognito, Okta, Auth0, ...); the quota identity is a configurable claim
 """
 
 import json
+import math
 import time
 
 import boto3
@@ -150,6 +151,19 @@ def _quota_headers(user: UserRecord, remaining_usd_micro: int | None) -> dict[st
     return headers
 
 
+def _model_allowed(model_id: str) -> bool:
+    allowed = settings.mode_b_allowed_model_ids
+    return not allowed or model_id in allowed
+
+
+def _model_not_allowed(model_id: str) -> JSONResponse:
+    return _error(
+        403,
+        f"Model '{model_id}' is not allowed by this Mode B deployment.",
+        "model_not_allowed",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Credential broker: the primary, API-agnostic path.
 #
@@ -229,9 +243,11 @@ async def _proxy_inference(request: Request, path: str) -> Response:
     except (ValueError, AssertionError):
         return _error(400, "Request body must be a JSON object.", "invalid_request_error")
 
-    model_id = str(body.get("model", ""))
-    if not model_id:
+    model_id = body.get("model")
+    if not isinstance(model_id, str) or not model_id:
         return _error(400, "Missing required field: model.", "invalid_request_error")
+    if not _model_allowed(model_id):
+        return _model_not_allowed(model_id)
 
     streaming = bool(body.get("stream", False))
 
@@ -397,6 +413,16 @@ async def count_tokens(request: Request) -> Response:
     if user is None:
         return _error(401, f"Unauthorized: {auth_error}", "invalid_api_key")
     raw = await request.body()
+    try:
+        body = json.loads(raw)
+        model_id = body.get("model")
+    except (ValueError, AttributeError):
+        return _error(400, "Request body must be a JSON object.",
+                      "invalid_request_error")
+    if not isinstance(model_id, str) or not model_id:
+        return _error(400, "Missing required field: model.", "invalid_request_error")
+    if not _model_allowed(model_id):
+        return _model_not_allowed(model_id)
     upstream = await mantle().post_json("/anthropic/v1/messages/count_tokens",
                                         raw, dict(request.headers))
     return Response(content=upstream.content, status_code=upstream.status_code,
@@ -408,7 +434,20 @@ async def list_models(request: Request) -> Response:
     if user is None:
         return _error(401, f"Unauthorized: {auth_error}", "invalid_api_key")
     upstream = await mantle().get("/v1/models", {})
-    return Response(content=upstream.content, status_code=upstream.status_code,
+    content = upstream.content
+    if settings.mode_b_allowed_model_ids and upstream.status_code < 400:
+        try:
+            payload = upstream.json()
+            if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+                payload["data"] = [
+                    model for model in payload["data"]
+                    if isinstance(model, dict)
+                    and str(model.get("id", "")) in settings.mode_b_allowed_model_ids
+                ]
+                content = json.dumps(payload).encode("utf-8")
+        except ValueError:
+            pass
+    return Response(content=content, status_code=upstream.status_code,
                     headers=response_headers(upstream))
 
 
@@ -454,6 +493,64 @@ def _require_admin(request: Request) -> JSONResponse | None:
     return None
 
 
+async def _admin_json_object(
+    request: Request,
+) -> tuple[dict | None, JSONResponse | None]:
+    try:
+        body = await request.json()
+    except (ValueError, UnicodeDecodeError):
+        return None, _error(
+            400,
+            "Request body must be a JSON object.",
+            "invalid_request_error",
+        )
+    if not isinstance(body, dict):
+        return None, _error(
+            400,
+            "Request body must be a JSON object.",
+            "invalid_request_error",
+        )
+    return body, None
+
+
+def _limits_json(user: UserRecord) -> dict:
+    return {
+        "daily_usd": user.daily_usd_micro / MICRO,
+        "daily_input_tokens": user.daily_input_tokens,
+        "daily_output_tokens": user.daily_output_tokens,
+    }
+
+
+def _parse_limits(body: dict, *, with_defaults: bool) -> tuple[dict, str]:
+    defaults = {
+        "daily_usd": settings.default_daily_usd,
+        "daily_input_tokens": settings.default_daily_input_tokens,
+        "daily_output_tokens": settings.default_daily_output_tokens,
+    }
+    values = {}
+    for field_name, default in defaults.items():
+        if field_name not in body:
+            if with_defaults:
+                values[field_name] = default
+            continue
+        raw = body[field_name]
+        if field_name == "daily_usd":
+            if isinstance(raw, bool):
+                return {}, f"{field_name} must be a non-negative number."
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                return {}, f"{field_name} must be a non-negative number."
+            if not math.isfinite(value) or value < 0:
+                return {}, f"{field_name} must be a non-negative number."
+        else:
+            if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+                return {}, f"{field_name} must be a non-negative integer."
+            value = raw
+        values[field_name] = value
+    return values, ""
+
+
 @app.post("/admin/users")
 async def create_user(request: Request) -> Response:
     """Pre-provision a user (by their IdP subject) with non-default limits.
@@ -463,19 +560,34 @@ async def create_user(request: Request) -> Response:
     """
     if (deny := _require_admin(request)) is not None:
         return deny
-    body = await request.json()
+    body, error = await _admin_json_object(request)
+    if error is not None:
+        return error
+    assert body is not None
     user_id = body.get("user_id")
-    if not user_id:
+    if not isinstance(user_id, str) or not user_id.strip():
         return _error(400, "user_id is required (the IdP subject / configured claim value).",
                       "invalid_request_error")
+    user_id = user_id.strip()
+    name = body.get("name", user_id)
+    if not isinstance(name, str) or not name.strip():
+        return _error(400, "name must be a non-empty string.",
+                      "invalid_request_error")
+    limits, limit_error = _parse_limits(body, with_defaults=True)
+    if limit_error:
+        return _error(400, limit_error, "invalid_request_error")
     store().put_user(
         user_id=user_id,
-        name=body.get("name", user_id),
-        daily_usd=float(body.get("daily_usd", settings.default_daily_usd)),
-        daily_input_tokens=int(body.get("daily_input_tokens", settings.default_daily_input_tokens)),
-        daily_output_tokens=int(body.get("daily_output_tokens", settings.default_daily_output_tokens)),
+        name=name.strip(),
+        **limits,
     )
-    return JSONResponse({"user_id": user_id, "provisioned": True})
+    user = store().get_user(user_id)
+    assert user is not None
+    return JSONResponse({
+        "user_id": user_id,
+        "provisioned": True,
+        "limits": _limits_json(user),
+    })
 
 
 @app.get("/admin/users")
@@ -487,11 +599,7 @@ async def list_users(request: Request) -> Response:
         usage = store().get_window_usage(user.user_id)
         out.append({
             "user_id": user.user_id, "name": user.name, "status": user.status,
-            "limits": {
-                "daily_usd": user.daily_usd_micro / MICRO,
-                "daily_input_tokens": user.daily_input_tokens,
-                "daily_output_tokens": user.daily_output_tokens,
-            },
+            "limits": _limits_json(user),
             "today": usage,
         })
     return JSONResponse({"users": out})
@@ -508,21 +616,42 @@ async def user_usage(user_id: str, request: Request, window: str | None = None) 
 async def set_limits(user_id: str, request: Request) -> Response:
     if (deny := _require_admin(request)) is not None:
         return deny
-    body = await request.json()
-    store().set_user_limits(
-        user_id,
-        daily_usd=body.get("daily_usd"),
-        daily_input_tokens=body.get("daily_input_tokens"),
-        daily_output_tokens=body.get("daily_output_tokens"),
-    )
-    return JSONResponse({"user_id": user_id, "updated": True})
+    body, error = await _admin_json_object(request)
+    if error is not None:
+        return error
+    assert body is not None
+    if store().get_user(user_id) is None:
+        return _error(404, f"User '{user_id}' was not found.", "not_found")
+    limits, limit_error = _parse_limits(body, with_defaults=False)
+    if limit_error:
+        return _error(400, limit_error, "invalid_request_error")
+    if not limits:
+        return _error(
+            400,
+            "At least one of daily_usd, daily_input_tokens, or "
+            "daily_output_tokens is required.",
+            "invalid_request_error",
+        )
+    store().set_user_limits(user_id, **limits)
+    user = store().get_user(user_id)
+    assert user is not None
+    return JSONResponse({
+        "user_id": user_id,
+        "updated": True,
+        "limits": _limits_json(user),
+    })
 
 
 @app.put("/admin/users/{user_id}/status")
 async def set_status(user_id: str, request: Request) -> Response:
     if (deny := _require_admin(request)) is not None:
         return deny
-    body = await request.json()
+    body, error = await _admin_json_object(request)
+    if error is not None:
+        return error
+    assert body is not None
+    if store().get_user(user_id) is None:
+        return _error(404, f"User '{user_id}' was not found.", "not_found")
     status = body.get("status")
     if status not in ("active", "blocked"):
         return _error(400, "status must be 'active' or 'blocked'.", "invalid_request_error")

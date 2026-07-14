@@ -1,0 +1,27 @@
+{
+  "alert_email": "platform-alerts@example.com",
+  "jwt_issuer": "https://idp.example.com",
+  "jwt_audience": "bedrock-quota-gateway",
+  "jwt_user_claim": "custom:tenant_id",
+  "auto_provision_users": false,
+  "default_daily_usd": 25.0,
+  "default_daily_input_tokens": 10000000,
+  "default_daily_output_tokens": 2000000,
+  "warn_threshold": 0.75,
+  "usage_retention_days": 90,
+  "retain_tables_on_delete": true,
+  "manage_invocation_logging": false,
+  "invocation_log_group_name": "/aws/bedrock/modelinvocations",
+  "invoker_principal_arns": [
+    "arn:aws:iam::111122223333:role/BedrockQuotaGatewayInvoker"
+  ],
+  "mode_b_allowed_model_ids": [
+    "openai.gpt-oss-120b",
+    "anthropic.claude-opus-4-7"
+  ],
+  "mode_a_allowed_model_arns": [
+    "arn:aws:bedrock:us-east-1::foundation-model/openai.gpt-oss-120b-1:0",
+    "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-opus-4-7"
+  ],
+  "model_config": "model-pricing.json"
+}

@@ -1,10 +1,8 @@
 """Model price table and cost estimation.
 
-Prices are expressed in USD per **1 million tokens** and are deliberately
-kept in one editable place. The values below are PLACEHOLDERS — check the
-current Amazon Bedrock pricing page for the models you enable and update
-this table (or set the MODEL_PRICES_JSON environment variable, which takes
-precedence and lets you change prices without redeploying code).
+Prices are expressed in USD per **1 million tokens**. CDK resolves the
+configured catalog and overrides into one deployment-time snapshot and
+injects it through ``MODEL_PRICES_JSON``.
 
 Internally the gateway accounts cost in **micro-USD** (1e-6 USD) as
 integers so DynamoDB atomic counters stay exact.
@@ -23,7 +21,8 @@ class ModelPrice:
     output_per_mtok: float  # USD per 1M output tokens
 
 
-# --- PLACEHOLDER prices: verify against the Bedrock pricing page. ---
+# Local/offline defaults. A deployed stack always injects its captured
+# snapshot, configured in cdk/config/model-pricing.json (or another JSON file).
 GPT_OSS_120B_PRICE = ModelPrice(input_per_mtok=0.15, output_per_mtok=0.60)
 GPT_OSS_20B_PRICE = ModelPrice(input_per_mtok=0.07, output_per_mtok=0.30)
 DEFAULT_PRICES: dict[str, ModelPrice] = {
@@ -34,9 +33,20 @@ DEFAULT_PRICES: dict[str, ModelPrice] = {
     "anthropic.claude-opus-4-7": ModelPrice(input_per_mtok=15.00, output_per_mtok=75.00),
 }
 
-# Unknown models are billed at the most expensive known rate so that a
-# missing table entry can never be used to bypass a budget.
-FALLBACK_PRICE = ModelPrice(input_per_mtok=15.00, output_per_mtok=75.00)
+DEFAULT_FALLBACK_PRICE = ModelPrice(input_per_mtok=15.00, output_per_mtok=75.00)
+# Backwards-compatible import for local users and existing tests.
+FALLBACK_PRICE = DEFAULT_FALLBACK_PRICE
+
+
+def load_fallback_price() -> ModelPrice:
+    raw = os.environ.get("MODEL_FALLBACK_PRICE_JSON")
+    if not raw:
+        return DEFAULT_FALLBACK_PRICE
+    parsed = json.loads(raw)
+    return ModelPrice(
+        input_per_mtok=float(parsed["input_per_mtok"]),
+        output_per_mtok=float(parsed["output_per_mtok"]),
+    )
 
 
 def load_prices() -> dict[str, ModelPrice]:
@@ -44,7 +54,7 @@ def load_prices() -> dict[str, ModelPrice]:
     if not raw:
         return dict(DEFAULT_PRICES)
     parsed = json.loads(raw)
-    prices = dict(DEFAULT_PRICES)
+    prices = {}
     for model_id, p in parsed.items():
         prices[model_id] = ModelPrice(
             input_per_mtok=float(p["input_per_mtok"]),
@@ -60,7 +70,7 @@ def get_price(model_id: str) -> ModelPrice:
     global _PRICES
     if _PRICES is None:
         _PRICES = load_prices()
-    return _PRICES.get(model_id, FALLBACK_PRICE)
+    return _PRICES.get(model_id, load_fallback_price())
 
 
 # Anthropic prompt-caching price multipliers relative to the input price
