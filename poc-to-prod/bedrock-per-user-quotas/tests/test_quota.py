@@ -109,6 +109,43 @@ def test_settle_with_cache_tokens_counts_them(store, user):
     assert usage["output_tokens"] == 200
 
 
+def test_reserve_treats_zero_limit_as_unlimited(store):
+    """#6: a per-dimension limit of 0 means 'not enforced', not 'block all'.
+    A user capped on USD only (token limits 0) must not be denied on tokens."""
+    store.put_user(user_id="usd_only", name="USD Only",
+                   daily_usd=1.0, daily_input_tokens=0, daily_output_tokens=0)
+    u = store.get_user("usd_only")
+    # Token counts far above any normal per-request cap, but cheap enough to
+    # stay within the $1 USD budget (1M in @0.15 + 1M out @0.60 = $0.75), so
+    # only the (zeroed => unlimited) token dimensions could deny — they don't.
+    decision = store.reserve(u, MODEL, est_input_tokens=1_000_000, max_output_tokens=1_000_000)
+    assert decision.allowed
+
+
+def test_sub_micro_positive_budget_does_not_round_to_unlimited(store):
+    """#4: a positive budget below $0.000001 must NOT floor to 0 (which the
+    '0 = unlimited' convention would read as no cap). It floors to 1 micro."""
+    store.put_user(user_id="tiny", name="Tiny", daily_usd=0.0000004,
+                   daily_input_tokens=0, daily_output_tokens=0)
+    u = store.get_user("tiny")
+    assert u.daily_usd_micro == 1  # 1 micro-USD, NOT 0/unlimited
+    # And it actually enforces: any priced request exceeds a 1-micro cap.
+    decision = store.reserve(u, MODEL, est_input_tokens=100, max_output_tokens=100)
+    assert not decision.allowed
+    # Exactly 0 stays unlimited (explicit opt-out, not a rounding artifact).
+    store.set_user_limits("tiny", daily_usd=0.0)
+    assert store.get_user("tiny").daily_usd_micro == 0
+
+
+def test_reserve_zero_usd_limit_is_unlimited_cost(store):
+    """A 0 USD limit likewise disables the cost dimension (block via status)."""
+    store.put_user(user_id="no_usd_cap", name="No USD Cap",
+                   daily_usd=0.0, daily_input_tokens=100, daily_output_tokens=100)
+    u = store.get_user("no_usd_cap")
+    decision = store.reserve(u, MODEL, est_input_tokens=10, max_output_tokens=10)
+    assert decision.allowed  # cost unlimited; token dims have headroom
+
+
 def test_blocked_user_is_denied(store, user):
     store.set_user_status("alice", "blocked", "test")
     blocked = store.get_user("alice")

@@ -4,7 +4,7 @@ EMF lines written to stdout are turned into CloudWatch metrics by Lambda
 automatically -- no PutMetricData API calls, no extra latency on the hot
 path. Locally they are just structured log lines.
 
-Metrics (namespace configurable, default BedrockMantleGateway):
+Metrics (namespace configurable, default BedrockQuotaGateway):
   Requests, Throttles, Errors, InputTokens, OutputTokens, EstimatedCostUSD
 Dimensions: [UserId], [UserId, Model], [Model] and service-wide.
 """

@@ -8,7 +8,7 @@ gateway verifies it and takes the quota identity from a configurable claim
 Two verification modes:
 
 - **JWKS (production)** — RS256/ES256 signatures verified against the
-  issuer's published JWKS (``JWT_JWKS_URL``, derived from ``JWT_ISSUER`` if
+  issuer's published JWKS (``JWT_JWKS_URL``, discovered from ``JWT_ISSUER`` if
   not set). Keys are fetched once and cached by PyJWKClient.
 - **Shared secret (dev/test)** — set ``JWT_SHARED_SECRET`` to verify HS256
   tokens without an IdP. Never use in production.
@@ -16,11 +16,16 @@ Two verification modes:
 ``iss`` and ``aud`` are enforced when configured; ``exp`` always is.
 """
 
+import json
 from dataclasses import dataclass
+from urllib.error import URLError
+from urllib.request import urlopen
 
 import jwt as pyjwt
 
 from .config import settings
+
+USER_TOKEN_HEADER = "x-quota-user-token"
 
 
 class JwtError(Exception):
@@ -47,6 +52,39 @@ def extract_bearer(authorization_header: str | None) -> str | None:
     return value or None
 
 
+def extract_user_token(headers) -> str | None:
+    """Read the end-user token without conflicting with SigV4 Authorization.
+
+    ``X-Quota-User-Token`` is the canonical header for IAM-authenticated
+    Function URLs. ``x-api-key`` and Bearer Authorization remain available
+    for local development and deployments whose edge does not use SigV4.
+    """
+    dedicated = extract_bearer(headers.get(USER_TOKEN_HEADER))
+    if dedicated:
+        return dedicated
+    api_key = extract_bearer(headers.get("x-api-key"))
+    if api_key:
+        return api_key
+    authorization = headers.get("authorization")
+    if authorization and authorization.lower().startswith("bearer "):
+        return extract_bearer(authorization)
+    return None
+
+
+def discover_jwks_url(issuer: str) -> str:
+    """Resolve ``jwks_uri`` from the issuer's OIDC discovery document."""
+    discovery_url = issuer.rstrip("/") + "/.well-known/openid-configuration"
+    try:
+        with urlopen(discovery_url, timeout=5) as response:  # noqa: S310 (operator-configured URL)
+            document = json.load(response)
+    except (OSError, URLError, ValueError, TypeError) as exc:
+        raise JwtError(f"could not load OIDC discovery document: {exc}") from exc
+    jwks_uri = document.get("jwks_uri") if isinstance(document, dict) else None
+    if not isinstance(jwks_uri, str) or not jwks_uri:
+        raise JwtError("OIDC discovery document does not contain a valid jwks_uri")
+    return jwks_uri
+
+
 class JwtVerifier:
     def __init__(self, jwks_client: "pyjwt.PyJWKClient | None" = None):
         self._jwks_client = jwks_client
@@ -55,7 +93,7 @@ class JwtVerifier:
         if self._jwks_client is None:
             jwks_url = settings.jwt_jwks_url
             if not jwks_url and settings.jwt_issuer:
-                jwks_url = settings.jwt_issuer.rstrip("/") + "/.well-known/jwks.json"
+                jwks_url = discover_jwks_url(settings.jwt_issuer)
             if not jwks_url:
                 raise JwtError(
                     "gateway is not configured with a JWT issuer/JWKS URL or shared secret"

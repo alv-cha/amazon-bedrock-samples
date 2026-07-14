@@ -62,10 +62,11 @@ agents-and-function-calling/bedrock-agents/agent-blueprint-templates/.package-lo
 agents-and-function-calling/bedrock-agents/agent-blueprint-templates/yarn.lock
 
 config.py
+!poc-to-prod/bedrock-per-user-quotas/gateway/app/config.py
 
 # ignore hypothesis and pytest cache directories
 **/.pytest_cache/
 **/.hypothesis/
 
-# CDK synth output for bedrock-mantle-per-user-quotas sample
-poc-to-prod/bedrock-mantle-per-user-quotas/cdk/cdk.out/
+# CDK synth output for bedrock-per-user-quotas sample
+poc-to-prod/bedrock-per-user-quotas/cdk/cdk.out/

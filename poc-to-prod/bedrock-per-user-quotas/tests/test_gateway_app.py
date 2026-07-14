@@ -96,6 +96,20 @@ def test_rejects_garbage_token(client):
     assert "invalid token" in r.json()["error"]["message"]
 
 
+def test_dedicated_token_header_coexists_with_sigv4_authorization(
+        client, alice, upstream):
+    r = client.post(
+        "/v1/responses",
+        json={"model": MODEL, "input": "hello", "max_output_tokens": 50},
+        headers={
+            "Authorization": "AWS4-HMAC-SHA256 Credential=example",
+            "X-Quota-User-Token": alice,
+        },
+    )
+    assert r.status_code == 200
+    assert len(upstream.requests) == 1
+
+
 def test_rejects_expired_token(client):
     expired = pyjwt.encode({"sub": "alice", "exp": int(time.time()) - 100},
                            SECRET, algorithm="HS256")
@@ -128,6 +142,41 @@ def test_auto_provision_can_be_disabled(client, monkeypatch):
 def test_missing_model_is_400(client, alice):
     r = _post(client, alice, {"input": "hello"})
     assert r.status_code == 400
+
+
+def test_multi_tenant_budget_keys_on_tenant_claim(client, monkeypatch, fake_dynamodb):
+    """Multi-tenant: budgeting on a tenant claim (not sub) shares one budget
+    across a tenant's users and isolates spend between tenants."""
+    import app.auth as auth_module
+    import app.main as m
+    from app.config import Settings
+    monkeypatch.setenv("JWT_USER_CLAIM", "custom:tenant_id")
+    fresh = Settings()
+    # The identity claim is read by the JWT verifier (app.auth) at verify time;
+    # main also reads settings, so patch both singletons.
+    monkeypatch.setattr(auth_module, "settings", fresh)
+    monkeypatch.setattr(m, "settings", fresh)
+
+    store = QuotaStore(dynamodb=fake_dynamodb)
+    # Tenant acme has a tiny budget; tenant globex has room.
+    store.put_user("tenant-acme", "ACME", daily_usd=0.000001,
+                   daily_input_tokens=10, daily_output_tokens=10)
+    store.put_user("tenant-globex", "Globex", daily_usd=1.0,
+                   daily_input_tokens=100_000, daily_output_tokens=20_000)
+
+    # Two DIFFERENT users of tenant acme both resolve to the same budget.
+    for user_sub in ("alice", "bob"):
+        tok = make_jwt(user_sub, **{"custom:tenant_id": "tenant-acme"})
+        r = _post(client, tok, {"model": MODEL, "input": "hello"})
+        assert r.status_code == 429, f"{user_sub} should hit acme's exhausted budget"
+
+    # A user of globex is unaffected by acme's exhaustion.
+    r = _post(client, make_jwt("carol", **{"custom:tenant_id": "tenant-globex"}),
+              {"model": MODEL, "input": "hello", "max_output_tokens": 50})
+    assert r.status_code == 200
+    assert QuotaStore(dynamodb=fake_dynamodb).get_window_usage("tenant-globex")["requests"] == 1
+    # acme's own usage row never recorded a successful request.
+    assert QuotaStore(dynamodb=fake_dynamodb).get_window_usage("tenant-acme")["requests"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +337,18 @@ def test_v1_messages_alias_maps_to_anthropic_path(client, alice, upstream):
 def test_admin_requires_key(client):
     r = client.post("/admin/users", json={"user_id": "x"})
     assert r.status_code == 403
+
+
+def test_dedicated_admin_header_coexists_with_sigv4_authorization(client):
+    r = client.post(
+        "/admin/users",
+        json={"user_id": "signed-admin"},
+        headers={
+            "Authorization": "AWS4-HMAC-SHA256 Credential=example",
+            "X-Quota-Admin-Key": "admin-secret",
+        },
+    )
+    assert r.status_code == 200
 
 
 def test_admin_preprovision_with_custom_limits(client, upstream, fake_dynamodb):

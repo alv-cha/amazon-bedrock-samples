@@ -7,11 +7,11 @@ from stacks.quota_gateway_stack import QuotaGatewayStack
 
 app = cdk.App()
 QuotaGatewayStack(
-    app, "BedrockMantleQuotaGateway",
+    app, "BedrockPerUserQuotaGateway",
     env=cdk.Environment(
         account=os.environ.get("CDK_DEFAULT_ACCOUNT"),
         region=os.environ.get("CDK_DEFAULT_REGION", "us-east-1"),
     ),
-    description="Per-user quota monitoring and enforcement gateway for the bedrock-mantle endpoint",
+    description="Per-user quota monitoring and enforcement gateway for Amazon Bedrock",
 )
 app.synth()

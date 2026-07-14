@@ -1,12 +1,13 @@
 """JWT verification tests: HS256 dev mode and the RS256/JWKS path."""
 
+import io
 import time
 
 import jwt as pyjwt
 import pytest
 
 import app.auth as auth_module
-from app.auth import JwtError, JwtVerifier
+from app.auth import JwtError, JwtVerifier, discover_jwks_url, extract_user_token
 from app.config import Settings
 
 SECRET = "test-jwt-secret"  # matches conftest JWT_SHARED_SECRET
@@ -74,6 +75,26 @@ def test_custom_user_claim(monkeypatch):
 
     identity = JwtVerifier().verify(make_jwt(extra={"cognito:username": "carol"}))
     assert identity.user_id == "carol"
+
+
+def test_dedicated_user_token_wins_over_sigv4_authorization():
+    token = extract_user_token({
+        "authorization": "AWS4-HMAC-SHA256 Credential=example",
+        "x-quota-user-token": "jwt-value",
+    })
+    assert token == "jwt-value"
+
+
+def test_sigv4_authorization_is_not_treated_as_a_jwt():
+    assert extract_user_token({
+        "authorization": "AWS4-HMAC-SHA256 Credential=example",
+    }) is None
+
+
+def test_oidc_discovery_uses_document_jwks_uri(monkeypatch):
+    payload = b'{"issuer":"https://idp.example.com","jwks_uri":"https://keys.example.com/jwks"}'
+    monkeypatch.setattr(auth_module, "urlopen", lambda url, timeout: io.BytesIO(payload))
+    assert discover_jwks_url("https://idp.example.com") == "https://keys.example.com/jwks"
 
 
 def test_rs256_via_jwks(monkeypatch):

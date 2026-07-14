@@ -1,30 +1,49 @@
-# Per-user quota monitoring and enforcement for Amazon Bedrock (bedrock-mantle)
+# Per-user quota monitoring and enforcement for Amazon Bedrock
 
-Amazon Bedrock enforces [tokens-per-minute quotas for the `bedrock-mantle`
-endpoint](https://docs.aws.amazon.com/bedrock/latest/userguide/quotas-mantle.html)
+Amazon Bedrock enforces [service quotas](https://docs.aws.amazon.com/bedrock/latest/userguide/quotas.html)
 at the **account level**, and [Projects](https://docs.aws.amazon.com/bedrock/latest/userguide/projects.html)
 give you **cost tracking** per workload — but neither can answer *"cap each of
 my end users at $1/day and cut them off when they hit it."*
 
-This sample deploys a lightweight, OpenAI/Anthropic-compatible **quota gateway**
-in front of the `bedrock-mantle` endpoint that does exactly that:
+This sample deploys a lightweight **per-user quota layer** for Amazon Bedrock
+that does exactly that. It offers two enforcement modes (detailed below): a
+**credential broker** that governs native `bedrock-runtime` calls across any
+API and provider (recommended), and an OpenAI/Anthropic-compatible **inline
+proxy** for the `bedrock-mantle` endpoint. Both:
 
 - **Identity from your existing auth** — users send the JWT your application
   already issues (Amazon Cognito, Okta, Auth0, Entra ID, any OIDC IdP); the
   gateway verifies it against the issuer's JWKS and keys quotas on the `sub`
   claim (configurable). No gateway-issued API keys to manage.
+
+> **Best fit: multi-tenant applications on Bedrock.** If you run a SaaS or
+> internal platform where many tenants (customers, teams, projects) share one
+> Bedrock account behind **one identity provider**, and you need to cap and
+> attribute spend **per tenant** — not just watch the account total — this is
+> built for you. Point `jwt_user_claim` at your tenant claim (e.g.
+> `custom:tenant_id`) and every budget, block, metric, and log line is keyed
+> per tenant with no code change. See
+> [Multi-tenant: budget and attribute per tenant](#multi-tenant-budget-and-attribute-per-tenant).
+>
+> It assumes tenants are **authenticated and cooperating** (a typical B2B /
+> internal-platform trust model), not anonymous or adversarial. See
+> [Trust model](#trust-model) for exactly what that means and where the edges
+> are.
 - **Per-user budgets** in USD *and* input/output tokens, per UTC day, with
   optional **auto-provisioning** of first-seen users at default limits
-- **Hard real-time enforcement** — over-budget requests get an HTTP 429
-  *before* any tokens are spent upstream
+- **Hard real-time admission control in Mode B** — over-budget reservations
+  get an HTTP 429 before any tokens are spent upstream; Mode A instead has a
+  bounded overspend window while its short-lived credentials remain valid
 - **Accurate metering of streaming** responses (SSE), not just JSON ones
 - **Per-user CloudWatch metrics + dashboard** (spend, tokens, throttles)
 - **Async safety net** — a reconciler blocks users whose settled usage
   drifted over budget and sends SNS alerts, then auto-unblocks after the
   daily reset
 
-Clients don't change: they keep using the vanilla OpenAI or Anthropic SDK and
-only point `base_url` at the gateway, passing the user's JWT as the key.
+The inference schemas remain OpenAI/Anthropic-compatible. Because the Lambda
+Function URL is protected by IAM, callers also use the included `httpx`
+SigV4 adapter: SigV4 occupies `Authorization`, while the end-user JWT travels
+in `X-Quota-User-Token`.
 
 ## Two enforcement modes
 
@@ -34,32 +53,39 @@ pick per workload.
 
 ### Mode A — Credential broker (any Bedrock API, any provider) — recommended
 
-For apps that call Bedrock **natively** (`bedrock-runtime`
-`InvokeModel`/`Converse`/streaming, **any** model provider) — or that use the
-mantle endpoint — the gateway does **not** proxy inference. Instead:
+For apps that call Bedrock **natively** on the `bedrock-runtime` endpoint
+(`InvokeModel`/`Converse`/streaming, **any** model provider) the gateway does
+**not** proxy inference. Instead:
 
 1. The app presents the user's JWT to the broker (`POST /v1/credentials`).
 2. The broker checks the user's budget and, if within limits, returns
-   **short-lived AWS credentials** via `sts:AssumeRole` with
-   **`RoleSessionName` + `SourceIdentity` = the JWT `sub`**.
-3. The app calls Bedrock **directly** with those creds — the gateway is out
-   of the data path (no added latency, no protocol coupling).
-4. Bedrock **model-invocation logging** records per-call token counts, and
-   each record's identity carries the session (= `sub`), so the reconciler
-   meters spend **per user** from Bedrock's own telemetry — uniformly across
-   every API and provider.
+   **short-lived AWS credentials** via `sts:AssumeRole`, stamping the
+   **`RoleSessionName`, `SourceIdentity`, and a `quota-user` session tag** with
+   a sanitized, collision-resistant identity derived from the quota-identity
+   claim (the full claim value is preserved in a reverse-map row).
+3. The app calls `bedrock-runtime` **directly** with those creds — the gateway
+   is out of the data path (no added latency, no protocol coupling).
+4. Bedrock **model-invocation logging** (which captures the `bedrock-runtime`
+   endpoint) records per-call token counts, and each record's identity carries
+   the session name, which the reconciler maps back to the user/tenant to
+   meter spend from Bedrock's own telemetry — uniformly across every provider.
 5. Over budget → the user is blocked; their next credential refresh is
    refused, so they lose access at the current session's TTL.
 
+> **Native path is `bedrock-runtime` only, by design.** The vended role does
+> not grant `bedrock-mantle:*`, because the mantle endpoint is **not** captured
+> by model-invocation logging — vended creds calling mantle would be unmetered.
+> Use Mode B to govern mantle traffic.
+
 ```
                      ┌───────────── Broker (Lambda + Function URL, IAM auth) ─────────────┐
- app backend ───JWT──┤ 1 verify JWT (issuer JWKS), identity = "sub"                        │
+ app backend ───JWT──┤ 1 verify JWT (issuer JWKS), identity = configured claim            │
  (has IAM role)      │ 2 budget check → over budget? 403/429, no creds                     │
-      │              │ 3 sts:AssumeRole  RoleSessionName + SourceIdentity = sub, short TTL │──▶ creds
+      │              │ 3 sts:AssumeRole  session name/SourceIdentity = sanitized id, TTL  │──▶ creds
       ▼              └────────────────────────────────────────────────────────────────────┘
- boto3 bedrock-runtime (or mantle) with vended creds ───────────────▶ Bedrock (any API/provider)
+ boto3 bedrock-runtime with vended creds ───────────────────────────▶ Bedrock (any provider)
                                                                           │ model-invocation logs
-              EventBridge (5 min) ─▶ Reconciler ─▶ meter per sub ─▶ block/unblock + SNS alerts
+       EventBridge (5 min) ─▶ Reconciler ─▶ map session→identity, meter ─▶ block/unblock + SNS
 ```
 
 **Enforcement is *bounded overspend*, not a hard pre-token cap:** a user can
@@ -74,8 +100,8 @@ you get true API/provider-agnostic coverage with zero client protocol change
 ```
                         ┌─────────────────────────────────────────────┐
  OpenAI / Anthropic SDK │  Gateway (Lambda + Function URL, streaming) │   bedrock-mantle
- base_url = gateway ────┼─▶ 1 verify the user's JWT (issuer JWKS),    ├──▶ Responses /
- api_key  = user JWT ───┤     quota identity = "sub" claim            │    Chat Completions /
+ SigV4 + user JWT header├─▶ 1 verify IAM caller + JWT (issuer JWKS),  ├──▶ Responses /
+ base_url = gateway ────┤     quota identity = "sub" claim            │    Chat Completions /
         ▲               │   2 RESERVE worst case vs daily budget      │    Anthropic Messages
         │               │      └─ over budget → 429 (no spend)        │
    your IdP             │   3 forward (short-term Bedrock token       │
@@ -87,6 +113,99 @@ you get true API/provider-agnostic coverage with zero client protocol change
               EventBridge (5 min) ──▶ Reconciler ──▶ block/unblock + SNS alerts
               CloudWatch dashboard: spend/user, tokens, throttles
 ```
+
+## Multi-tenant: budget and attribute per tenant
+
+The gateway keys every quota on **one configurable JWT claim** — the quota
+*identity*. Set it once at deploy and the whole pipeline (budget check,
+reserve/settle, the vended session's `SourceIdentity`, model-invocation-log
+attribution, the reconciler, admin API, and CloudWatch dimensions) keys on
+that value. Nothing else changes.
+
+```bash
+cdk deploy \
+  -c jwt_issuer=https://your-idp.example.com/... \
+  -c jwt_user_claim=custom:tenant_id \
+  -c manage_invocation_logging=true
+```
+
+Now `custom:tenant_id` is the unit of budgeting: a limit set on
+`tenant-acme` is shared by every user whose token carries that claim, and one
+tenant can never spend against another's budget (the claim is signed by your
+IdP and verified on every call). Common choices:
+
+| `jwt_user_claim` | Budgeting unit | Use when |
+|---|---|---|
+| `sub` (default) | Individual end user | One budget per person |
+| `custom:tenant_id` / `org_id` | Tenant / customer | B2B SaaS: cap each customer org |
+| `custom:team` / `custom:project` | Team / cost center | Internal platform chargeback |
+
+Set per-tenant limits through the admin API using the **claim value** as the
+`user_id` (the field name is historical — it holds whatever
+`jwt_user_claim` resolves to):
+
+```python
+from examples.sigv4_gateway import signed_request
+
+signed_request(
+    "POST", f"{GATEWAY_URL}/admin/users", admin_key=ADMIN_KEY,
+    json={"user_id": "tenant-acme", "name": "ACME Corp", "daily_usd": 200},
+)
+```
+
+**Assumptions and boundaries of this model:**
+
+- **One IdP / one issuer per deployment.** Identity is a claim inside tokens
+  from a single trusted issuer (`jwt_issuer`). This matches how tenant-per-
+  claim SaaS is normally built, and mirrors the Claude Apps Gateway's own
+  "one issuer per gateway — run separate instances" stance. Federating a
+  *different* IdP per tenant is out of scope: it needs multi-issuer
+  verification and issuer-namespaced identities (`{iss}#{claim}`) so subjects
+  can't collide across issuers. `auth.py` verifies against one issuer today.
+- **The claim must be present and signed.** A token missing the configured
+  claim is rejected (401), so a tenant can't fall back to an unbudgeted
+  identity. Make the claim a **required, IdP-populated** attribute — not one
+  the client can set — so tenant A cannot mint a token claiming tenant B.
+- **Cross-tenant isolation is by budget, not by model.** Per-tenant *spend*
+  is isolated, but by default every tenant may call every enabled model. To
+  give tenants (or tiers) different model access, scope the vended role
+  (Mode A) or add a model allowlist — see [Trust model](#trust-model).
+
+## Trust model
+
+This sample is built for **authenticated, cooperating** callers — your own
+application's tenants/users, behind your IdP and your app backend. It is a
+governance and cost-control tool for that setting, **not** an anti-abuse
+control for anonymous or adversarial users. Concretely:
+
+- **Identity is only as trustworthy as the claim.** Budgets bind to a JWT
+  claim your IdP signs. The gateway verifies the signature, `exp`, and
+  (when configured) `iss`/`aud` — but it trusts the *content* of a valid
+  token. If end users can influence the claim you budget on (e.g. a
+  self-service-editable attribute), they can shift which budget they spend
+  against. Budget on an IdP-controlled claim.
+- **Enforcement is bounded overspend, not a hard cap** (Mode A). A within-
+  budget tenant that pulls credentials right before its budget is exhausted
+  can keep calling Bedrock until those creds expire
+  (`VENDED_CREDENTIAL_TTL_SECONDS`, default 900s) plus reconciler lag
+  (~5 min). Fine for cost control among cooperating tenants; **not** a
+  defense against a tenant deliberately racing the window. Shorten the TTL
+  to tighten the bound (at the cost of more `AssumeRole` calls), or use
+  Mode B (inline proxy) for a hard pre-spend 429.
+- **The account boundary still matters.** Per-tenant budgets are only
+  authoritative if tenants can't call Bedrock directly, bypassing the
+  gateway. See [Making the gateway the only path](#making-the-gateway-the-only-path-account-governance).
+- **Token budgets are the hard lever; dollars are an estimate.** Token
+  reservations are enforced exactly at admission. Dollar budgets are priced
+  from an editable table (placeholders by default) and, for Mode A native
+  traffic, cannot see prompt-cache discounts (model-invocation logs carry no
+  cache-token fields). Treat dollar caps as close estimates and lead with
+  token budgets where a precise ceiling matters.
+
+If you need controls for **anonymous or adversarial** end users (per-IP rate
+limits, sign-up abuse prevention, hard pre-token caps), this sample is a
+starting point but not a complete solution — layer it behind WAF / API
+Gateway throttling and prefer Mode B's pre-spend cap.
 
 ## What the gateway itself costs
 
@@ -190,8 +309,9 @@ caps). This sample differs in three deliberate ways:
 1. **Scope: any client, not just Claude apps.** It fronts the
    `bedrock-mantle` endpoint's full protocol surface (OpenAI Responses,
    Chat Completions, Anthropic Messages), so one deployment governs your
-   application's end users, OpenAI-SDK workloads, **Codex CLI**, LangChain
-   apps, *and* Claude Code with the same budgets, admin API, and dashboard.
+   application's end users, OpenAI/Anthropic SDK workloads, and LangChain
+   apps with the same budgets, admin API, and dashboard. CLI tools require a
+   SigV4-capable sidecar because they cannot sign Lambda Function URLs.
    Neither solution above can serve an OpenAI-protocol client.
 2. **Enforcement model: admission control, not post-hoc caps.** Budgets
    are enforced by an atomic reserve→settle protocol *before* the request
@@ -199,13 +319,36 @@ caps). This sample differs in three deliberate ways:
    its own TPM quotas), backed by an async reconciler. Concurrent requests
    cannot overshoot the budget.
 3. **Footprint: serverless.** One Lambda, two DynamoDB tables, no VPC, no
-   database, no load balancer, no client-side binaries — deployable in
-   minutes and billed per request, which matters when the goal is "let any
-   customer try per-user budgets this afternoon."
+   database, no load balancer — deployable in minutes and billed per request,
+   with a small client-side SigV4 adapter for IAM-protected invocation.
 
-If your only need is managed Claude Code seats for developers, evaluate
-Claude Apps Gateway first. If you need per-user budgets across a mixed
-fleet of applications and coding agents on Bedrock, this sample is the
+A third, **infrastructure-free** approach is worth knowing: per-developer
+cost *attribution* using Cognito + IAM **session tags** + **cost-allocation
+tags**, with **AWS Budgets** for alerts (e.g. [this walkthrough](https://builder.aws.com/content/3EMlLuVf7JSb1fwM8xeQfSi5cz5/deep-dive-on-managing-bedrock-in-claude-code-over-bedrock-with-aws-budgets-tags)).
+The developer's own machine assumes a role tagged with their alias and calls
+Bedrock; Cost Explorer then breaks spend down by tag. It shares this sample's
+identity spine but stops at attribution — and its two structural limits are
+the reason this sample exists:
+
+- **It monitors, it doesn't enforce.** Budgets/Cost Explorer data lags
+  **~24 hours**, so a runaway tenant is an email *tomorrow*, not a cutoff
+  now. This sample blocks in minutes (bounded overspend) or pre-spend
+  (Mode B).
+- **Tags are self-attested.** The client sets its own session tag, fine for
+  cooperating developers doing chargeback but not an authoritative per-tenant
+  cap. This sample sets the identity **server-side** (`SourceIdentity`, set
+  by the broker) so a tenant can't relabel its spend.
+
+**Which to pick:**
+
+| Your need | Use |
+|---|---|
+| Managed Claude Code / Desktop seats for employees, corporate SSO | Claude Apps Gateway |
+| Per-developer Bedrock **cost visibility**, zero infrastructure, alerts are enough | Cognito + Budgets + cost-allocation tags |
+| **Cap and cut off** spend **per tenant/user** across any Bedrock client, in minutes not a day | **This sample** |
+
+If you need per-tenant or per-user budgets that are *enforced* — across a
+mixed fleet of applications and coding agents on Bedrock — this sample is the
 reference for that pattern.
 
 ## Why reserve → settle?
@@ -226,7 +369,8 @@ TPM quotas, applied per user.
 | `reconciler/` | Scheduled Lambda: per-user metering from Bedrock model-invocation logs, drift blocking, auto-unblock, SNS alerts |
 | `cdk/` | CDK app (Python): broker/gateway Lambda + IAM-auth Function URL, vended Bedrock role, model-invocation logging, DynamoDB, optional demo Cognito pool, EventBridge, SNS, dashboard |
 | `examples/demo_native_calls.py` | Mode A demo: fetch per-user creds from the broker, call Bedrock natively (Converse + InvokeModel) |
-| `tests/` | 69 unit + end-to-end tests, no AWS account needed |
+| `examples/sigv4_gateway.py` | SigV4 adapters for `httpx`, OpenAI/Anthropic Python SDKs, and signed admin calls |
+| `tests/` | 96 unit + end-to-end tests, no AWS account needed |
 | `notebook/per_user_quota_demo.ipynb` | Walkthrough: deploy, sign in users, watch a 429 happen |
 | `assets/architecture.drawio` | Editable architecture diagram (draw.io) |
 | `DEMO.md` | 12-minute demo script + pre-demo runbook + failure playbook |
@@ -238,6 +382,7 @@ TPM quotas, applied per user.
   `openai.gpt-oss-120b`; check `GET /v1/models`)
 - Python 3.12+, Node.js (for the CDK CLI), Docker (for CDK asset bundling)
 - Bootstrapped CDK environment (`cdk bootstrap`)
+- `pip install -r gateway/requirements.txt` for the signed client examples
 
 ## Deploy
 
@@ -249,14 +394,28 @@ cd cdk
 pip install -r requirements.txt
 cdk deploy \
   -c jwt_issuer=https://your-idp.example.com/... \
-  -c jwt_audience=<your-app-client-id> \        # optional but recommended
-  -c jwt_user_claim=sub \                       # optional, default "sub"
-  -c alert_email=you@example.com                # optional
+  -c jwt_audience=YOUR_APP_CLIENT_ID \
+  -c jwt_user_claim=sub \
+  -c manage_invocation_logging=true \
+  -c alert_email=you@example.com
 ```
+
+`jwt_audience`, `jwt_user_claim`, and `alert_email` are optional. OIDC
+discovery supplies `jwks_uri`; use `-c jwt_jwks_url=https://...` only when
+the provider does not expose a standard discovery document.
 
 **Without an IdP**, omit `jwt_issuer` and the stack creates a **demo Cognito
 User Pool** and wires the gateway to it (outputs `DemoUserPoolId` /
 `DemoUserPoolClientId`; the demo notebook uses these).
+
+`manage_invocation_logging=true` explicitly acknowledges that Bedrock model
+invocation logging is one account-and-region-wide setting. In shared
+accounts, preserve the existing configuration instead:
+
+```bash
+-c manage_invocation_logging=false \
+-c invocation_log_group_name=/your/existing/bedrock/log-group
+```
 
 Outputs include the **GatewayUrl** and the **AdminKeySecretArn**. Fetch the
 admin key:
@@ -268,31 +427,46 @@ aws secretsmanager get-secret-value --secret-id <AdminKeySecretArn> \
 
 ## Use it
 
-Users are **auto-provisioned at default limits on their first request**
-(disable with `AUTO_PROVISION_USERS=false` on the Lambda). To give a specific
-user non-default limits, pre-provision them by their IdP subject:
-
-```bash
-curl -X POST "$GATEWAY_URL/admin/users" \
-  -H "Authorization: Bearer $ADMIN_KEY" -H "Content-Type: application/json" \
-  -d '{"user_id": "<sub-claim-value>", "daily_usd": 0.5}'
-```
-
-Alice uses the plain OpenAI SDK with the JWT she already has from signing in
-to your app:
+Users (or tenants — whatever `jwt_user_claim` resolves to) are
+**auto-provisioned at default limits on their first request**. Convenient for
+onboarding, but it means a newly-seen identity silently gets the default
+budget: in a multi-tenant deployment, decide whether you want tenants to
+appear automatically or be provisioned deliberately at onboarding. Disable
+lazy creation with `AUTO_PROVISION_USERS=false` on the Lambda, then
+pre-provision each identity by its claim value:
 
 ```python
-from openai import OpenAI
+from examples.sigv4_gateway import signed_request
 
-client = OpenAI(base_url=f"{GATEWAY_URL}/v1", api_key=alice_jwt)
+signed_request(
+    "POST", f"{GATEWAY_URL}/admin/users", admin_key=ADMIN_KEY,
+    json={"user_id": "<sub-claim-value>", "daily_usd": 0.5},
+).raise_for_status()
+```
+
+Alice uses the OpenAI SDK with the JWT she already has and the included
+SigV4 `httpx` adapter:
+
+```python
+import httpx
+from openai import OpenAI
+from examples.sigv4_gateway import FunctionUrlSigV4Auth
+
+client = OpenAI(
+    base_url=f"{GATEWAY_URL}/v1",
+    api_key="sigv4-managed",
+    http_client=httpx.Client(
+        auth=FunctionUrlSigV4Auth(alice_jwt, region="us-east-1")
+    ),
+)
 response = client.responses.create(
     model="openai.gpt-oss-120b",
     input="Three bullet points on the CAP theorem.",
 )
 ```
 
-…or the Anthropic SDK (`base_url=f"{GATEWAY_URL}/anthropic"`, mirroring
-mantle's own `/anthropic/v1/messages` path), or Chat Completions — all three
+The same `httpx` auth adapter works with the Anthropic Python SDK
+(`base_url=f"{GATEWAY_URL}/anthropic"`) and Chat Completions. All three
 protocols served by `bedrock-mantle` are proxied and metered, including
 `stream=True`. Every response carries `X-Quota-Limit-USD` /
 `X-Quota-Remaining-USD` headers. When the budget is gone:
@@ -326,8 +500,12 @@ aws iam attach-role-policy --role-name <dev-role> \
 ```
 
 **Option B — Service Control Policy (organization-wide, recommended).**
-Denies direct invocation for every principal in the account except the
-gateway role (output `GatewayRoleArn`):
+Denies direct invocation for every principal in the account **except the two
+roles the gateway itself uses**: the gateway Lambda's role (output
+`GatewayRoleArn`, used for Mode B's mantle proxy) **and** the per-user vended
+role (output `BedrockUserRoleArn`, which Mode A's native calls run under).
+Both must be excepted — omitting `BedrockUserRoleArn` denies every Mode A
+native call, breaking the primary path:
 
 ```json
 {
@@ -345,60 +523,41 @@ gateway role (output `GatewayRoleArn`):
     ],
     "Resource": "*",
     "Condition": {
-      "ArnNotLike": {"aws:PrincipalArn": "<GatewayRoleArn>"}
+      "ArnNotLike": {
+        "aws:PrincipalArn": ["<GatewayRoleArn>", "<BedrockUserRoleArn>"]
+      }
     }
   }]
 }
 ```
+
+(`aws:PrincipalArn` for an assumed-role session is the underlying **role**
+ARN, so listing the two role ARNs covers every vended session.)
 
 Also avoid issuing **long-term Bedrock API keys** to users (they are IAM
 users under the hood and can call the endpoints directly); with the gateway
 in place, end users never need Bedrock credentials of any kind — their IdP
 JWT is enough.
 
-## Using with coding agents (Claude Code, Codex CLI)
+## Using with coding agents
 
 Coding agents are the heaviest per-user consumers of Bedrock in most
-accounts, and both major CLIs support custom endpoints — so their usage can
-be budgeted per developer through this gateway. The gateway meters what
-they actually do: SSE streaming, **Anthropic prompt caching** (cache
-read/write tokens are counted and priced with configurable multipliers —
-crucial, since most of a coding agent's input arrives as cache reads), and
-the `count_tokens` endpoint is proxied for free.
+accounts. There are two valid integration patterns:
 
-**Claude Code** — point it at the gateway instead of Bedrock-direct:
+- **Native Bedrock clients, including Claude Code in Bedrock mode:** obtain
+  short-lived credentials from `/v1/credentials`, then export the returned
+  `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN`.
+  `examples/demo_native_calls.py` implements the signed exchange. These calls
+  use Mode A and are metered from Bedrock invocation logs.
+- **OpenAI/Anthropic protocol agents:** run them in an application or
+  organization-owned sidecar that applies `FunctionUrlSigV4Auth`. CLI tools
+  that only support `base_url` plus a Bearer key cannot call the IAM-protected
+  Function URL directly because they do not produce SigV4 signatures.
 
-```bash
-export ANTHROPIC_BASE_URL="<GatewayUrl>"          # no /v1 suffix
-export ANTHROPIC_AUTH_TOKEN="<the developer's JWT>"
-export ANTHROPIC_MODEL="anthropic.claude-opus-4-7" # a mantle Claude model id
-claude
-```
-
-For unattended refresh of short-lived JWTs, use Claude Code's
-`apiKeyHelper` setting (`~/.claude/settings.json`) pointing at a script
-that returns a fresh token from your IdP. **Do not use
-`CLAUDE_CODE_USE_BEDROCK=1`** — that mode signs requests straight to
-`bedrock-runtime` and bypasses the gateway (the lockdown SCP above blocks
-it, which is exactly what you want).
-
-**Codex CLI** — add a provider in `~/.codex/config.toml`:
-
-```toml
-model = "openai.gpt-oss-120b"        # a mantle model id
-model_provider = "quota-gateway"
-
-[model_providers.quota-gateway]
-name = "Amazon Bedrock via quota gateway"
-base_url = "<GatewayUrl>/v1"
-env_key = "GATEWAY_JWT"              # Codex sends this env var as the Bearer token
-wire_api = "responses"
-```
-
-```bash
-export GATEWAY_JWT="<the developer's JWT>"
-codex
-```
+This distinction is intentional: making the Function URL public would restore
+direct CLI compatibility, but would remove the IAM-authenticated backend
+boundary. The Python SDK path remains fully streaming and meters Anthropic
+prompt-cache usage plus token-counting calls.
 
 Practical notes for agent workloads:
 
@@ -413,9 +572,9 @@ Practical notes for agent workloads:
 ## Monitoring
 
 The gateway emits per-user metrics via CloudWatch Embedded Metric Format
-(namespace `BedrockMantleGateway`): `Requests`, `InputTokens`, `OutputTokens`,
+(namespace `BedrockQuotaGateway`): `Requests`, `InputTokens`, `OutputTokens`,
 `EstimatedCostUSD`, `LatencyMs`, `Throttles`, `Errors` with `UserId` /
-`Model` dimensions. The stack creates a **bedrock-mantle-quota-gateway**
+`Model` dimensions. The stack creates a **bedrock-per-user-quota-gateway**
 dashboard with spend, requests, and throttles per user.
 
 You can cross-check gateway numbers against the service-side
@@ -424,10 +583,12 @@ You can cross-check gateway numbers against the service-side
 ## Important notes
 
 - **JWT verification**: signatures are verified against the issuer's JWKS
-  (`JWT_JWKS_URL`, derived from `JWT_ISSUER/.well-known/jwks.json` if unset);
+  (`JWT_JWKS_URL`, or the `jwks_uri` from the issuer's OIDC discovery document);
   `exp` is always enforced, `iss`/`aud` when configured. Set
-  `JWT_USER_CLAIM` if your quota identity isn't `sub` (e.g. `email`,
-  `cognito:username`). A `JWT_SHARED_SECRET` HS256 mode exists for local
+  `JWT_USER_CLAIM` if your quota identity isn't `sub` — e.g. `email`,
+  `cognito:username`, or a tenant claim like `custom:tenant_id` to budget
+  **per tenant** (see [Multi-tenant](#multi-tenant-budget-and-attribute-per-tenant)).
+  A `JWT_SHARED_SECRET` HS256 mode exists for local
   dev/tests only. Note the gateway checks token *validity*, not revocation —
   keep token lifetimes short, and use the admin block endpoint for immediate
   cut-off.
@@ -444,19 +605,21 @@ You can cross-check gateway numbers against the service-side
   design; counters settle to actuals within milliseconds of completion.
 - The Function URL uses **`AuthType: AWS_IAM`** — callers must SigV4-sign
   (your app backend's IAM role does this), so the URL is **not anonymously
-  reachable**, satisfying the Palisade "world-accessible Lambda" policy. The
-  end-user JWT still rides in the header and drives the per-user identity:
-  SigV4 at the edge (*who may call the gateway*) + JWT in the app (*which
-  user is spending*) — defense in depth. Grant specific caller roles with
+  reachable**, satisfying the Palisade "world-accessible Lambda" policy.
+  SigV4 owns `Authorization`; the end-user JWT travels in
+  `X-Quota-User-Token`, and the admin key in `X-Quota-Admin-Key`. Grant
+  specific caller roles with
   `-c invoker_principal_arns=arn1,arn2` (defaults to the account root).
 - Daily windows reset at **00:00 UTC**; usage records expire from DynamoDB
-  after 35 days (TTL).
+  after 35 days, and broker session-map rows after two days (DynamoDB TTL).
+- Warning notifications are emitted once per user per UTC window, not every
+  reconciler run.
 
 ## Run the tests
 
 ```bash
 pip install fastapi httpx pytest boto3 'PyJWT[crypto]'
-pytest tests/ -q     # 65 tests, no AWS account or network needed
+pytest tests/ -q     # 96 tests, no AWS account or network needed
 ```
 
 ## Cleanup
@@ -464,6 +627,10 @@ pytest tests/ -q     # 65 tests, no AWS account or network needed
 ```bash
 cd cdk && cdk destroy
 ```
+
+If the stack managed Bedrock invocation logging, that regional configuration,
+its log group, and its writer role are retained intentionally. Review or
+remove them manually only after confirming no other workload depends on them.
 
 ## Related samples
 

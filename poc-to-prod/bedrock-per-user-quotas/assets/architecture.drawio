@@ -16,7 +16,7 @@
         </mxCell>
 
         <!-- Actors (outside cloud) -->
-        <mxCell id="users" value="Users / app backend&#10;native AWS SDK (boto3), OpenAI or&#10;Anthropic SDK, Claude Code, Codex CLI&#10;JWT from your IdP" style="sketch=0;outlineConnect=0;fontColor=#232F3E;gradientColor=none;fillColor=#232F3E;strokeColor=none;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;aspect=fixed;shape=mxgraph.aws4.users;" vertex="1" parent="1">
+        <mxCell id="users" value="Users / app backend&#10;native AWS SDK (boto3), OpenAI or&#10;Anthropic SDK + SigV4 adapter&#10;JWT from your IdP" style="sketch=0;outlineConnect=0;fontColor=#232F3E;gradientColor=none;fillColor=#232F3E;strokeColor=none;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;aspect=fixed;shape=mxgraph.aws4.users;" vertex="1" parent="1">
           <mxGeometry x="90" y="290" width="70" height="70" as="geometry" />
         </mxCell>
         <mxCell id="admin" value="Platform admin" style="sketch=0;outlineConnect=0;fontColor=#232F3E;gradientColor=none;fillColor=#232F3E;strokeColor=none;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;aspect=fixed;shape=mxgraph.aws4.user;" vertex="1" parent="1">
@@ -96,7 +96,7 @@
         <mxCell id="e1" value="1. Sign in, get JWT" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#232F3E;fontSize=11;fontColor=#232F3E;exitX=1;exitY=0.25;entryX=0;entryY=0.75;" edge="1" parent="1" source="users" target="idp">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="e2" value="2. POST /v1/credentials — JWT in header&#10;(request SigV4-signed by the app's role)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#232F3E;fontSize=11;fontColor=#232F3E;exitX=1;exitY=0.4;entryX=0;entryY=0.4;" edge="1" parent="1" source="users" target="gateway">
+        <mxCell id="e2" value="2. Request signed by app role (SigV4)&#10;JWT in X-Quota-User-Token" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#232F3E;fontSize=11;fontColor=#232F3E;exitX=1;exitY=0.4;entryX=0;entryY=0.4;" edge="1" parent="1" source="users" target="gateway">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
         <mxCell id="e2r" value="5. Short-lived per-user AWS creds (TTL ~15 min)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#D05C17;fontSize=11;fontColor=#D05C17;dashed=1;exitX=0;exitY=0.65;entryX=1;entryY=0.65;" edge="1" parent="1" source="gateway" target="users">

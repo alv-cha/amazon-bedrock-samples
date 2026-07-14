@@ -27,6 +27,24 @@ from botocore.exceptions import ClientError
 from .config import settings
 from .pricing import MICRO, cost_micro_usd
 
+# A per-dimension limit of 0 means "not enforced" (unlimited) for that
+# dimension, so a customer can cap on USD alone by zeroing the token limits.
+# To stop a user entirely, block them (status), don't set a 0 budget. We use
+# a large sentinel headroom for unlimited dimensions so the atomic reserve
+# condition treats them as non-binding rather than always-failing.
+_UNLIMITED_HEADROOM = 1 << 62
+
+
+def _usd_to_micro(daily_usd: float) -> int:
+    """USD budget -> integer micro-USD. Any *positive* budget floors to at
+    least 1 micro, so a tiny cap (e.g. $0.0000004) can't round to 0 and get
+    mistaken for the "0 = unlimited" sentinel. Exactly 0 stays 0 (unlimited).
+    """
+    micro = int(daily_usd * MICRO)
+    if daily_usd > 0 and micro == 0:
+        return 1
+    return micro
+
 
 def current_window(now: datetime | None = None) -> str:
     now = now or datetime.now(timezone.utc)
@@ -131,7 +149,7 @@ class QuotaStore:
             "user_id": user_id,
             "name": name,
             "status": "active",
-            "daily_usd_micro": int(daily_usd * MICRO),
+            "daily_usd_micro": _usd_to_micro(daily_usd),
             "daily_input_tokens": daily_input_tokens,
             "daily_output_tokens": daily_output_tokens,
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -181,7 +199,7 @@ class QuotaStore:
         sets, values = [], {}
         if daily_usd is not None:
             sets.append("daily_usd_micro = :c")
-            values[":c"] = int(daily_usd * MICRO)
+            values[":c"] = _usd_to_micro(daily_usd)
         if daily_input_tokens is not None:
             sets.append("daily_input_tokens = :i")
             values[":i"] = daily_input_tokens
@@ -226,9 +244,16 @@ class QuotaStore:
         window = current_window()
         reserve_cost = cost_micro_usd(model_id, est_input_tokens, max_output_tokens)
 
-        cost_headroom = user.daily_usd_micro - reserve_cost
-        input_headroom = user.daily_input_tokens - est_input_tokens
-        output_headroom = user.daily_output_tokens - max_output_tokens
+        # A limit of 0 means "not enforced" for that dimension (see
+        # _UNLIMITED_HEADROOM), matching _is_over_budget and the reconciler.
+        # Using a large sentinel headroom keeps the dimension non-binding in
+        # both the pre-check and the atomic ConditionExpression below.
+        cost_headroom = (user.daily_usd_micro - reserve_cost
+                         if user.daily_usd_micro else _UNLIMITED_HEADROOM)
+        input_headroom = (user.daily_input_tokens - est_input_tokens
+                          if user.daily_input_tokens else _UNLIMITED_HEADROOM)
+        output_headroom = (user.daily_output_tokens - max_output_tokens
+                           if user.daily_output_tokens else _UNLIMITED_HEADROOM)
         if cost_headroom < 0 or input_headroom < 0 or output_headroom < 0:
             self._count_throttle(user.user_id, window)
             return QuotaDecision(
@@ -277,7 +302,13 @@ class QuotaStore:
                 reserved_input_tokens=est_input_tokens,
                 reserved_output_tokens=max_output_tokens,
             ),
-            remaining_usd_micro=user.daily_usd_micro - int(new.get("cost_micro", 0)),
+            # None when USD is unlimited (limit 0), else remaining against the
+            # single counter (which the reconciler also feeds), so the header
+            # reflects native-vended spend too — not just proxy spend.
+            remaining_usd_micro=(
+                user.daily_usd_micro - int(new.get("cost_micro", 0))
+                if user.daily_usd_micro else None
+            ),
         )
 
     def settle(self, reservation: Reservation,
@@ -336,6 +367,10 @@ class QuotaStore:
         window = window or current_window()
         resp = self._usage.get_item(Key={"user_id": user_id, "window": window})
         item = resp.get("Item") or {}
+        # ONE counter set holds the total: the proxy (Mode B) ADDs at settle
+        # time and the reconciler ADDs native-vended (Mode A) deltas to the
+        # SAME fields (see reconciler _ingest_usage), so no summing is needed
+        # and every reader — this, _is_over_budget, and reserve() — agrees.
         return {
             "user_id": user_id,
             "window": window,

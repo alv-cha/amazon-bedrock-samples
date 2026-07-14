@@ -15,10 +15,16 @@ identity:
                                             changed on re-assume, so a user
                                             can't relabel as someone else)
 
-Because RoleSessionName is limited to 64 chars of [\\w+=,.@-], we sanitize
-the `sub` into a valid session name but keep the *full* `sub` as both the
-DynamoDB key and the SourceIdentity, so two users can never collapse onto
-one session name without also colliding on SourceIdentity (which we assert).
+RoleSessionName, SourceIdentity, and session-tag values each restrict which
+characters they accept, and STS rejects the whole AssumeRole call if any of
+them is out of range — so a raw IdP `sub` like "auth0|5f...e9" (pipe) or a
+non-ASCII subject breaks vending entirely. We therefore sanitize the `sub`
+into ONE collision-resistant identity (``session_name_for``) whose character
+set is the intersection valid for all three, and use it for all three. A
+short SHA-256 suffix of the *full* sub guarantees two distinct subs never
+collapse onto one identity even after sanitization/truncation. The full,
+unmodified `sub` is preserved as the DynamoDB key and in the ``SESSION#``
+reverse-map row, so metering still attributes usage to the real user.
 """
 
 import hashlib
@@ -31,8 +37,21 @@ from botocore.exceptions import ClientError
 from .auth import Identity
 from .config import settings
 
-_SESSION_SAFE = re.compile(r"[^\w+=,.@-]")
+# The vended identity is used as RoleSessionName, SourceIdentity, AND a
+# session-tag VALUE. Their allowed charsets differ:
+#   RoleSessionName / SourceIdentity: [\w+=,.@-]
+#   session-tag value:                [\p{L}\p{Z}\p{N}_.:/=+\-@]  (NO comma)
+# We keep only the INTERSECTION so one sanitized value is valid in all three;
+# notably comma is dropped (valid in a session name but rejected in a tag
+# value, so a sub like an LDAP DN "CN=a,OU=b" would otherwise fail vending).
+# re.ASCII so a non-ASCII `sub` (e.g. "josé", CJK) can't leave Unicode word
+# characters that STS rejects.
+_SESSION_SAFE = re.compile(r"[^\w+=.@-]", re.ASCII)
 _MAX_SESSION_NAME = 64
+# Hex chars of SHA-256(sub) appended to keep distinct subs from colliding onto
+# one identity. 20 hex = 80 bits: birthday-safe past ~10^12 distinct subjects
+# (10 hex / 40 bits collided near ~10^6, too weak for large multi-tenant use).
+_HASH_HEX = 20
 
 
 @dataclass(frozen=True)
@@ -55,16 +74,21 @@ class BrokerError(Exception):
 
 
 def session_name_for(sub: str) -> str:
-    """Map an arbitrary JWT `sub` to a valid, collision-resistant
-    RoleSessionName.
+    """Map an arbitrary JWT `sub` to a single sanitized, collision-resistant
+    identity valid as a RoleSessionName, SourceIdentity, AND session-tag value.
 
-    Session names must match [\\w+=,.@-]{1,64}. IdP subs can exceed this
-    (e.g. "auth0|5f...e9", long GUIDs). We keep a readable prefix and append
-    a short hash of the *full* sub so distinct subs never map to the same
-    session name even after sanitization/truncation.
+    We keep only characters in the intersection of all three fields' charsets
+    (ASCII ``[\\w+=.@-]`` — see ``_SESSION_SAFE``; comma excluded because tag
+    values reject it) and cap length at 64, since STS rejects the entire
+    AssumeRole call if any field is out of range. IdP subs routinely violate
+    this (e.g. "auth0|5f...e9", "google-oauth2|123", long GUIDs, non-ASCII).
+    We strip disallowed characters to a readable prefix and append an
+    ``_HASH_HEX``-char hash of the *full* sub so distinct subs don't collide
+    even after sanitization/truncation. The full sub is preserved separately
+    (DynamoDB key + SESSION# reverse map), so attribution is unaffected.
     """
     cleaned = _SESSION_SAFE.sub("-", sub).strip("-") or "user"
-    digest = hashlib.sha256(sub.encode("utf-8")).hexdigest()[:10]
+    digest = hashlib.sha256(sub.encode("utf-8")).hexdigest()[:_HASH_HEX]
     suffix = "-" + digest
     prefix = cleaned[: _MAX_SESSION_NAME - len(suffix)]
     return prefix + suffix
@@ -97,13 +121,18 @@ class CredentialBroker:
             resp = self._sts.assume_role(
                 RoleArn=self._role_arn,
                 RoleSessionName=session_name,
-                # SourceIdentity keeps the FULL sub; it is tamper-resistant
-                # and propagates to CloudTrail for every downstream call.
-                SourceIdentity=sub[:_MAX_SESSION_NAME],
+                # SourceIdentity and the session tag share RoleSessionName's
+                # charset limits, so we stamp the SAME sanitized identity in
+                # all three. Using the raw sub here would make STS reject the
+                # call for any sub containing '|', ':', or non-ASCII (Auth0,
+                # Google, Entra, ...). SourceIdentity is still tamper-resistant
+                # (can't be changed on re-assume) and propagates to CloudTrail;
+                # the full sub is recoverable via the SESSION# reverse map.
+                SourceIdentity=session_name,
                 DurationSeconds=self._ttl,
                 # Tag the session so cost-allocation / log queries can also
                 # filter by the app user without parsing the ARN.
-                Tags=[{"Key": "quota-user", "Value": sub[:256]}],
+                Tags=[{"Key": "quota-user", "Value": session_name}],
             )
         except ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "STSError")

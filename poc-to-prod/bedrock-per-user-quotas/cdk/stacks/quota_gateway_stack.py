@@ -1,4 +1,4 @@
-"""CDK stack for the bedrock-mantle per-user quota gateway.
+"""CDK stack for the Bedrock per-user quota gateway.
 
 Resources:
 - DynamoDB: users table (limits/status per JWT subject), usage table (TTL)
@@ -11,6 +11,8 @@ Resources:
 - Reconciler Lambda on a 5-minute EventBridge schedule + SNS alert topic
 - CloudWatch dashboard over the gateway's EMF metrics
 """
+
+import json
 
 import aws_cdk as cdk
 from aws_cdk import (
@@ -32,7 +34,30 @@ from aws_cdk import (
 )
 from constructs import Construct
 
-METRICS_NAMESPACE = "BedrockMantleGateway"
+METRICS_NAMESPACE = "BedrockQuotaGateway"
+
+# Single source of truth for model prices (USD per 1M tokens), injected as
+# MODEL_PRICES_JSON into BOTH the gateway and reconciler Lambdas. Both already
+# treat this env var as authoritative over their in-code fallback tables, so
+# defining it once here prevents the two from drifting (the gateway prices at
+# settle time; the reconciler is authoritative for native-vended traffic).
+# NOTE: these are PLACEHOLDERS — verify against the Amazon Bedrock pricing page
+# for the models you enable. Keys are model IDs as they appear in Bedrock
+# model-invocation logs / mantle responses.
+#
+# CACHE-PRICING CAVEAT (Mode A): Bedrock model-invocation logs record only
+# input.inputTokenCount / output.outputTokenCount — there are NO cache-token
+# fields — so the reconciler cannot apply the gateway's prompt-cache
+# multipliers to native-vended traffic. The gateway (proxy path) is
+# cache-aware; the reconciler (native path) is not, so for cache-heavy
+# coding-agent workloads the two pricers differ and native dollar enforcement
+# is approximate. Cache-accurate native metering would require enabling
+# text-data delivery and parsing inputBodyJson. See README for the tradeoff.
+MODEL_PRICES = {
+    "openai.gpt-oss-120b": {"input_per_mtok": 0.15, "output_per_mtok": 0.60},
+    "openai.gpt-oss-20b": {"input_per_mtok": 0.07, "output_per_mtok": 0.30},
+    "anthropic.claude-opus-4-7": {"input_per_mtok": 15.00, "output_per_mtok": 75.00},
+}
 
 
 class QuotaGatewayStack(Stack):
@@ -42,7 +67,21 @@ class QuotaGatewayStack(Stack):
         alert_email = self.node.try_get_context("alert_email")
         jwt_issuer = self.node.try_get_context("jwt_issuer")
         jwt_audience = self.node.try_get_context("jwt_audience") or ""
+        jwt_jwks_url = self.node.try_get_context("jwt_jwks_url") or ""
         jwt_user_claim = self.node.try_get_context("jwt_user_claim") or "sub"
+        # Vended-credential lifetime = the broker's AssumeRole DurationSeconds
+        # (VENDED_CREDENTIAL_TTL_SECONDS env). STS bounds AssumeRole duration to
+        # 900s–43200s. The vended role's max_session_duration is derived from it
+        # (see below) so DurationSeconds can never exceed the role's ceiling.
+        vended_ttl_seconds = int(self.node.try_get_context("vended_ttl_seconds") or 900)
+        if not 900 <= vended_ttl_seconds <= 43200:
+            raise ValueError(
+                "vended_ttl_seconds must be between 900 (15 min) and 43200 "
+                f"(12h, the STS AssumeRole duration limit); got {vended_ttl_seconds}."
+            )
+        # A role's max_session_duration floor is 3600s (STS), independent of the
+        # AssumeRole duration floor (900s), so lift the ceiling to at least 1h.
+        max_session_seconds = max(vended_ttl_seconds, 3600)
         # -c snapstart=true: resume the gateway from a Firecracker microVM
         # snapshot instead of cold-starting (Python SnapStart). Requires
         # publishing versions; the Function URL then targets an alias.
@@ -78,6 +117,7 @@ class QuotaGatewayStack(Stack):
             self, "UsersTable",
             partition_key=ddb.Attribute(name="user_id", type=ddb.AttributeType.STRING),
             billing_mode=ddb.BillingMode.PAY_PER_REQUEST,
+            time_to_live_attribute="expires_at",
             removal_policy=RemovalPolicy.DESTROY,  # sample: destroy on teardown
         )
 
@@ -151,9 +191,12 @@ class QuotaGatewayStack(Stack):
                 "USAGE_TABLE": usage_table.table_name,
                 "METRICS_NAMESPACE": METRICS_NAMESPACE,
                 "ADMIN_KEY_SECRET_ARN": admin_secret.secret_arn,
+                # Single price source shared with the reconciler (prevents drift).
+                "MODEL_PRICES_JSON": json.dumps(MODEL_PRICES),
                 # JWT auth
                 "JWT_ISSUER": jwt_issuer,
                 "JWT_AUDIENCE": jwt_audience,
+                "JWT_JWKS_URL": jwt_jwks_url,
                 "JWT_USER_CLAIM": jwt_user_claim,
             },
         )
@@ -172,7 +215,8 @@ class QuotaGatewayStack(Stack):
         # Per-user vended role (the API-agnostic enforcement path)
         #
         # The broker assumes this role on behalf of an in-budget user, with
-        # RoleSessionName + SourceIdentity = the JWT sub. The user then calls
+        # RoleSessionName + SourceIdentity = a sanitized id derived from the
+        # identity claim (reverse-mapped for metering). The user then calls
         # Bedrock NATIVELY (InvokeModel / Converse / streaming, any provider)
         # with the short-lived creds. Scoped to Bedrock invoke actions on all
         # models in this account/region; tighten `resources` to specific
@@ -185,8 +229,22 @@ class QuotaGatewayStack(Stack):
             # another user. Users never hold static Bedrock access (the
             # deny-direct policy below enforces "must go through the broker").
             assumed_by=iam.ArnPrincipal(gateway_fn.role.role_arn),
-            max_session_duration=Duration.hours(1),
+            # >= the vended TTL (and >= the STS 3600s floor), so the broker's
+            # AssumeRole DurationSeconds can never exceed the role's ceiling.
+            max_session_duration=Duration.seconds(max_session_seconds),
             description="Short-lived, per-user Bedrock access vended by the quota broker.",
+        )
+        # STS requires sts:SetSourceIdentity and sts:TagSession on BOTH the
+        # caller's identity policy (granted below) AND this role's trust
+        # policy. `assumed_by` only emits sts:AssumeRole, so without these the
+        # broker's assume_role(SourceIdentity=, Tags=) call fails with
+        # AccessDenied for every user. Scope to the gateway principal only.
+        bedrock_user_role.assume_role_policy.add_statements(
+            iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                principals=[iam.ArnPrincipal(gateway_fn.role.role_arn)],
+                actions=["sts:SetSourceIdentity", "sts:TagSession"],
+            )
         )
         bedrock_user_role.add_to_policy(
             iam.PolicyStatement(
@@ -196,11 +254,17 @@ class QuotaGatewayStack(Stack):
                     "bedrock:InvokeModelWithResponseStream",
                     "bedrock:Converse",
                     "bedrock:ConverseStream",
-                    # mantle (OpenAI/Anthropic-compatible) inference
-                    "bedrock-mantle:CreateInference",
-                    "bedrock-mantle:CallWithBearerToken",
                 ],
-                # All models in this account/region (sample default).
+                # bedrock-runtime ONLY, deliberately. Model-invocation logging
+                # (the reconciler's metering source) captures ONLY the
+                # bedrock-runtime endpoint — mantle (OpenAI/Anthropic-compatible)
+                # calls are NOT logged, so granting bedrock-mantle:* here would
+                # let a user spend via vended creds with ZERO metering and no
+                # enforcement. Mode A's native path must stay on the logged
+                # endpoint. (Mode B proxies mantle in-band and meters there.)
+                # All models in this account/region (sample default); tighten
+                # `resources` to specific model ARNs to restrict which models
+                # users may call.
                 resources=["*"],
             )
         )
@@ -215,67 +279,144 @@ class QuotaGatewayStack(Stack):
             )
         )
         gateway_fn.add_environment("BEDROCK_USER_ROLE_ARN", bedrock_user_role.role_arn)
+        # Same knob that sized max_session_duration above (kept in lockstep).
+        gateway_fn.add_environment("VENDED_CREDENTIAL_TTL_SECONDS", str(vended_ttl_seconds))
 
         # ------------------------------------------------------------------
         # Bedrock model-invocation logging -> CloudWatch Logs.
         #
-        # This is the ONLY source with per-call token counts across every
-        # invoke path/provider, and each record's identity.arn carries the
-        # RoleSessionName (= sanitized JWT sub) so the reconciler can meter
-        # per user. It is an account/region-level Bedrock setting, applied
-        # here via a custom resource.
+        # This is the source of per-call token counts across every bedrock-
+        # runtime invoke path (InvokeModel/Converse/streaming, all providers);
+        # each record's identity.arn carries the RoleSessionName (= sanitized
+        # JWT sub) so the reconciler can meter per user.
+        #
+        # IMPORTANT: model-invocation logging is a SINGLE ACCOUNT + REGION-WIDE
+        # Bedrock setting (one config per region). Managing it from this stack
+        # therefore OVERWRITES any existing configuration on deploy (e.g. a
+        # security team's central sink). Management requires explicit opt-in,
+        # and the resulting configuration, log group, and writer role are
+        # RETAINED on `cdk destroy` because the stack cannot restore whatever
+        # was configured before.
+        #
+        # In a shared account, deploy with:
+        #   -c manage_invocation_logging=false
+        #   -c invocation_log_group_name=/your/existing/bedrock/log-group
+        # and this stack will read your existing group instead of touching the
+        # account-wide setting. That group must already receive model-
+        # invocation logs whose identity.arn carries the vended session name.
         # ------------------------------------------------------------------
-        invocation_log_group = logs.LogGroup(
-            self, "BedrockInvocationLogs",
-            log_group_name="/bedrock/quota-gateway/model-invocations",
-            retention=logs.RetentionDays.TWO_WEEKS,
-            removal_policy=RemovalPolicy.DESTROY,
-        )
-        # Role Bedrock uses to write the invocation logs.
-        bedrock_logging_role = iam.Role(
-            self, "BedrockLoggingRole",
-            assumed_by=iam.ServicePrincipal("bedrock.amazonaws.com"),
-        )
-        invocation_log_group.grant_write(bedrock_logging_role)
-        # Enable model-invocation logging account/region-wide.
-        cr.AwsCustomResource(
-            self, "EnableBedrockInvocationLogging",
-            on_create=cr.AwsSdkCall(
-                service="Bedrock",
-                action="putModelInvocationLoggingConfiguration",
-                parameters={
-                    "loggingConfig": {
-                        "cloudWatchConfig": {
-                            "logGroupName": invocation_log_group.log_group_name,
-                            "roleArn": bedrock_logging_role.role_arn,
+        manage_logging_context = self.node.try_get_context("manage_invocation_logging")
+        manage_logging = str(manage_logging_context).lower() == "true"
+        existing_log_group_name = self.node.try_get_context("invocation_log_group_name")
+
+        if existing_log_group_name:
+            # Bring-your-own group: never mutate the account-wide setting.
+            invocation_log_group = logs.LogGroup.from_log_group_name(
+                self, "BedrockInvocationLogs", existing_log_group_name
+            )
+            manage_logging = False
+        elif manage_logging_context is None:
+            raise ValueError(
+                "Bedrock model-invocation logging is an account + region-wide "
+                "setting, so this stack will not change it without explicit "
+                "consent. Use -c manage_invocation_logging=true to let this "
+                "sample manage it, or use -c manage_invocation_logging=false "
+                "-c invocation_log_group_name=<existing-group>."
+            )
+        elif not manage_logging:
+            # No group given AND not managing the account-wide config: the
+            # reconciler would query a log group that receives nothing, so
+            # Mode A native spend is metered as zero and never enforced. Fail
+            # loudly rather than deploy a gateway that silently meters nothing.
+            raise ValueError(
+                "manage_invocation_logging=false requires "
+                "-c invocation_log_group_name=<an existing log group that "
+                "already receives Bedrock model-invocation logs>. Without it "
+                "the reconciler has no usage source and Mode A budgets would "
+                "not be enforced. To let this stack manage logging itself, "
+                "set -c manage_invocation_logging=true explicitly."
+            )
+        else:
+            invocation_log_group = logs.LogGroup(
+                self, "BedrockInvocationLogs",
+                log_group_name="/bedrock/quota-gateway/model-invocations",
+                retention=logs.RetentionDays.TWO_WEEKS,
+                removal_policy=RemovalPolicy.RETAIN,
+            )
+
+        if manage_logging:
+            cdk.Annotations.of(self).add_warning(
+                "This stack manages the ACCOUNT + REGION-WIDE Bedrock model-"
+                "invocation logging configuration: deploy OVERWRITES any "
+                "existing config. The configuration, log group, and writer "
+                "role are RETAINED on `cdk destroy` because the prior "
+                "configuration cannot be restored automatically. In a shared "
+                "account, redeploy with -c manage_invocation_logging=false "
+                "and -c invocation_log_group_name=<your existing group>."
+            )
+            # Role Bedrock uses to write the invocation logs.
+            bedrock_logging_role = iam.Role(
+                self, "BedrockLoggingRole",
+                assumed_by=iam.ServicePrincipal(
+                    "bedrock.amazonaws.com",
+                    conditions={
+                        "StringEquals": {"aws:SourceAccount": self.account},
+                        "ArnLike": {
+                            "aws:SourceArn": self.format_arn(
+                                service="bedrock", resource="*"
+                            )
                         },
-                        "textDataDeliveryEnabled": False,
-                        "imageDataDeliveryEnabled": False,
-                        "embeddingDataDeliveryEnabled": False,
-                    }
-                },
-                physical_resource_id=cr.PhysicalResourceId.of("bedrock-invocation-logging"),
-            ),
-            # Best-effort cleanup so teardown restores the prior state.
-            on_delete=cr.AwsSdkCall(
-                service="Bedrock",
-                action="deleteModelInvocationLoggingConfiguration",
-            ),
-            policy=cr.AwsCustomResourcePolicy.from_statements([
-                iam.PolicyStatement(
-                    actions=[
-                        "bedrock:PutModelInvocationLoggingConfiguration",
-                        "bedrock:DeleteModelInvocationLoggingConfiguration",
-                        "bedrock:GetModelInvocationLoggingConfiguration",
-                    ],
-                    resources=["*"],
+                    },
                 ),
-                # Required so Bedrock can validate it may pass the logging role.
-                iam.PolicyStatement(actions=["iam:PassRole"],
-                                    resources=[bedrock_logging_role.role_arn]),
-            ]),
-            install_latest_aws_sdk=False,
-        )
+                inline_policies={
+                    "WriteInvocationLogs": iam.PolicyDocument(statements=[
+                        iam.PolicyStatement(
+                            actions=["logs:CreateLogStream", "logs:PutLogEvents"],
+                            resources=[
+                                f"{invocation_log_group.log_group_arn}:"
+                                "log-stream:aws/bedrock/modelinvocations",
+                            ],
+                        )
+                    ])
+                },
+            )
+            bedrock_logging_role.apply_removal_policy(RemovalPolicy.RETAIN)
+            # Enable model-invocation logging account/region-wide.
+            invocation_logging_config = cr.AwsCustomResource(
+                self, "EnableBedrockInvocationLogging",
+                on_create=cr.AwsSdkCall(
+                    service="Bedrock",
+                    action="putModelInvocationLoggingConfiguration",
+                    parameters={
+                        "loggingConfig": {
+                            "cloudWatchConfig": {
+                                "logGroupName": invocation_log_group.log_group_name,
+                                "roleArn": bedrock_logging_role.role_arn,
+                            },
+                            "textDataDeliveryEnabled": False,
+                            "imageDataDeliveryEnabled": False,
+                            "embeddingDataDeliveryEnabled": False,
+                        }
+                    },
+                    physical_resource_id=cr.PhysicalResourceId.of("bedrock-invocation-logging"),
+                ),
+                policy=cr.AwsCustomResourcePolicy.from_statements([
+                    iam.PolicyStatement(
+                        actions=[
+                            "bedrock:PutModelInvocationLoggingConfiguration",
+                            "bedrock:GetModelInvocationLoggingConfiguration",
+                        ],
+                        resources=["*"],
+                    ),
+                    # Required so Bedrock can validate it may pass the logging role.
+                    iam.PolicyStatement(actions=["iam:PassRole"],
+                                        resources=[bedrock_logging_role.role_arn]),
+                ]),
+                install_latest_aws_sdk=False,
+            )
+            invocation_logging_config.node.default_child.apply_removal_policy(
+                RemovalPolicy.RETAIN
+            )
 
         # SnapStart only applies to published versions, so with it enabled
         # the Function URL targets a "live" alias of the current version;
@@ -352,6 +493,7 @@ class QuotaGatewayStack(Stack):
             runtime=lambda_.Runtime.PYTHON_3_12,
             memory_size=256,
             timeout=Duration.minutes(2),
+            reserved_concurrent_executions=1,
             handler="handler.handler",
             code=lambda_.Code.from_asset("../reconciler"),
             environment={
@@ -359,6 +501,12 @@ class QuotaGatewayStack(Stack):
                 "USAGE_TABLE": usage_table.table_name,
                 "SNS_TOPIC_ARN": alert_topic.topic_arn,
                 "WARN_THRESHOLD": "0.8",
+                # Native-vended usage EMF is emitted under the same namespace
+                # as the gateway's so the dashboard reflects Mode A traffic too.
+                "METRICS_NAMESPACE": METRICS_NAMESPACE,
+                # Same price source as the gateway so the authoritative
+                # reconciler cost can't drift from the gateway's settle cost.
+                "MODEL_PRICES_JSON": json.dumps(MODEL_PRICES),
                 # Source of per-user token counts (any Bedrock API/provider).
                 "INVOCATION_LOG_GROUP": invocation_log_group.log_group_name,
             },
@@ -385,7 +533,7 @@ class QuotaGatewayStack(Stack):
         # ------------------------------------------------------------------
         # Dashboard
         # ------------------------------------------------------------------
-        dashboard = cw.Dashboard(self, "Dashboard", dashboard_name="bedrock-mantle-quota-gateway")
+        dashboard = cw.Dashboard(self, "Dashboard", dashboard_name="bedrock-per-user-quota-gateway")
 
         def search_widget(title: str, metric: str, stat: str = "Sum") -> cw.GraphWidget:
             return cw.GraphWidget(

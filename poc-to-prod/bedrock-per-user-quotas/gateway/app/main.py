@@ -1,17 +1,28 @@
-"""Per-user quota gateway for the Amazon Bedrock ``bedrock-mantle`` endpoint.
-
-A drop-in OpenAI/Anthropic-compatible proxy:
-
-    client = OpenAI(base_url="https://<gateway>/v1", api_key="<user's JWT>")
+"""Per-user quota gateway for Amazon Bedrock.
 
 Users authenticate with the JWT their application already uses (any OIDC
-IdP — Cognito, Okta, Auth0, ...). The gateway verifies the token, takes the
-quota identity from its ``sub`` claim (configurable), reserves the request's
-worst case against that user's daily budgets (USD + input/output tokens),
-forwards the call to bedrock-mantle with a short-term Bedrock token from its
-own IAM role, then settles the counters with real usage from the response —
-including from SSE streams. Over-budget requests receive HTTP 429 before
-any tokens are spent upstream.
+IdP — Cognito, Okta, Auth0, ...); the quota identity is a configurable claim
+(default ``sub``). Two enforcement modes share this app:
+
+- **Mode A — credential broker** (``POST /v1/credentials``, recommended):
+  verifies the JWT, checks the user's budget, and vends short-lived AWS
+  credentials so the app calls ``bedrock-runtime`` natively (any API/provider).
+  The gateway is out of the data path; metering is done asynchronously by the
+  reconciler from Bedrock model-invocation logs.
+
+- **Mode B — inline proxy** (``/v1/*`` and ``/anthropic/v1/*``): a drop-in
+  OpenAI/Anthropic-compatible proxy for the ``bedrock-mantle`` endpoint that
+  reserves each request's worst case against the user's daily budgets, forwards
+  it with a short-term Bedrock token minted from the gateway's own IAM role,
+  then settles the counters with real usage (including from SSE streams).
+  Over-budget requests receive HTTP 429 before any tokens are spent upstream.
+
+      client = OpenAI(
+          base_url="https://<gateway>/v1",
+          http_client=httpx.Client(
+              auth=FunctionUrlSigV4Auth("<user's JWT>", "<region>")
+          ),
+      )
 """
 
 import json
@@ -22,7 +33,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import emf
-from .auth import Identity, JwtError, JwtVerifier, extract_bearer
+from .auth import Identity, JwtError, JwtVerifier, extract_bearer, extract_user_token
 from .broker import BrokerError, CredentialBroker
 from .config import settings
 from .metering import (
@@ -35,7 +46,7 @@ from .pricing import MICRO
 from .quota import QuotaStore, Reservation, UserRecord
 from .upstream import MantleClient, response_headers
 
-app = FastAPI(title="bedrock-mantle per-user quota gateway", docs_url=None, redoc_url=None)
+app = FastAPI(title="Bedrock per-user quota gateway", docs_url=None, redoc_url=None)
 
 _store: QuotaStore | None = None
 _mantle: MantleClient | None = None
@@ -103,10 +114,10 @@ def _authenticate(request: Request) -> tuple[UserRecord | None, str]:
     """Verify the caller's JWT and resolve the quota user record.
 
     Returns (user, "") on success or (None, reason) on failure. The token
-    is read from Authorization: Bearer (OpenAI SDK) or x-api-key
-    (Anthropic SDK).
+    is normally read from X-Quota-User-Token so SigV4 can own Authorization.
+    Bearer Authorization and x-api-key remain supported for local deployments.
     """
-    token = extract_bearer(request.headers.get("authorization")) or request.headers.get("x-api-key")
+    token = extract_user_token(request.headers)
     if not token:
         return None, "Missing bearer token."
     try:
@@ -129,6 +140,10 @@ def _authenticate(request: Request) -> tuple[UserRecord | None, str]:
 
 
 def _quota_headers(user: UserRecord, remaining_usd_micro: int | None) -> dict[str, str]:
+    # A 0 USD limit means "unlimited" (see quota._UNLIMITED_HEADROOM), so
+    # report "unlimited" rather than a misleading 0.000000 cap/remaining.
+    if not user.daily_usd_micro:
+        return {"X-Quota-Limit-USD": "unlimited"}
     headers = {"X-Quota-Limit-USD": f"{user.daily_usd_micro / MICRO:.6f}"}
     if remaining_usd_micro is not None:
         headers["X-Quota-Remaining-USD"] = f"{max(remaining_usd_micro, 0) / MICRO:.6f}"
@@ -139,7 +154,8 @@ def _quota_headers(user: UserRecord, remaining_usd_micro: int | None) -> dict[st
 # Credential broker: the primary, API-agnostic path.
 #
 # Instead of proxying inference, hand an in-budget user short-lived AWS
-# credentials (RoleSessionName + SourceIdentity = their JWT sub) so they can
+# credentials (RoleSessionName + SourceIdentity = a sanitized id derived from
+# their identity claim, reverse-mapped for metering) so they can
 # call Bedrock natively on any API/provider. Enforcement is at vend time:
 # blocked/over-budget users get 403 and simply can't obtain fresh creds, so
 # they lose access at their current session's TTL (bounded overspend).
@@ -427,7 +443,11 @@ async def healthz() -> dict:
 # ---------------------------------------------------------------------------
 
 def _require_admin(request: Request) -> JSONResponse | None:
-    provided = extract_bearer(request.headers.get("authorization"))
+    provided = extract_bearer(request.headers.get("x-quota-admin-key"))
+    if not provided:
+        authorization = request.headers.get("authorization")
+        if authorization and authorization.lower().startswith("bearer "):
+            provided = extract_bearer(authorization)
     expected = admin_key()
     if not expected or provided != expected:
         return _error(403, "Admin authorization required.", "forbidden")

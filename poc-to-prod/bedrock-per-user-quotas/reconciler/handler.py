@@ -25,10 +25,54 @@ import boto3
 from metering_ingest import aggregate_by_user, run_insights_query, _window_epoch_bounds
 
 MICRO = 1_000_000
+METRICS_NAMESPACE = os.environ.get("METRICS_NAMESPACE", "BedrockQuotaGateway")
 
 
-# --- pricing (self-contained; mirrors gateway/app/pricing.py) ---
-# USD per 1M tokens. Override with MODEL_PRICES_JSON to match the gateway.
+def _emit_emf(user_id: str, d_cost_micro: int, d_in: int, d_out: int, d_req: int) -> None:
+    """Emit per-user CloudWatch metrics (EMF) for native-vended usage the
+    reconciler just metered, so the dashboard reflects Mode A too (the proxy
+    path emits its own EMF; without this, native spend was invisible there).
+    Emits the DELTA applied this run so cumulative Sum stats stay correct."""
+    if d_req <= 0 and d_cost_micro <= 0:
+        return
+    record = {
+        "_aws": {
+            "Timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+            "CloudWatchMetrics": [{
+                "Namespace": METRICS_NAMESPACE,
+                "Dimensions": [["UserId"], []],
+                "Metrics": [
+                    {"Name": "Requests", "Unit": "Count"},
+                    {"Name": "InputTokens", "Unit": "Count"},
+                    {"Name": "OutputTokens", "Unit": "Count"},
+                    {"Name": "EstimatedCostUSD", "Unit": "None"},
+                ],
+            }],
+        },
+        "UserId": user_id, "Source": "reconciler",
+        "Requests": max(d_req, 0), "InputTokens": max(d_in, 0),
+        "OutputTokens": max(d_out, 0),
+        "EstimatedCostUSD": round(max(d_cost_micro, 0) / MICRO, 8),
+    }
+    print(json.dumps(record))
+
+
+# --- pricing (self-contained; the reconciler is a separate Lambda asset and
+# cannot import gateway/app/pricing.py at runtime) ---
+# USD per 1M tokens. In a real deploy the CDK injects MODEL_PRICES_JSON (the
+# SAME table given to the gateway) which _prices() overlays on top of these,
+# so the two Lambdas price identically and can't drift. This dict is only the
+# local/offline fallback when MODEL_PRICES_JSON is unset.
+#
+# CACHE CAVEAT: unlike the gateway, this pricer has no prompt-cache
+# multipliers, because Bedrock model-invocation logs carry no cache-token
+# fields (only input.inputTokenCount / output.outputTokenCount). If those
+# counts exclude cache read/write tokens (as the Anthropic usage shape
+# suggests), cache-heavy native-vended traffic is UNDER-counted here, so the
+# reconciler may under-enforce dollar budgets for coding-agent workloads.
+# Getting cache-accurate native metering requires enabling text-data delivery
+# and parsing inputBodyJson (heavier + privacy-sensitive). See the note in the
+# CDK MODEL_PRICES definition for the accuracy tradeoff.
 _DEFAULT_PRICES = {
     "openai.gpt-oss-120b": (0.15, 0.60),
     "openai.gpt-oss-20b": (0.07, 0.30),
@@ -76,10 +120,16 @@ def _current_window() -> str:
 
 def _scan_users(table) -> list[dict]:
     items, resp = [], table.scan()
-    items.extend(resp.get("Items", []))
+    items.extend(
+        item for item in resp.get("Items", [])
+        if not str(item.get("user_id", "")).startswith("SESSION#")
+    )
     while "LastEvaluatedKey" in resp:
         resp = table.scan(ExclusiveStartKey=resp["LastEvaluatedKey"])
-        items.extend(resp.get("Items", []))
+        items.extend(
+            item for item in resp.get("Items", [])
+            if not str(item.get("user_id", "")).startswith("SESSION#")
+        )
     return items
 
 
@@ -99,6 +149,14 @@ def _set_status(users_table, user_id: str, status: str, reason: str) -> None:
             ":s": status, ":r": reason,
             ":t": datetime.now(timezone.utc).isoformat(),
         },
+    )
+
+
+def _mark_warning_sent(users_table, user_id: str, window: str) -> None:
+    users_table.update_item(
+        Key={"user_id": user_id},
+        UpdateExpression="SET warning_sent_window = :w",
+        ExpressionAttributeValues={":w": window},
     )
 
 
@@ -125,10 +183,21 @@ class _SessionResolver:
 
 def _ingest_usage(logs_client, users_table, usage_table, log_group: str,
                   window: str, now: datetime) -> dict:
-    """Read Bedrock model-invocation logs and write authoritative per-user
-    usage for the current window. Idempotent: overwrites the window's
-    metered counters with the summed truth (SET, not ADD), so re-running the
-    reconciler converges rather than double-counts."""
+    """Reconcile the ONE per-user usage counter to the authoritative
+    log-derived total for native-vended traffic.
+
+    There is a single set of counters (cost_micro / input_tokens /
+    output_tokens / requests) that BOTH writers feed:
+      - the proxy (Mode B) ADDs real usage at settle time;
+      - this reconciler ADDs the *delta* of native-vended (Mode A) usage.
+
+    To stay idempotent across the every-5-min re-runs (each query re-sums the
+    whole day) while ALSO composing with the proxy's ADDs, we remember how
+    much this reconciler has already applied to the window in bookkeeping
+    fields (``metered_applied_*``) and ADD only ``new_total - already_applied``
+    each run. So the counter converges to proxy_usage + native_usage without
+    the SET-vs-ADD clobber a shared counter would otherwise suffer.
+    """
     if not log_group:
         return {"metered_users": 0, "unresolved_sessions": []}
     start, end = _window_epoch_bounds(now)
@@ -143,17 +212,35 @@ def _ingest_usage(logs_client, users_table, usage_table, log_group: str,
         reqs = sum(e["requests"] for e in entries)
         cost = sum(_cost_micro(prices, e["model"], e["input_tokens"], e["output_tokens"])
                    for e in entries)
+
+        # Read what we've already applied so this run only ADDs the delta.
+        item = usage_table.get_item(
+            Key={"user_id": user_id, "window": window}).get("Item") or {}
+        d_cost = cost - int(item.get("metered_applied_cost_micro", 0))
+        d_in = in_tok - int(item.get("metered_applied_input_tokens", 0))
+        d_out = out_tok - int(item.get("metered_applied_output_tokens", 0))
+        d_req = reqs - int(item.get("metered_applied_requests", 0))
+        if (d_cost, d_in, d_out, d_req) == (0, 0, 0, 0):
+            metered += 1
+            continue
+
+        # ADD the delta to the shared enforced counters, and SET the
+        # bookkeeping to the new authoritative total in the same update.
         usage_table.update_item(
             Key={"user_id": user_id, "window": window},
             UpdateExpression=(
-                "SET cost_micro = :c, input_tokens = :i, output_tokens = :o, "
-                "requests = :r, metered_at = :t, expires_at = :e"
+                "ADD cost_micro :dc, input_tokens :di, output_tokens :do, requests :dr "
+                "SET metered_applied_cost_micro = :c, metered_applied_input_tokens = :i, "
+                "metered_applied_output_tokens = :o, metered_applied_requests = :r, "
+                "metered_at = :t, expires_at = :e"
             ),
             ExpressionAttributeValues={
+                ":dc": d_cost, ":di": d_in, ":do": d_out, ":dr": d_req,
                 ":c": cost, ":i": in_tok, ":o": out_tok, ":r": reqs,
                 ":t": now.isoformat(), ":e": _window_ttl_epoch(now),
             },
         )
+        _emit_emf(user_id, d_cost, d_in, d_out, d_req)
         metered += 1
     return {
         "metered_users": metered,
@@ -189,14 +276,21 @@ def handler(event, context, dynamodb=None, sns=None, logs=None):  # noqa: ARG001
         limit_out = int(user.get("daily_output_tokens", 0))
 
         usage = usage_table.get_item(Key={"user_id": user_id, "window": window}).get("Item") or {}
+        # ONE counter set, fed by both writers (proxy settle ADD + this
+        # reconciler's delta ADD in _ingest_usage), so no summing needed here
+        # or in get_window_usage — the enforced value is already the total.
         cost = int(usage.get("cost_micro", 0))
         tokens_in = int(usage.get("input_tokens", 0))
         tokens_out = int(usage.get("output_tokens", 0))
 
+        # A limit of 0 means "not enforced" for that dimension (block a user
+        # via status, not a 0 budget). Use >= so the boundary matches the
+        # broker's vend-time _is_over_budget check exactly; a strict > here
+        # made an exactly-at-limit user flap blocked/active every cycle.
         over = (
-            (limit_cost and cost > limit_cost)
-            or (limit_in and tokens_in > limit_in)
-            or (limit_out and tokens_out > limit_out)
+            (limit_cost and cost >= limit_cost)
+            or (limit_in and tokens_in >= limit_in)
+            or (limit_out and tokens_out >= limit_out)
         )
 
         snapshot = {
@@ -213,10 +307,16 @@ def handler(event, context, dynamodb=None, sns=None, logs=None):  # noqa: ARG001
             _set_status(users_table, user_id, "active", "auto: window reset, usage back under budget")
             _notify(sns, topic_arn, f"[quota-gateway] UNBLOCKED {user_id}", snapshot)
             unblocked.append(user_id)
-        elif status == "active" and limit_cost and cost >= warn_threshold * limit_cost:
+        elif (
+            status == "active"
+            and limit_cost
+            and cost >= warn_threshold * limit_cost
+            and str(user.get("warning_sent_window", "")) != window
+        ):
             warned.append(user_id)
             _notify(sns, topic_arn, f"[quota-gateway] WARNING {user_id} at "
                     f"{100 * cost / limit_cost:.0f}% of daily budget", snapshot)
+            _mark_warning_sent(users_table, user_id, window)
 
     result = {"window": window, "blocked": blocked, "unblocked": unblocked,
               "warned": warned, "metering": ingest}
