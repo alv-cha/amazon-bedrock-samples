@@ -16,10 +16,15 @@ from .config import settings
 
 # Headers we forward from client -> mantle. Authorization is always
 # replaced with the gateway's own upstream token.
+#
+# NOTE: "openai-project" is deliberately NOT forwarded. Mantle attributes
+# usage/cost per Bedrock Project via the OpenAI-Project header, so forwarding
+# a client-supplied value would let a caller self-attribute its spend to any
+# project (another team's cost center). The gateway injects the managed
+# project id for the authenticated user instead (see _headers(project_id=...)).
 _FORWARD_REQUEST_HEADERS = {
     "content-type",
     "accept",
-    "openai-project",
     "openai-beta",
     "anthropic-version",
     "anthropic-beta",
@@ -49,7 +54,8 @@ class MantleClient:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    def _headers(self, incoming: dict[str, str], path: str = "") -> dict[str, str]:
+    def _headers(self, incoming: dict[str, str], path: str = "",
+                 project_id: str | None = None) -> dict[str, str]:
         headers = {
             k: v for k, v in incoming.items()
             if k.lower() in _FORWARD_REQUEST_HEADERS
@@ -63,29 +69,42 @@ class MantleClient:
         else:
             headers["Authorization"] = f"Bearer {token}"
         headers.setdefault("Content-Type", "application/json")
+        # Managed per-user Bedrock Project for cost attribution. Overrides any
+        # client-sent value (which is not forwarded); empty means "no header"
+        # so mantle uses the account's default project.
+        if project_id:
+            headers["OpenAI-Project"] = project_id
         return headers
 
-    async def post_json(self, path: str, body: bytes, incoming_headers: dict[str, str]) -> httpx.Response:
+    async def post_json(self, path: str, body: bytes, incoming_headers: dict[str, str],
+                        project_id: str | None = None) -> httpx.Response:
         """Non-streaming request: returns the full upstream response."""
-        return await self._client.post(path, content=body, headers=self._headers(incoming_headers, path))
+        return await self._client.post(
+            path, content=body,
+            headers=self._headers(incoming_headers, path, project_id),
+        )
 
-    async def get(self, path: str, incoming_headers: dict[str, str]) -> httpx.Response:
-        headers = self._headers(incoming_headers, path)
+    async def get(self, path: str, incoming_headers: dict[str, str],
+                  project_id: str | None = None) -> httpx.Response:
+        headers = self._headers(incoming_headers, path, project_id)
         headers.pop("Content-Type", None)
         return await self._client.get(path, headers=headers)
 
-    async def delete(self, path: str, incoming_headers: dict[str, str]) -> httpx.Response:
-        headers = self._headers(incoming_headers, path)
+    async def delete(self, path: str, incoming_headers: dict[str, str],
+                     project_id: str | None = None) -> httpx.Response:
+        headers = self._headers(incoming_headers, path, project_id)
         headers.pop("Content-Type", None)
         return await self._client.delete(path, headers=headers)
 
-    async def post_stream(self, path: str, body: bytes, incoming_headers: dict[str, str]):
+    async def post_stream(self, path: str, body: bytes, incoming_headers: dict[str, str],
+                          project_id: str | None = None):
         """Streaming request: returns an opened httpx response (SSE).
 
         Caller is responsible for closing it (or iterating to the end).
         """
         request = self._client.build_request(
-            "POST", path, content=body, headers=self._headers(incoming_headers, path)
+            "POST", path, content=body,
+            headers=self._headers(incoming_headers, path, project_id),
         )
         return await self._client.send(request, stream=True)
 

@@ -33,6 +33,12 @@ class Settings:
     # Full base URL wins if set; otherwise it is derived from the region.
     mantle_base_url: str = field(default_factory=lambda: _env("MANTLE_BASE_URL", ""))
 
+    # Bedrock Project (Mantle cost-attribution boundary) applied to Mode B
+    # inference when a user has no per-user mantle_project_id. "default" is the
+    # account's built-in project; set your own via DEFAULT_MANTLE_PROJECT_ID.
+    default_mantle_project_id: str = field(
+        default_factory=lambda: _env("DEFAULT_MANTLE_PROJECT_ID", "default"))
+
     # --- storage ---
     users_table: str = field(default_factory=lambda: _env("USERS_TABLE", "bedrock-quota-users"))
     usage_table: str = field(default_factory=lambda: _env("USAGE_TABLE", "bedrock-quota-usage"))

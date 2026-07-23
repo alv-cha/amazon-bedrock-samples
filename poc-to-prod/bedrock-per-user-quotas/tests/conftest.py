@@ -122,19 +122,22 @@ class FakeTable:
         return parts
 
     def _apply_update(self, expr: str, item: dict, values: dict, names: dict) -> None:
-        # Split into ADD ... / SET ... sections (keywords are uppercase in the app).
+        # Split into ADD / SET / REMOVE sections (keywords uppercase in the app).
         import re
         sections: dict[str, str] = {}
-        for match in re.finditer(r"\b(ADD|SET)\b", expr):
+        for match in re.finditer(r"\b(ADD|SET|REMOVE)\b", expr):
             keyword = match.group(1)
             start = match.end()
-            next_match = re.search(r"\b(?:ADD|SET)\b", expr[start:])
+            next_match = re.search(r"\b(?:ADD|SET|REMOVE)\b", expr[start:])
             end = start + next_match.start() if next_match else len(expr)
             sections[keyword] = expr[start:end].strip()
         if "ADD" in sections:
             for part in self._split_top_level(sections["ADD"]):
                 attr, placeholder = part.split()
                 item[attr] = int(item.get(attr, 0)) + int(values[placeholder])
+        if "REMOVE" in sections:
+            for part in self._split_top_level(sections["REMOVE"]):
+                item.pop(names.get(part.strip(), part.strip()), None)
         if "SET" in sections:
             for part in self._split_top_level(sections["SET"]):
                 target, _, rhs = part.partition("=")

@@ -65,6 +65,9 @@ class UserRecord:
     daily_usd_micro: int
     daily_input_tokens: int
     daily_output_tokens: int
+    # Optional per-user Bedrock Project for Mantle (Mode B) cost attribution;
+    # empty means fall back to settings.default_mantle_project_id.
+    mantle_project_id: str = ""
 
     @property
     def active(self) -> bool:
@@ -145,8 +148,9 @@ class QuotaStore:
         return self.get_user(user_id)
 
     def put_user(self, user_id: str, name: str,
-                 daily_usd: float, daily_input_tokens: int, daily_output_tokens: int) -> None:
-        self._users.put_item(Item={
+                 daily_usd: float, daily_input_tokens: int, daily_output_tokens: int,
+                 mantle_project_id: str = "") -> None:
+        item = {
             "user_id": user_id,
             "name": name,
             "status": "active",
@@ -154,7 +158,10 @@ class QuotaStore:
             "daily_input_tokens": daily_input_tokens,
             "daily_output_tokens": daily_output_tokens,
             "created_at": datetime.now(timezone.utc).isoformat(),
-        })
+        }
+        if mantle_project_id:
+            item["mantle_project_id"] = mantle_project_id
+        self._users.put_item(Item=item)
         self._user_cache.pop(user_id, None)
 
     def record_session(self, session_name: str, user_id: str) -> None:
@@ -194,6 +201,23 @@ class QuotaStore:
         )
         self._user_cache.clear()
 
+    def set_user_mantle_project(self, user_id: str, project_id: str) -> None:
+        """Set (or clear, with "") the user's managed Bedrock Project for
+        Mantle cost attribution. Empty string removes the per-user mapping so
+        the gateway falls back to settings.default_mantle_project_id."""
+        if project_id:
+            self._users.update_item(
+                Key={"user_id": user_id},
+                UpdateExpression="SET mantle_project_id = :p",
+                ExpressionAttributeValues={":p": project_id},
+            )
+        else:
+            self._users.update_item(
+                Key={"user_id": user_id},
+                UpdateExpression="REMOVE mantle_project_id",
+            )
+        self._user_cache.clear()
+
     def set_user_limits(self, user_id: str, daily_usd: float | None = None,
                         daily_input_tokens: int | None = None,
                         daily_output_tokens: int | None = None) -> None:
@@ -225,6 +249,7 @@ class QuotaStore:
             daily_usd_micro=int(item.get("daily_usd_micro", 0)),
             daily_input_tokens=int(item.get("daily_input_tokens", 0)),
             daily_output_tokens=int(item.get("daily_output_tokens", 0)),
+            mantle_project_id=str(item.get("mantle_project_id", "")),
         )
 
     # ------------------------------------------------------------------

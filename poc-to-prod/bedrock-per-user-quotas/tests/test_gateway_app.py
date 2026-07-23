@@ -401,6 +401,42 @@ def test_stored_response_get_and_delete_are_forwarded(client, alice, upstream):
 
 
 # ---------------------------------------------------------------------------
+# Mantle managed Projects (cost attribution)
+# ---------------------------------------------------------------------------
+
+def test_default_mantle_project_injected_and_client_value_stripped(client, alice, upstream):
+    """The gateway injects the deployment default project and never forwards a
+    client-supplied OpenAI-Project (which would let a caller self-attribute)."""
+    r = client.post(
+        "/v1/responses",
+        json={"model": MODEL, "input": "hello", "max_output_tokens": 10},
+        headers={
+            "Authorization": f"Bearer {alice}",
+            "OpenAI-Project": "proj_someone_elses_cost_center",
+        },
+    )
+    assert r.status_code == 200
+    sent = upstream.requests[0]
+    # Default is "default" (settings.default_mantle_project_id); the client's
+    # value must not survive.
+    assert sent.headers["openai-project"] == "default"
+    assert "someone_elses" not in sent.headers["openai-project"]
+
+
+def test_per_user_mantle_project_is_used(client, fake_dynamodb, upstream):
+    """A user's configured mantle_project_id overrides the default."""
+    QuotaStore(dynamodb=fake_dynamodb).put_user(
+        "dave", "Dave", daily_usd=1.0,
+        daily_input_tokens=100_000, daily_output_tokens=20_000,
+        mantle_project_id="proj_dave_team",
+    )
+    r = _post(client, make_jwt("dave"),
+              {"model": MODEL, "input": "hello", "max_output_tokens": 10})
+    assert r.status_code == 200
+    assert upstream.requests[0].headers["openai-project"] == "proj_dave_team"
+
+
+# ---------------------------------------------------------------------------
 # Admin API
 # ---------------------------------------------------------------------------
 
@@ -439,6 +475,7 @@ def test_admin_preprovision_with_custom_limits(client, upstream, fake_dynamodb):
             "daily_input_tokens": 250_000,
             "daily_output_tokens": 50_000,
         },
+        "mantle_project_id": "",
     }
 
     user = QuotaStore(dynamodb=fake_dynamodb).get_user("carol")
@@ -453,6 +490,32 @@ def test_admin_preprovision_with_custom_limits(client, upstream, fake_dynamodb):
     r3 = client.get("/admin/users/carol/usage",
                     headers={"Authorization": "Bearer admin-secret"})
     assert r3.json()["requests"] == 1
+
+
+def test_admin_create_with_mantle_project_round_trips(client, fake_dynamodb):
+    r = client.post(
+        "/admin/users",
+        json={"user_id": "erin", "mantle_project_id": "proj_erin"},
+        headers={"Authorization": "Bearer admin-secret"},
+    )
+    assert r.status_code == 200
+    assert r.json()["mantle_project_id"] == "proj_erin"
+    assert QuotaStore(dynamodb=fake_dynamodb).get_user("erin").mantle_project_id == "proj_erin"
+
+    listing = client.get("/admin/users",
+                         headers={"Authorization": "Bearer admin-secret"}).json()
+    erin = next(u for u in listing["users"] if u["user_id"] == "erin")
+    assert erin["mantle_project_id"] == "proj_erin"
+
+
+def test_admin_create_rejects_non_string_mantle_project(client):
+    r = client.post(
+        "/admin/users",
+        json={"user_id": "bad", "mantle_project_id": 123},
+        headers={"Authorization": "Bearer admin-secret"},
+    )
+    assert r.status_code == 400
+    assert "mantle_project_id" in r.json()["error"]["message"]
 
 
 def test_admin_create_requires_user_id(client):

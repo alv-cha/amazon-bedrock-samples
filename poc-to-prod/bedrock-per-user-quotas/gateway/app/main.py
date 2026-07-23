@@ -156,6 +156,13 @@ def _model_allowed(model_id: str) -> bool:
     return not allowed or model_id in allowed
 
 
+def _mantle_project_for(user: UserRecord) -> str:
+    """Managed Bedrock Project for this user's Mode B traffic: the per-user
+    mantle_project_id if set, else the deployment default. Client-supplied
+    OpenAI-Project headers are never used (they aren't forwarded upstream)."""
+    return user.mantle_project_id or settings.default_mantle_project_id
+
+
 def _model_not_allowed(model_id: str) -> JSONResponse:
     return _error(
         403,
@@ -276,16 +283,17 @@ async def _proxy_inference(request: Request, path: str) -> Response:
 
     started = time.monotonic()
     incoming = dict(request.headers)
+    project_id = _mantle_project_for(user)
 
     if streaming:
-        return await _stream_upstream(user, reservation, model_id, path, raw, incoming, started, decision)
-    return await _forward_upstream(user, reservation, model_id, path, raw, incoming, started, decision)
+        return await _stream_upstream(user, reservation, model_id, path, raw, incoming, started, decision, project_id)
+    return await _forward_upstream(user, reservation, model_id, path, raw, incoming, started, decision, project_id)
 
 
 async def _forward_upstream(user, reservation: Reservation, model_id, path, raw,
-                            incoming, started, decision) -> Response:
+                            incoming, started, decision, project_id=None) -> Response:
     try:
-        upstream = await mantle().post_json(path, raw, incoming)
+        upstream = await mantle().post_json(path, raw, incoming, project_id)
     except Exception:
         store().settle(reservation, None, None, failed=True)
         emf.record_error(user.user_id, model_id, 502)
@@ -329,9 +337,9 @@ async def _forward_upstream(user, reservation: Reservation, model_id, path, raw,
 
 
 async def _stream_upstream(user, reservation: Reservation, model_id, path, raw,
-                           incoming, started, decision) -> Response:
+                           incoming, started, decision, project_id=None) -> Response:
     try:
-        upstream = await mantle().post_stream(path, raw, incoming)
+        upstream = await mantle().post_stream(path, raw, incoming, project_id)
     except Exception:
         store().settle(reservation, None, None, failed=True)
         emf.record_error(user.user_id, model_id, 502)
@@ -521,6 +529,22 @@ def _limits_json(user: UserRecord) -> dict:
     }
 
 
+def _parse_mantle_project(body: dict) -> tuple[str, str]:
+    """Extract an optional mantle_project_id from an admin body.
+
+    Returns (project_id, "") on success (project_id is "" when unset) or
+    ("", error_message) when the field is present but invalid.
+    """
+    if "mantle_project_id" not in body:
+        return "", ""
+    raw = body["mantle_project_id"]
+    if raw is None:
+        return "", ""
+    if not isinstance(raw, str):
+        return "", "mantle_project_id must be a string."
+    return raw.strip(), ""
+
+
 def _parse_limits(body: dict, *, with_defaults: bool) -> tuple[dict, str]:
     defaults = {
         "daily_usd": settings.default_daily_usd,
@@ -576,9 +600,13 @@ async def create_user(request: Request) -> Response:
     limits, limit_error = _parse_limits(body, with_defaults=True)
     if limit_error:
         return _error(400, limit_error, "invalid_request_error")
+    project_id, project_error = _parse_mantle_project(body)
+    if project_error:
+        return _error(400, project_error, "invalid_request_error")
     store().put_user(
         user_id=user_id,
         name=name.strip(),
+        mantle_project_id=project_id,
         **limits,
     )
     user = store().get_user(user_id)
@@ -587,6 +615,7 @@ async def create_user(request: Request) -> Response:
         "user_id": user_id,
         "provisioned": True,
         "limits": _limits_json(user),
+        "mantle_project_id": user.mantle_project_id,
     })
 
 
@@ -600,6 +629,7 @@ async def list_users(request: Request) -> Response:
         out.append({
             "user_id": user.user_id, "name": user.name, "status": user.status,
             "limits": _limits_json(user),
+            "mantle_project_id": user.mantle_project_id,
             "today": usage,
         })
     return JSONResponse({"users": out})

@@ -173,3 +173,22 @@ def test_windows_are_isolated(store, user):
     assert other["requests"] == 0
     today = store.get_window_usage("alice", window=current_window())
     assert today["requests"] == 1
+
+
+def test_mantle_project_id_defaults_empty_and_persists(store):
+    store.put_user(user_id="u1", name="U1", daily_usd=1.0,
+                   daily_input_tokens=10, daily_output_tokens=10)
+    assert store.get_user("u1").mantle_project_id == ""
+
+    store.put_user(user_id="u2", name="U2", daily_usd=1.0,
+                   daily_input_tokens=10, daily_output_tokens=10,
+                   mantle_project_id="proj_team")
+    assert store.get_user("u2").mantle_project_id == "proj_team"
+
+
+def test_set_user_mantle_project_sets_and_clears(store, user):
+    store.set_user_mantle_project("alice", "proj_alpha")
+    assert store.get_user("alice").mantle_project_id == "proj_alpha"
+    # Empty string clears the mapping (falls back to the deployment default).
+    store.set_user_mantle_project("alice", "")
+    assert store.get_user("alice").mantle_project_id == ""
