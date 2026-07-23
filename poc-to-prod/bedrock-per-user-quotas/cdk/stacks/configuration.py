@@ -30,6 +30,7 @@ _DEPLOYMENT_KEYS = {
     "mode_a_allowed_model_arns",
     "mode_b_allowed_model_ids",
     "model_config",
+    "reconciler_interval_minutes",
     "retain_tables_on_delete",
     "snapstart",
     "usage_retention_days",
@@ -54,6 +55,7 @@ _DEFAULTS = {
     # Empty preserves the pre-configuration behavior: all Mode B model IDs.
     "mode_b_allowed_model_ids": [],
     "model_config": "config/model-pricing.json",
+    "reconciler_interval_minutes": 5,
     "retain_tables_on_delete": False,
     "snapstart": False,
     "usage_retention_days": 35,
@@ -87,6 +89,7 @@ class DeploymentConfig:
     mode_a_allowed_model_arns: tuple[str, ...]
     mode_b_allowed_model_ids: tuple[str, ...]
     model_pricing: ModelPricingConfig
+    reconciler_interval_minutes: int
     retain_tables_on_delete: bool
     snapstart: bool
     usage_retention_days: int
@@ -229,6 +232,10 @@ class DeploymentConfig:
             mode_a_allowed_model_arns=tuple(mode_a_arns),
             mode_b_allowed_model_ids=tuple(mode_b_ids),
             model_pricing=model_pricing,
+            reconciler_interval_minutes=_positive_int(
+                "reconciler_interval_minutes",
+                value("reconciler_interval_minutes"),
+            ),
             retain_tables_on_delete=_boolean(
                 "retain_tables_on_delete", value("retain_tables_on_delete")
             ),

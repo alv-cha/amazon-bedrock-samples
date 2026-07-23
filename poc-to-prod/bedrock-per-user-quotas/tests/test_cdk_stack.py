@@ -230,6 +230,23 @@ def test_gateway_can_delete_stored_mantle_responses():
     )
 
 
+def test_reconciler_interval_defaults_to_five_minutes():
+    template = _template({"manage_invocation_logging": "true"})
+    template.has_resource_properties(
+        "AWS::Events::Rule", {"ScheduleExpression": "rate(5 minutes)"}
+    )
+
+
+def test_reconciler_interval_is_configurable():
+    template = _template({
+        "manage_invocation_logging": "true",
+        "reconciler_interval_minutes": 1,
+    })
+    template.has_resource_properties(
+        "AWS::Events::Rule", {"ScheduleExpression": "rate(1 minute)"}
+    )
+
+
 def test_custom_quota_configuration_and_table_retention():
     template = _template({
         "manage_invocation_logging": True,
@@ -268,6 +285,9 @@ def test_custom_quota_configuration_and_table_retention():
         ("default_daily_input_tokens", -1, "positive integer"),
         ("default_daily_output_tokens", 1.5, "positive integer"),
         ("usage_retention_days", 0, "positive integer"),
+        ("reconciler_interval_minutes", 0, "positive integer"),
+        ("reconciler_interval_minutes", 1.5, "positive integer"),
+        ("reconciler_interval_minutes", "x", "positive integer"),
         ("warn_threshold", 0, "positive number"),
         ("warn_threshold", 1, "less than 1"),
         ("warn_threshold", 1.1, "less than 1"),

@@ -8,7 +8,7 @@ Resources:
   (optionally ``-c jwt_audience=...``), or let the stack create a demo
   Cognito User Pool
 - Admin key in Secrets Manager
-- Reconciler Lambda on a 5-minute EventBridge schedule + SNS alert topic
+- Reconciler Lambda on a configurable EventBridge schedule (default 5 min) + SNS alert topic
 - CloudWatch dashboard over the gateway's EMF metrics
 """
 
@@ -563,9 +563,20 @@ class QuotaGatewayStack(Stack):
             )
         )
 
+        # Reconciler cadence (deploy-time, -c reconciler_interval_minutes,
+        # default 5). A shorter interval tightens Mode A's bounded-overspend
+        # window but costs more: the Logs Insights query re-scans from
+        # UTC-day-start to now on every run (see reconciler/metering_ingest.py
+        # _window_epoch_bounds), so 1 min is roughly 5x the scan volume of
+        # 5 min. It is safe to re-run frequently — the reconciler is
+        # idempotent (metered_applied_* bookkeeping) and capped at one
+        # concurrent execution — so this is purely a cost/latency tradeoff:
+        # 1 = demo responsiveness, 5 = default, 15 = heavy log volume.
         events.Rule(
             self, "ReconcilerSchedule",
-            schedule=events.Schedule.rate(Duration.minutes(5)),
+            schedule=events.Schedule.rate(
+                Duration.minutes(config.reconciler_interval_minutes)
+            ),
             targets=[targets.LambdaFunction(reconciler_fn)],
         )
 

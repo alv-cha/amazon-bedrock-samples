@@ -1,7 +1,8 @@
 """Safety-net reconciler for the per-user quota gateway.
 
-Runs on an EventBridge schedule (default: every 5 minutes) and closes the
-gaps that real-time enforcement cannot cover on its own:
+Runs on a configurable EventBridge schedule (deploy-time, default: every
+5 minutes) and closes the gaps that real-time enforcement cannot cover on
+its own:
 
 1. **Drift blocking** — if a user's *settled* usage for the current UTC day
    exceeds their limits (e.g. streams that under-reported usage, price
