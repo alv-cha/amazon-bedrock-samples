@@ -65,6 +65,7 @@ def signed_request(method: str, url: str, *, region: str | None = None,
                    admin_key: str | None = None,
                    aws_session: boto3.Session | None = None,
                    http_client: httpx.Client | None = None,
+                   timeout=None,
                    **kwargs) -> httpx.Response:
     """Send one SigV4-signed gateway request with optional app credentials."""
     headers = dict(kwargs.pop("headers", {}) or {})
@@ -73,20 +74,28 @@ def signed_request(method: str, url: str, *, region: str | None = None,
     if admin_key:
         headers["X-Quota-Admin-Key"] = admin_key
 
-    request = httpx.Request(method, url, headers=headers, **kwargs)
-    request.headers.pop("Authorization", None)
-    request.headers.update(_sign(
-        request.method,
-        str(request.url),
-        dict(request.headers),
-        request.content,
-        region or os.environ.get("AWS_REGION", "us-east-1"),
-        _credentials(aws_session),
-    ))
-    if http_client is not None:
-        return http_client.send(request)
-    with httpx.Client() as client:
+    def send(client: httpx.Client) -> httpx.Response:
+        request_kwargs = dict(kwargs)
+        if timeout is not None:
+            request_kwargs["timeout"] = timeout
+        request = client.build_request(
+            method, url, headers=headers, **request_kwargs
+        )
+        request.headers.pop("Authorization", None)
+        request.headers.update(_sign(
+            request.method,
+            str(request.url),
+            dict(request.headers),
+            request.content,
+            region or os.environ.get("AWS_REGION", "us-east-1"),
+            _credentials(aws_session),
+        ))
         return client.send(request)
+
+    if http_client is not None:
+        return send(http_client)
+    with httpx.Client() as client:
+        return send(client)
 
 
 def _admin_request_args(args) -> tuple[str, str, dict]:

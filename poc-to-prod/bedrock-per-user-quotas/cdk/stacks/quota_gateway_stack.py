@@ -251,6 +251,21 @@ class QuotaGatewayStack(Stack):
         gateway_fn.role.add_managed_policy(
             iam.ManagedPolicy.from_aws_managed_policy_name("AmazonBedrockMantleInferenceAccess")
         )
+        # The AWS-managed inference policy includes Get*, List*, and
+        # CreateInference, but not DeleteInference. Grant only the missing
+        # action needed by the stored-response cleanup route.
+        gateway_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["bedrock-mantle:DeleteInference"],
+                resources=[
+                    self.format_arn(
+                        service="bedrock-mantle",
+                        resource="project",
+                        resource_name="*",
+                    )
+                ],
+            )
+        )
 
         # ------------------------------------------------------------------
         # Per-user vended role (the API-agnostic enforcement path)

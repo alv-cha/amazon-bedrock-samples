@@ -199,6 +199,37 @@ def test_default_quota_configuration_is_injected_into_lambdas():
         assert table["UpdateReplacePolicy"] == "Delete"
 
 
+def test_gateway_can_delete_stored_mantle_responses():
+    template = _template({"manage_invocation_logging": "true"})
+
+    template.has_resource_properties(
+        "AWS::IAM::Policy",
+        {
+            "PolicyDocument": {
+                "Statement": Match.array_with([
+                    Match.object_like({
+                        "Action": "bedrock-mantle:DeleteInference",
+                        "Effect": "Allow",
+                        "Resource": {
+                            "Fn::Join": [
+                                "",
+                                [
+                                    "arn:",
+                                    {"Ref": "AWS::Partition"},
+                                    (
+                                        ":bedrock-mantle:us-east-1:"
+                                        "111122223333:project/*"
+                                    ),
+                                ],
+                            ]
+                        },
+                    })
+                ])
+            }
+        },
+    )
+
+
 def test_custom_quota_configuration_and_table_retention():
     template = _template({
         "manage_invocation_logging": True,

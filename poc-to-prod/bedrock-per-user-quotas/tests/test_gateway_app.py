@@ -371,6 +371,35 @@ def test_v1_messages_alias_maps_to_anthropic_path(client, alice, upstream):
     assert upstream.requests[0].url.path == "/anthropic/v1/messages"
 
 
+def test_stored_response_get_and_delete_are_forwarded(client, alice, upstream):
+    def lifecycle_response(request):
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        return httpx.Response(
+            200,
+            json={"id": "resp_stored", "object": "response"},
+        )
+
+    upstream.response_factory = lifecycle_response
+    headers = {"Authorization": f"Bearer {alice}"}
+
+    retrieved = client.get("/v1/responses/resp_stored", headers=headers)
+    deleted = client.delete("/v1/responses/resp_stored", headers=headers)
+
+    assert retrieved.status_code == 200
+    assert retrieved.json()["id"] == "resp_stored"
+    assert deleted.status_code == 204
+    assert [
+        (request.method, request.url.path)
+        for request in upstream.requests
+    ] == [
+        ("GET", "/v1/responses/resp_stored"),
+        ("DELETE", "/v1/responses/resp_stored"),
+    ]
+    for request in upstream.requests:
+        assert request.headers["authorization"] == "Bearer test-upstream-key"
+
+
 # ---------------------------------------------------------------------------
 # Admin API
 # ---------------------------------------------------------------------------

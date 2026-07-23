@@ -34,27 +34,34 @@ def test_signed_admin_request_keeps_admin_key_outside_authorization():
         def get_credentials(self):
             return Credentials("AKID", "SECRET", "SESSION")
 
-    class HttpClient:
-        request = None
+    captured = {}
 
-        def send(self, request):
-            self.request = request
-            return httpx.Response(200, request=request)
+    def handler(request):
+        captured["request"] = request
+        return httpx.Response(200, request=request)
 
-    client = HttpClient()
-    response = signed_request(
-        "POST",
-        "https://example.lambda-url.us-east-1.on.aws/admin/users",
-        region="us-east-1",
-        admin_key="admin-secret",
-        aws_session=AwsSession(),
-        http_client=client,
-        json={"user_id": "alice"},
-    )
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        response = signed_request(
+            "POST",
+            "https://example.lambda-url.us-east-1.on.aws/admin/users",
+            region="us-east-1",
+            admin_key="admin-secret",
+            aws_session=AwsSession(),
+            http_client=client,
+            timeout=17,
+            json={"user_id": "alice"},
+        )
 
     assert response.status_code == 200
-    assert client.request.headers["X-Quota-Admin-Key"] == "admin-secret"
-    assert client.request.headers["Authorization"].startswith("AWS4-HMAC-SHA256 ")
+    request = captured["request"]
+    assert request.headers["X-Quota-Admin-Key"] == "admin-secret"
+    assert request.headers["Authorization"].startswith("AWS4-HMAC-SHA256 ")
+    assert request.extensions["timeout"] == {
+        "connect": 17,
+        "read": 17,
+        "write": 17,
+        "pool": 17,
+    }
 
 
 def test_admin_cli_create_and_update_include_all_quota_dimensions():
