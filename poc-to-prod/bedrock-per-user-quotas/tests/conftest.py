@@ -46,7 +46,23 @@ class FakeTable:
         return {"Item": dict(item)} if item else {}
 
     def scan(self, **kwargs):
-        return {"Items": [dict(v) for v in self.items.values()]}
+        # Stable ordering by primary key so Limit + ExclusiveStartKey paging is
+        # deterministic (real DynamoDB order is unspecified, but tests need a
+        # fixed one). Only the subset of the scan API the app uses.
+        ordered = [dict(v) for _, v in sorted(self.items.items())]
+        start = 0
+        exclusive = kwargs.get("ExclusiveStartKey")
+        if exclusive:
+            start_key = self._key(exclusive)
+            keys = [self._key(v) for v in ordered]
+            start = keys.index(start_key) + 1 if start_key in keys else 0
+        limit = kwargs.get("Limit")
+        page = ordered[start:start + limit] if limit else ordered[start:]
+        result = {"Items": page}
+        if limit and (start + limit) < len(ordered):
+            last = page[-1]
+            result["LastEvaluatedKey"] = {a: last[a] for a in self.key_attrs}
+        return result
 
     def query(self, IndexName=None, KeyConditionExpression=None,
               ExpressionAttributeValues=None, Limit=None, **kwargs):

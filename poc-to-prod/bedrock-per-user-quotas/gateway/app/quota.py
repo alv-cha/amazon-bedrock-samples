@@ -17,6 +17,7 @@ Tables (created by the CDK stack):
           input_tokens, output_tokens, requests, throttles, expires_at (TTL)
 """
 
+import json
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -408,14 +409,38 @@ class QuotaStore:
             "errors": int(item.get("errors", 0)),
         }
 
+    @staticmethod
+    def _is_sentinel(item: dict) -> bool:
+        # SESSION# rows are the RoleSessionName -> user_id reverse map; they
+        # are not real users and must never surface in admin listings.
+        return str(item.get("user_id", "")).startswith("SESSION#")
+
     def list_users(self) -> list[UserRecord]:
-        # Skip SESSION# sentinel items (RoleSessionName -> user_id map).
-        def _rows(items):
-            return [self._to_user(i) for i in items
-                    if not str(i.get("user_id", "")).startswith("SESSION#")]
         users, resp = [], self._users.scan()
-        users.extend(_rows(resp.get("Items", [])))
+        rows = [self._to_user(i) for i in resp.get("Items", []) if not self._is_sentinel(i)]
+        users.extend(rows)
         while "LastEvaluatedKey" in resp:
             resp = self._users.scan(ExclusiveStartKey=resp["LastEvaluatedKey"])
-            users.extend(_rows(resp.get("Items", [])))
+            users.extend(self._to_user(i) for i in resp.get("Items", []) if not self._is_sentinel(i))
         return users
+
+    def list_users_page(self, limit: int = 50,
+                        cursor: str | None = None) -> tuple[list[UserRecord], str | None]:
+        """One page of users plus an opaque cursor for the next page (or None).
+
+        Backed by a DynamoDB scan; the cursor is the ExclusiveStartKey encoded
+        as JSON. SESSION# sentinels are filtered out, so a page may contain
+        fewer than `limit` real users even when more pages remain.
+        """
+        scan_kwargs: dict = {"Limit": max(1, limit)}
+        if cursor:
+            try:
+                scan_kwargs["ExclusiveStartKey"] = json.loads(cursor)
+            except (ValueError, TypeError) as exc:
+                raise ValueError("invalid cursor") from exc
+        resp = self._users.scan(**scan_kwargs)
+        users = [self._to_user(i) for i in resp.get("Items", [])
+                 if not self._is_sentinel(i)]
+        last = resp.get("LastEvaluatedKey")
+        next_cursor = json.dumps(last) if last else None
+        return users, next_cursor

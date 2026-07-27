@@ -239,6 +239,13 @@ class QuotaGatewayStack(Stack):
                 "JWT_AUDIENCE": jwt_audience,
                 "JWT_JWKS_URL": jwt_jwks_url,
                 "JWT_USER_CLAIM": jwt_user_claim,
+                # Admin-by-JWT (empty claim = shared key only)
+                "ADMIN_JWT_CLAIM": config.admin_jwt_claim,
+                "ADMIN_JWT_VALUE": config.admin_jwt_value,
+                # Mantle managed-project default + reconciler cadence (read-only
+                # surface for GET /admin/summary; the schedule is set on the rule)
+                "DEFAULT_MANTLE_PROJECT_ID": config.default_mantle_project_id,
+                "RECONCILER_INTERVAL_MINUTES": str(config.reconciler_interval_minutes),
             },
         )
 

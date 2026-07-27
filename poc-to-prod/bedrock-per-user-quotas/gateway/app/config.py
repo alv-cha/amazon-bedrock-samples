@@ -58,6 +58,15 @@ class Settings:
     auto_provision_users: bool = field(
         default_factory=lambda: _env("AUTO_PROVISION_USERS", "true").lower() == "true")
 
+    # --- admin-by-JWT (lets the browser UI authorize with a normal login) ---
+    # A verified JWT authorizes the /admin API when this claim contains the
+    # required value (string claim equal to it, or list claim containing it).
+    # e.g. ADMIN_JWT_CLAIM=cognito:groups, ADMIN_JWT_VALUE=quota-admins.
+    # Empty ADMIN_JWT_CLAIM disables JWT-based admin (shared key only), so the
+    # admin secret is never required in a browser.
+    admin_jwt_claim: str = field(default_factory=lambda: _env("ADMIN_JWT_CLAIM", ""))
+    admin_jwt_value: str = field(default_factory=lambda: _env("ADMIN_JWT_VALUE", ""))
+
     # --- credential broker (per-user short-lived AWS creds) ---
     # Role the broker assumes on behalf of an in-budget user; scoped to
     # Bedrock invoke actions only. Its trust policy must let the broker's
@@ -70,6 +79,11 @@ class Settings:
 
     # --- metrics ---
     metrics_namespace: str = field(default_factory=lambda: _env("METRICS_NAMESPACE", "BedrockQuotaGateway"))
+    # Reconciler cadence, surfaced read-only by GET /admin/summary so the UI can
+    # display it. It is set at deploy time on the EventBridge rule; this env var
+    # is informational only (changing it here does NOT change the schedule).
+    reconciler_interval_minutes: int = field(
+        default_factory=lambda: int(_env("RECONCILER_INTERVAL_MINUTES", "5")))
 
     # --- quota defaults applied to newly created users (admin API) ---
     default_daily_usd: float = field(default_factory=lambda: float(_env("DEFAULT_DAILY_USD", "1.0")))

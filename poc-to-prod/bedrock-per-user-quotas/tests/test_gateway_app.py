@@ -604,3 +604,115 @@ def test_admin_block_user(client, alice):
     assert r.status_code == 200
     r2 = _post(client, alice, {"model": MODEL, "input": "hello"})
     assert r2.status_code == 429
+
+
+# ---------------------------------------------------------------------------
+# C3: admin summary, mantle-project route, pagination, admin-by-JWT
+# ---------------------------------------------------------------------------
+
+ADMIN = {"Authorization": "Bearer admin-secret"}
+
+
+def test_admin_summary_separates_enforcement_and_observability(client, fake_dynamodb):
+    store = QuotaStore(dynamodb=fake_dynamodb)
+    store.put_user("s1", "S1", daily_usd=1.0, daily_input_tokens=10, daily_output_tokens=10)
+    store.put_user("s2", "S2", daily_usd=1.0, daily_input_tokens=10, daily_output_tokens=10)
+    store.set_user_status("s2", "blocked", "test")
+
+    r = client.get("/admin/summary", headers=ADMIN)
+    assert r.status_code == 200
+    body = r.json()
+    # Enforcement (DynamoDB) and observability (CloudWatch) are separate blocks.
+    assert body["enforcement"]["source"] == "dynamodb"
+    assert body["enforcement"]["total_users"] == 2
+    assert body["enforcement"]["blocked_users"] == 1
+    assert body["enforcement"]["blocked_user_ids"] == ["s2"]
+    assert "as_of" in body["enforcement"]
+    assert body["observability"]["source"] == "cloudwatch_emf"
+    assert "reconciler_interval_minutes" in body
+
+
+def test_admin_set_mantle_project_route(client, fake_dynamodb):
+    QuotaStore(dynamodb=fake_dynamodb).put_user(
+        "frank", "Frank", daily_usd=1.0, daily_input_tokens=10, daily_output_tokens=10)
+    r = client.put("/admin/users/frank/mantle-project",
+                   json={"mantle_project_id": "proj_frank"}, headers=ADMIN)
+    assert r.status_code == 200
+    assert r.json()["mantle_project_id"] == "proj_frank"
+    assert QuotaStore(dynamodb=fake_dynamodb).get_user("frank").mantle_project_id == "proj_frank"
+    # Clearing with "" falls back to the default.
+    r2 = client.put("/admin/users/frank/mantle-project",
+                    json={"mantle_project_id": ""}, headers=ADMIN)
+    assert r2.status_code == 200
+    assert QuotaStore(dynamodb=fake_dynamodb).get_user("frank").mantle_project_id == ""
+
+
+def test_admin_set_mantle_project_requires_existing_user(client):
+    r = client.put("/admin/users/ghost/mantle-project",
+                   json={"mantle_project_id": "p"}, headers=ADMIN)
+    assert r.status_code == 404
+
+
+def test_admin_users_pagination(client, fake_dynamodb):
+    store = QuotaStore(dynamodb=fake_dynamodb)
+    for i in range(5):
+        store.put_user(f"u{i}", f"U{i}", daily_usd=1.0,
+                       daily_input_tokens=10, daily_output_tokens=10)
+    seen, cursor, pages = set(), None, 0
+    while True:
+        url = "/admin/users?limit=2" + (f"&cursor={cursor}" if cursor else "")
+        r = client.get(url, headers=ADMIN)
+        assert r.status_code == 200
+        body = r.json()
+        for u in body["users"]:
+            seen.add(u["user_id"])
+        pages += 1
+        cursor = body["next_cursor"]
+        if not cursor:
+            break
+        assert pages < 10  # guard against a non-terminating cursor
+    assert seen == {f"u{i}" for i in range(5)}
+    assert pages >= 3  # 5 users at limit=2
+
+
+def test_admin_users_rejects_bad_limit(client):
+    assert client.get("/admin/users?limit=0", headers=ADMIN).status_code == 400
+    assert client.get("/admin/users?limit=5000", headers=ADMIN).status_code == 400
+
+
+def _with_admin_jwt(monkeypatch, claim="cognito:groups", value="quota-admins"):
+    """Enable admin-by-JWT by refreshing both settings singletons."""
+    import app.auth as auth_module
+    from app.config import Settings
+    monkeypatch.setenv("ADMIN_JWT_CLAIM", claim)
+    monkeypatch.setenv("ADMIN_JWT_VALUE", value)
+    fresh = Settings()
+    monkeypatch.setattr(auth_module, "settings", fresh)
+    monkeypatch.setattr(gateway, "settings", fresh)
+
+
+def test_admin_by_jwt_group_claim_accepted(client, fake_dynamodb, monkeypatch):
+    _with_admin_jwt(monkeypatch)
+    token = make_jwt("admin-alice", **{"cognito:groups": ["eng", "quota-admins"]})
+    r = client.get("/admin/summary", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 200
+
+
+def test_admin_by_jwt_without_group_rejected(client, monkeypatch):
+    _with_admin_jwt(monkeypatch)
+    token = make_jwt("regular-bob", **{"cognito:groups": ["eng"]})
+    r = client.get("/admin/summary", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 403
+
+
+def test_admin_shared_key_still_works_when_jwt_admin_enabled(client, monkeypatch):
+    _with_admin_jwt(monkeypatch)
+    r = client.get("/admin/summary", headers=ADMIN)
+    assert r.status_code == 200
+
+
+def test_admin_by_jwt_disabled_by_default(client):
+    # Without ADMIN_JWT_CLAIM configured, a group-carrying JWT is NOT admin.
+    token = make_jwt("admin-alice", **{"cognito:groups": ["quota-admins"]})
+    r = client.get("/admin/summary", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 403

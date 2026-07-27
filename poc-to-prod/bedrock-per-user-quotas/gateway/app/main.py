@@ -28,6 +28,7 @@ IdP — Cognito, Okta, Auth0, ...); the quota identity is a configurable claim
 import json
 import math
 import time
+from datetime import datetime, timezone
 
 import boto3
 from fastapi import FastAPI, Request, Response
@@ -489,16 +490,45 @@ async def healthz() -> dict:
 # Admin API
 # ---------------------------------------------------------------------------
 
+def _jwt_grants_admin(token: str) -> bool:
+    """True if a verified JWT carries the configured admin claim/value.
+
+    Lets the browser UI authorize with a normal corporate login (via the
+    X-Quota-User-Token / Authorization path) instead of ever holding the
+    shared admin secret. Disabled unless ADMIN_JWT_CLAIM is configured.
+    """
+    claim = settings.admin_jwt_claim
+    if not claim:
+        return False
+    try:
+        identity = verifier().verify(token)
+    except JwtError:
+        return False
+    value = identity.claims.get(claim)
+    required = settings.admin_jwt_value
+    if isinstance(value, str):
+        return value == required
+    if isinstance(value, (list, tuple)):
+        return required in value
+    return False
+
+
 def _require_admin(request: Request) -> JSONResponse | None:
+    # 1) Shared admin key (CLI / server-to-server), via X-Quota-Admin-Key or
+    #    Authorization: Bearer.
     provided = extract_bearer(request.headers.get("x-quota-admin-key"))
     if not provided:
         authorization = request.headers.get("authorization")
         if authorization and authorization.lower().startswith("bearer "):
             provided = extract_bearer(authorization)
     expected = admin_key()
-    if not expected or provided != expected:
-        return _error(403, "Admin authorization required.", "forbidden")
-    return None
+    if expected and provided and provided == expected:
+        return None
+    # 2) Admin-by-JWT (browser UI): a verified token with the admin claim.
+    token = extract_user_token(request.headers)
+    if token and _jwt_grants_admin(token):
+        return None
+    return _error(403, "Admin authorization required.", "forbidden")
 
 
 async def _admin_json_object(
@@ -620,11 +650,18 @@ async def create_user(request: Request) -> Response:
 
 
 @app.get("/admin/users")
-async def list_users(request: Request) -> Response:
+async def list_users(request: Request, limit: int = 50,
+                     cursor: str | None = None) -> Response:
     if (deny := _require_admin(request)) is not None:
         return deny
+    if limit < 1 or limit > 1000:
+        return _error(400, "limit must be between 1 and 1000.", "invalid_request_error")
+    try:
+        users, next_cursor = store().list_users_page(limit=limit, cursor=cursor)
+    except ValueError:
+        return _error(400, "Invalid cursor.", "invalid_request_error")
     out = []
-    for user in store().list_users():
+    for user in users:
         usage = store().get_window_usage(user.user_id)
         out.append({
             "user_id": user.user_id, "name": user.name, "status": user.status,
@@ -632,7 +669,51 @@ async def list_users(request: Request) -> Response:
             "mantle_project_id": user.mantle_project_id,
             "today": usage,
         })
-    return JSONResponse({"users": out})
+    return JSONResponse({"users": out, "next_cursor": next_cursor})
+
+
+@app.get("/admin/summary")
+async def admin_summary(request: Request) -> Response:
+    """Deployment-wide summary, with enforcement and observability reported
+    SEPARATELY so an operator never conflates the two:
+
+    - enforcement: the authoritative DynamoDB state the gateway acts on
+      (user counts, blocked users, today's aggregate usage). as_of = now.
+    - observability: where the richer per-user metrics live (CloudWatch/EMF).
+      The gateway does not read metrics back, so this block points there
+      rather than duplicating numbers with a different freshness.
+    """
+    if (deny := _require_admin(request)) is not None:
+        return deny
+    now = datetime.now(timezone.utc)
+    users = store().list_users()
+    blocked = [u.user_id for u in users if not u.active]
+    agg = {"cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0, "requests": 0}
+    for u in users:
+        usage = store().get_window_usage(u.user_id)
+        agg["cost_usd"] += usage.get("cost_usd", 0.0)
+        agg["input_tokens"] += usage.get("input_tokens", 0)
+        agg["output_tokens"] += usage.get("output_tokens", 0)
+        agg["requests"] += usage.get("requests", 0)
+    return JSONResponse({
+        "enforcement": {
+            "source": "dynamodb",
+            "as_of": now.isoformat(),
+            "window": now.strftime("%Y-%m-%d"),
+            "total_users": len(users),
+            "blocked_users": len(blocked),
+            "blocked_user_ids": blocked,
+            "today": agg,
+        },
+        "observability": {
+            "source": "cloudwatch_emf",
+            "metrics_namespace": settings.metrics_namespace,
+            "note": "Per-user metrics (Requests, InputTokens, OutputTokens, "
+                    "EstimatedCostUSD, LatencyMs, Throttles, Errors) are in "
+                    "CloudWatch under this namespace; query there for history.",
+        },
+        "reconciler_interval_minutes": settings.reconciler_interval_minutes,
+    })
 
 
 @app.get("/admin/users/{user_id}/usage")
@@ -670,6 +751,27 @@ async def set_limits(user_id: str, request: Request) -> Response:
         "updated": True,
         "limits": _limits_json(user),
     })
+
+
+@app.put("/admin/users/{user_id}/mantle-project")
+async def set_mantle_project(user_id: str, request: Request) -> Response:
+    """Set or clear a user's managed Bedrock Project for Mantle (Mode B) cost
+    attribution. Send {"mantle_project_id": "proj_x"} to set, "" to clear."""
+    if (deny := _require_admin(request)) is not None:
+        return deny
+    body, error = await _admin_json_object(request)
+    if error is not None:
+        return error
+    assert body is not None
+    if store().get_user(user_id) is None:
+        return _error(404, f"User '{user_id}' was not found.", "not_found")
+    if "mantle_project_id" not in body:
+        return _error(400, "mantle_project_id is required.", "invalid_request_error")
+    project_id, project_error = _parse_mantle_project(body)
+    if project_error:
+        return _error(400, project_error, "invalid_request_error")
+    store().set_user_mantle_project(user_id, project_id)
+    return JSONResponse({"user_id": user_id, "mantle_project_id": project_id})
 
 
 @app.put("/admin/users/{user_id}/status")

@@ -15,11 +15,14 @@ CDK_DIR = Path(__file__).resolve().parents[1]
 
 _DEPLOYMENT_KEYS = {
     "adapter_layer_arn",
+    "admin_jwt_claim",
+    "admin_jwt_value",
     "alert_email",
     "auto_provision_users",
     "default_daily_input_tokens",
     "default_daily_output_tokens",
     "default_daily_usd",
+    "default_mantle_project_id",
     "invocation_log_group_name",
     "invoker_principal_arns",
     "jwt_audience",
@@ -40,11 +43,14 @@ _DEPLOYMENT_KEYS = {
 
 _DEFAULTS = {
     "adapter_layer_arn": "",
+    "admin_jwt_claim": "",
+    "admin_jwt_value": "",
     "alert_email": "",
     "auto_provision_users": True,
     "default_daily_input_tokens": 1_000_000,
     "default_daily_output_tokens": 200_000,
     "default_daily_usd": 1.0,
+    "default_mantle_project_id": "default",
     "invocation_log_group_name": "",
     "invoker_principal_arns": [],
     "jwt_audience": "",
@@ -74,11 +80,14 @@ class ModelPricingConfig:
 @dataclass(frozen=True)
 class DeploymentConfig:
     adapter_layer_arn: str
+    admin_jwt_claim: str
+    admin_jwt_value: str
     alert_email: str
     auto_provision_users: bool
     default_daily_input_tokens: int
     default_daily_output_tokens: int
     default_daily_usd: float
+    default_mantle_project_id: str
     invocation_log_group_name: str
     invoker_principal_arns: tuple[str, ...]
     jwt_audience: str
@@ -207,6 +216,8 @@ class DeploymentConfig:
             adapter_layer_arn=_string(
                 "adapter_layer_arn", value("adapter_layer_arn")
             ),
+            admin_jwt_claim=_string("admin_jwt_claim", value("admin_jwt_claim")),
+            admin_jwt_value=_string("admin_jwt_value", value("admin_jwt_value")),
             alert_email=_string("alert_email", value("alert_email")),
             auto_provision_users=_boolean(
                 "auto_provision_users", value("auto_provision_users")
@@ -222,6 +233,9 @@ class DeploymentConfig:
             default_daily_usd=_positive_float(
                 "default_daily_usd", value("default_daily_usd")
             ),
+            default_mantle_project_id=_string(
+                "default_mantle_project_id", value("default_mantle_project_id")
+            ) or "default",
             invocation_log_group_name=existing_log_group,
             invoker_principal_arns=tuple(invoker_arns),
             jwt_audience=_string("jwt_audience", value("jwt_audience")),
