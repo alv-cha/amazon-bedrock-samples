@@ -6,10 +6,11 @@ give you **cost tracking** per workload — but neither can answer *"cap each of
 my end users at $1/day and cut them off when they hit it."*
 
 This sample deploys a lightweight **per-user quota layer** for Amazon Bedrock
-that does exactly that. It offers two enforcement modes (detailed below): a
-**credential broker** that governs native `bedrock-runtime` calls across any
-API and provider (recommended), and an OpenAI/Anthropic-compatible **inline
-proxy** for the `bedrock-mantle` endpoint. Both:
+that does exactly that — **enterprise-grade, fine-grained access and spend
+governance** over your Bedrock usage. It offers two enforcement modes (detailed
+below): a **credential broker** that governs native `bedrock-runtime` calls
+across any API and provider (recommended), and an OpenAI/Anthropic-compatible
+**inline proxy** for the `bedrock-mantle` endpoint. Both:
 
 - **Identity from your existing auth** — users send the JWT your application
   already issues (Amazon Cognito, Okta, Auth0, Entra ID, any OIDC IdP); the
@@ -39,6 +40,9 @@ proxy** for the `bedrock-mantle` endpoint. Both:
 - **Async safety net** — a reconciler blocks users whose settled usage
   drifted over budget and sends SNS alerts, then auto-unblocks after the
   daily reset
+- **Optional admin console** — a static React UI (opt-in `-c admin_ui=true`)
+  on S3 + CloudFront, authenticated with Cognito; see
+  [`admin-ui/`](admin-ui/README.md)
 
 The inference schemas remain OpenAI/Anthropic-compatible. Because the Lambda
 Function URL is protected by IAM, callers also use the included `httpx`
@@ -212,6 +216,42 @@ If you need controls for **anonymous or adversarial** end users (per-IP rate
 limits, sign-up abuse prevention, hard pre-token caps), this sample is a
 starting point but not a complete solution — layer it behind WAF / API
 Gateway throttling and prefer Mode B's pre-spend cap.
+
+## Roadmap: two phases
+
+The sample is deliberately split so you can adopt the governance core first and
+federate it into your enterprise identity later:
+
+- **Phase 1 — Bedrock quota governance core (this sample).** Per-user/tenant USD
+  and token budgets, `reserve → settle` admission control (Mode B), the
+  credential broker (Mode A), the reconciler safety net, the admin API, and the
+  optional console. Works today against any OIDC issuer via `jwt_issuer` /
+  `jwt_user_claim`.
+- **Phase 2 — federate with your enterprise IdP / IAM Identity Center.** Point
+  the gateway at your corporate issuer (the `jwt_issuer`/`jwt_user_claim` knobs
+  already support this) and budget on the tenant/team claim it emits. The
+  current edge is **one issuer per deployment** (see [Trust model](#trust-model));
+  multi-issuer federation is future work.
+
+## Do I need DynamoDB?
+
+Mostly yes, but it is small and load-bearing for a specific reason. DynamoDB
+here is an **enforcement ledger, not an analytics store**:
+
+- **Irreplaceable:** the atomic conditional write in `QuotaStore.reserve`
+  (Mode B's hard pre-spend cap) needs a transactional counter — CloudWatch
+  cannot gate a request. The users table's limits/status is the authoritative
+  allow/block source read at vend time and per request.
+- **Already mirrored to CloudWatch:** per-user usage is emitted as EMF metrics,
+  so *reporting* and history live in CloudWatch/Logs Insights, not DynamoDB.
+
+So you can drop DynamoDB **only** if you accept monitoring-only — Mode A's
+bounded-overspend metering via the reconciler and CloudWatch, with **no** Mode B
+hard cap and no atomic admission. For a fixed, known user set that wants the
+"core only" enterprise posture, limits/status can instead come from a validated
+**static quota file** (loaded like `model_config`) behind a read-only
+`StaticQuotaStore` — but that replaces only the *users* table; the *usage* table
+is still required for any hard enforcement.
 
 ## What the gateway itself costs
 

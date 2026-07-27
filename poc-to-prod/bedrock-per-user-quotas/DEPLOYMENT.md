@@ -109,6 +109,12 @@ commands such as `-c jwt_issuer=...` and
 | `jwt_user_claim` | `sub` | Non-empty signed JWT claim |
 | `vended_ttl_seconds` | `900` | 900 through 43200 seconds |
 | `snapstart` | `false` | Strict boolean |
+| `reconciler_interval_minutes` | `5` | Positive integer; EventBridge cadence (1 = demo, 5 = default, 15 = heavy log volume — shorter re-scans more Logs Insights data) |
+| `default_mantle_project_id` | `default` | Bedrock Project injected on Mode B when a user has no `mantle_project_id` |
+| `admin_jwt_claim` | empty | JWT claim that authorizes the `/admin` API (e.g. `cognito:groups`); empty = shared key only |
+| `admin_jwt_value` | empty | Required value in `admin_jwt_claim` (e.g. `quota-admins`) |
+| `admin_ui` | `false` | Boolean; deploy the S3+CloudFront admin console (demo Cognito pool only) |
+| `experimental_native_session_deny` | `false` | Boolean; reconciler revokes blocked users' vended sessions early via a SourceIdentity Deny — grants it `iam:PutRolePolicy` on the vended role (AppSec sign-off) |
 
 The CDK configuration requires positive default limits. The admin API permits
 zero for an individual limit, where zero means that dimension is unlimited.
