@@ -13,20 +13,26 @@ Resources:
 """
 
 import json
+import os
 
 import aws_cdk as cdk
 from aws_cdk import (
     Duration,
     RemovalPolicy,
     Stack,
+    aws_cloudfront as cloudfront,
+    aws_cloudfront_origins as cloudfront_origins,
     aws_cloudwatch as cw,
     aws_cognito as cognito,
+    aws_cognito_identitypool as idpool,
     aws_dynamodb as ddb,
     aws_events as events,
     aws_events_targets as targets,
     aws_iam as iam,
     aws_lambda as lambda_,
     aws_logs as logs,
+    aws_s3 as s3,
+    aws_s3_deployment as s3deploy,
     aws_secretsmanager as sm,
     aws_sns as sns,
     aws_sns_subscriptions as subs,
@@ -496,6 +502,86 @@ class QuotaGatewayStack(Stack):
                 fn_url.grant_invoke_url(iam.ArnPrincipal(arn))
         else:
             fn_url.grant_invoke_url(iam.AccountRootPrincipal())
+
+        # ------------------------------------------------------------------
+        # Admin UI (opt-in: -c admin_ui=true). Static React on S3 + CloudFront,
+        # authenticated with the demo Cognito pool via a Cognito Identity Pool.
+        # The browser gets temporary AWS creds from the Identity Pool's
+        # authenticated role and SigV4-signs its calls to the AWS_IAM Function
+        # URL — no admin secret ever reaches the browser (admin-by-JWT does the
+        # /admin authorization; see ADMIN_JWT_CLAIM). Only wired when the stack
+        # created the demo pool; with a BYO issuer, see DEPLOYMENT.md for the
+        # manual Identity Pool + OIDC-provider path.
+        # ------------------------------------------------------------------
+        if config.admin_ui and user_pool is not None:
+            ui_bucket = s3.Bucket(
+                self, "AdminUiBucket",
+                block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+                encryption=s3.BucketEncryption.S3_MANAGED,
+                enforce_ssl=True,
+                removal_policy=RemovalPolicy.DESTROY,
+                auto_delete_objects=True,
+            )
+            ui_distribution = cloudfront.Distribution(
+                self, "AdminUiDistribution",
+                default_root_object="index.html",
+                default_behavior=cloudfront.BehaviorOptions(
+                    origin=cloudfront_origins.S3BucketOrigin.with_origin_access_control(
+                        ui_bucket
+                    ),
+                    viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+                ),
+                # SPA: client-side routes resolve to index.html.
+                error_responses=[
+                    cloudfront.ErrorResponse(
+                        http_status=403, response_http_status=200,
+                        response_page_path="/index.html",
+                    ),
+                    cloudfront.ErrorResponse(
+                        http_status=404, response_http_status=200,
+                        response_page_path="/index.html",
+                    ),
+                ],
+            )
+            admin_identity_pool = idpool.IdentityPool(
+                self, "AdminIdentityPool",
+                allow_unauthenticated_identities=False,
+                authentication_providers=idpool.IdentityPoolAuthenticationProviders(
+                    user_pools=[idpool.UserPoolAuthenticationProvider(
+                        user_pool=user_pool,
+                        user_pool_client=user_pool_client,
+                    )],
+                ),
+            )
+            # The authenticated browser identity may invoke the Function URL;
+            # the JWT it presents (admin group) authorizes the /admin routes.
+            fn_url.grant_invoke_url(admin_identity_pool.authenticated_role)
+            # dist/ is a generated Vite bundle (gitignored), resolved relative
+            # to this file so it works regardless of the synth CWD. Fail with an
+            # actionable message rather than a cryptic asset error if it is
+            # missing — the operator must build the SPA before deploying.
+            ui_dist = os.path.join(
+                os.path.dirname(__file__), "..", "..", "admin-ui", "dist"
+            )
+            if not os.path.isdir(ui_dist):
+                raise FileNotFoundError(
+                    "admin_ui=true but admin-ui/dist is missing. Run "
+                    "'npm install && npm run build' in admin-ui/ before "
+                    "'cdk deploy -c admin_ui=true'."
+                )
+            s3deploy.BucketDeployment(
+                self, "AdminUiDeployment",
+                sources=[s3deploy.Source.asset(ui_dist)],
+                destination_bucket=ui_bucket,
+                distribution=ui_distribution,
+                distribution_paths=["/*"],
+            )
+            cdk.CfnOutput(self, "AdminUiUrl",
+                          value=f"https://{ui_distribution.distribution_domain_name}",
+                          description="Admin console (CloudFront). Sign in with the demo Cognito pool.")
+            cdk.CfnOutput(self, "AdminIdentityPoolId",
+                          value=admin_identity_pool.identity_pool_id,
+                          description="Cognito Identity Pool the admin UI exchanges tokens with.")
 
         # ------------------------------------------------------------------
         # Lockdown helper: attach this policy to every role that should NOT

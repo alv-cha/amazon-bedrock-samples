@@ -17,6 +17,7 @@ _DEPLOYMENT_KEYS = {
     "adapter_layer_arn",
     "admin_jwt_claim",
     "admin_jwt_value",
+    "admin_ui",
     "alert_email",
     "auto_provision_users",
     "default_daily_input_tokens",
@@ -45,6 +46,7 @@ _DEFAULTS = {
     "adapter_layer_arn": "",
     "admin_jwt_claim": "",
     "admin_jwt_value": "",
+    "admin_ui": False,
     "alert_email": "",
     "auto_provision_users": True,
     "default_daily_input_tokens": 1_000_000,
@@ -82,6 +84,7 @@ class DeploymentConfig:
     adapter_layer_arn: str
     admin_jwt_claim: str
     admin_jwt_value: str
+    admin_ui: bool
     alert_email: str
     auto_provision_users: bool
     default_daily_input_tokens: int
@@ -218,6 +221,7 @@ class DeploymentConfig:
             ),
             admin_jwt_claim=_string("admin_jwt_claim", value("admin_jwt_claim")),
             admin_jwt_value=_string("admin_jwt_value", value("admin_jwt_value")),
+            admin_ui=_boolean("admin_ui", value("admin_ui")),
             alert_email=_string("alert_email", value("alert_email")),
             auto_provision_users=_boolean(
                 "auto_provision_users", value("auto_provision_users")

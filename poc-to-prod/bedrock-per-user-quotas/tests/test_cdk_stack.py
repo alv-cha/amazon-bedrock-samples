@@ -1,4 +1,5 @@
 import json
+import os
 
 import aws_cdk as cdk
 import pytest
@@ -14,6 +15,15 @@ def no_docker_asset_bundling(monkeypatch):
     inline = lambda_.Code.from_inline("def handler(event, context): return {}")
     monkeypatch.setattr(stack_module.lambda_.Code, "from_asset",
                         lambda *args, **kwargs: inline)
+    # The admin UI (admin_ui=true) uses s3deploy.Source.asset, which also
+    # bundles from disk; stub it so synth needs no Node build. The stack also
+    # guards on admin-ui/dist existing, so make that guard pass without a build.
+    monkeypatch.setattr(
+        stack_module.s3deploy.Source, "asset",
+        lambda *args, **kwargs: stack_module.s3deploy.Source.data("index.html", "<!doctype html>"),
+    )
+    dist_dir = os.path.join(os.path.dirname(stack_module.__file__), "..", "..", "admin-ui", "dist")
+    os.makedirs(dist_dir, exist_ok=True)
 
 
 def _template(context: dict[str, str]) -> Template:
@@ -245,6 +255,42 @@ def test_reconciler_interval_is_configurable():
     template.has_resource_properties(
         "AWS::Events::Rule", {"ScheduleExpression": "rate(1 minute)"}
     )
+
+
+def test_admin_ui_disabled_by_default():
+    template = _template({"manage_invocation_logging": "true"})
+    template.resource_count_is("AWS::S3::Bucket", 0)
+    template.resource_count_is("AWS::CloudFront::Distribution", 0)
+    template.resource_count_is("AWS::Cognito::IdentityPool", 0)
+
+
+def test_admin_ui_creates_static_site_and_identity_pool():
+    # No jwt_issuer -> the stack creates the demo Cognito pool the UI needs.
+    template = _template({
+        "manage_invocation_logging": "true",
+        "admin_ui": "true",
+    })
+    template.resource_count_is("AWS::S3::Bucket", 1)
+    template.resource_count_is("AWS::CloudFront::Distribution", 1)
+    template.resource_count_is("AWS::Cognito::IdentityPool", 1)
+    # The authenticated role is granted invoke on the Function URL.
+    template.has_resource_properties(
+        "AWS::Lambda::Permission",
+        Match.object_like({"Action": "lambda:InvokeFunctionUrl"}),
+    )
+
+
+def test_admin_ui_skipped_for_byo_issuer():
+    # With a BYO issuer there is no demo pool to attach, so the UI is not wired
+    # even when requested (documented manual path instead).
+    template = _template({
+        "manage_invocation_logging": "true",
+        "admin_ui": "true",
+        "jwt_issuer": "https://idp.example.com/",
+        "jwt_audience": "aud",
+    })
+    template.resource_count_is("AWS::CloudFront::Distribution", 0)
+    template.resource_count_is("AWS::Cognito::IdentityPool", 0)
 
 
 def test_custom_quota_configuration_and_table_retention():
