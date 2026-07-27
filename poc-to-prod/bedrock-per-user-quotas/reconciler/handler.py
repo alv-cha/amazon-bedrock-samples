@@ -17,8 +17,10 @@ its own:
 Self-contained: needs only boto3, which the Lambda runtime provides.
 """
 
+import hashlib
 import json
 import os
+import re
 from datetime import datetime, timezone
 
 import boto3
@@ -27,6 +29,23 @@ from metering_ingest import aggregate_by_user, run_insights_query, _window_epoch
 
 MICRO = 1_000_000
 METRICS_NAMESPACE = os.environ.get("METRICS_NAMESPACE", "BedrockQuotaGateway")
+
+# Must match gateway/app/broker.session_name_for EXACTLY: the same sanitized,
+# collision-resistant identity the broker stamps as SourceIdentity (charset
+# [\w+=.@-] with comma excluded, 20 hex hash chars). Duplicated because the
+# reconciler is a separate Lambda asset and can't import the gateway package
+# (same reason _cost_micro is duplicated below). If the broker's rule changes,
+# change it here too or SourceIdentity denies will target the wrong identity.
+_SESSION_SAFE = re.compile(r"[^\w+=.@-]", re.ASCII)
+_MAX_SESSION_NAME = 64
+_HASH_HEX = 20
+
+
+def session_name_for(sub: str) -> str:
+    cleaned = _SESSION_SAFE.sub("-", sub).strip("-") or "user"
+    digest = hashlib.sha256(sub.encode("utf-8")).hexdigest()[:_HASH_HEX]
+    suffix = "-" + digest
+    return cleaned[: _MAX_SESSION_NAME - len(suffix)] + suffix
 
 
 def _emit_emf(user_id: str, d_cost_micro: int, d_in: int, d_out: int, d_req: int) -> None:
@@ -169,6 +188,79 @@ def _set_status(users_table, user_id: str, status: str, reason: str) -> None:
     )
 
 
+# --- EXPERIMENTAL: early revocation of in-flight vended sessions ---------
+# When experimental_native_session_deny is on, the reconciler maintains an
+# inline policy on BedrockUserRole that Denies Bedrock invoke actions for the
+# currently-blocked users, keyed on aws:SourceIdentity (the identity the broker
+# stamped). This is the AWS-documented session-revocation pattern: it cuts a
+# blocked user's ALREADY-vended credentials before they expire, instead of
+# waiting out the TTL. It is OFF by default and grants the reconciler
+# iam:PutRolePolicy/DeleteRolePolicy on that one role only.
+#
+# Failure is non-fatal by design: TTL expiry (<= vended TTL) is the guaranteed
+# bound, so on policy-size overflow or any IAM error we alert and fall back to
+# TTL rather than break the run. IAM propagation is eventually consistent — the
+# deny is not instantaneous; measure, don't promise instant cutoff.
+_NATIVE_DENY_POLICY_NAME = "quota-native-session-deny"
+_DENY_ACTIONS = [
+    "bedrock:InvokeModel",
+    "bedrock:InvokeModelWithResponseStream",
+    "bedrock:Converse",
+    "bedrock:ConverseStream",
+]
+# Inline role policies cap at 10,240 chars; stay well under so we alert-and-skip
+# rather than fail a PutRolePolicy on a huge blocked set.
+_MAX_DENY_SOURCE_IDENTITIES = 200
+
+
+def _native_deny_document(blocked_session_ids: list[str]) -> dict:
+    return {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "DenyBlockedQuotaUsers",
+            "Effect": "Deny",
+            "Action": _DENY_ACTIONS,
+            "Resource": "*",
+            "Condition": {
+                "StringEquals": {"aws:SourceIdentity": sorted(blocked_session_ids)}
+            },
+        }],
+    }
+
+
+def _sync_native_deny_policy(iam_client, role_name: str, blocked_user_ids: list[str],
+                             sns, topic_arn: str) -> dict:
+    """Put/delete the SourceIdentity Deny policy for the blocked set. Returns a
+    status dict; never raises (falls back to TTL on any failure)."""
+    session_ids = [session_name_for(u) for u in blocked_user_ids]
+    try:
+        if not session_ids:
+            # No one blocked -> remove the policy (idempotent).
+            try:
+                iam_client.delete_role_policy(
+                    RoleName=role_name, PolicyName=_NATIVE_DENY_POLICY_NAME)
+            except iam_client.exceptions.NoSuchEntityException:
+                pass
+            return {"mode": "native_session_deny", "denied": 0}
+        if len(session_ids) > _MAX_DENY_SOURCE_IDENTITIES:
+            _notify(sns, topic_arn,
+                    "[quota-gateway] native-deny OVERFLOW (falling back to TTL)",
+                    {"blocked": len(session_ids), "cap": _MAX_DENY_SOURCE_IDENTITIES})
+            return {"mode": "native_session_deny", "overflow": True,
+                    "blocked": len(session_ids), "denied": 0}
+        iam_client.put_role_policy(
+            RoleName=role_name,
+            PolicyName=_NATIVE_DENY_POLICY_NAME,
+            PolicyDocument=json.dumps(_native_deny_document(session_ids)),
+        )
+        return {"mode": "native_session_deny", "denied": len(session_ids)}
+    except Exception as exc:  # noqa: BLE001 - never break the run on IAM issues
+        _notify(sns, topic_arn,
+                "[quota-gateway] native-deny IAM error (falling back to TTL)",
+                {"error": str(exc), "role": role_name})
+        return {"mode": "native_session_deny", "error": str(exc), "denied": 0}
+
+
 def _mark_warning_sent(users_table, user_id: str, window: str) -> None:
     users_table.update_item(
         Key={"user_id": user_id},
@@ -266,7 +358,7 @@ def _ingest_usage(logs_client, users_table, usage_table, log_group: str,
     }
 
 
-def handler(event, context, dynamodb=None, sns=None, logs=None):  # noqa: ARG001 (Lambda signature)
+def handler(event, context, dynamodb=None, sns=None, logs=None, iam=None):  # noqa: ARG001 (Lambda signature)
     if dynamodb is None or sns is None:
         dynamodb, sns = _resources()
     log_group = os.environ.get("INVOCATION_LOG_GROUP", "")
@@ -276,6 +368,7 @@ def handler(event, context, dynamodb=None, sns=None, logs=None):  # noqa: ARG001
     usage_table = dynamodb.Table(os.environ["USAGE_TABLE"])
     topic_arn = os.environ.get("SNS_TOPIC_ARN", "")
     warn_threshold = float(os.environ.get("WARN_THRESHOLD", "0.8"))
+    native_deny = os.environ.get("EXPERIMENTAL_NATIVE_SESSION_DENY", "").lower() == "true"
     now = datetime.now(timezone.utc)
     window = now.strftime("%Y-%m-%d")
 
@@ -285,6 +378,9 @@ def handler(event, context, dynamodb=None, sns=None, logs=None):  # noqa: ARG001
     ingest = _ingest_usage(logs, users_table, usage_table, log_group, window, now)
 
     blocked, unblocked, warned = [], [], []
+    # Every user in a blocked state after this run (pre-existing + newly
+    # blocked, minus unblocked) — the target set for the SourceIdentity deny.
+    all_blocked: list[str] = []
 
     for user in _scan_users(users_table):
         user_id = str(user["user_id"])
@@ -321,10 +417,15 @@ def handler(event, context, dynamodb=None, sns=None, logs=None):  # noqa: ARG001
             _set_status(users_table, user_id, "blocked", "auto: settled usage exceeded daily budget")
             _notify(sns, topic_arn, f"[quota-gateway] BLOCKED {user_id}", snapshot)
             blocked.append(user_id)
+            all_blocked.append(user_id)
         elif status == "blocked" and str(user.get("status_reason", "")).startswith("auto:") and not over:
             _set_status(users_table, user_id, "active", "auto: window reset, usage back under budget")
             _notify(sns, topic_arn, f"[quota-gateway] UNBLOCKED {user_id}", snapshot)
             unblocked.append(user_id)
+        elif status == "blocked":
+            # Already blocked and staying blocked (auto or admin) — keep it in
+            # the deny set so its in-flight vended sessions stay cut off.
+            all_blocked.append(user_id)
         elif (
             status == "active"
             and limit_cost
@@ -338,5 +439,18 @@ def handler(event, context, dynamodb=None, sns=None, logs=None):  # noqa: ARG001
 
     result = {"window": window, "blocked": blocked, "unblocked": unblocked,
               "warned": warned, "metering": ingest}
+
+    # Optional early revocation of in-flight vended sessions for blocked users.
+    if native_deny:
+        role_name = os.environ.get("BEDROCK_USER_ROLE_NAME", "")
+        if role_name:
+            if iam is None:
+                iam = boto3.client("iam")
+            result["native_deny"] = _sync_native_deny_policy(
+                iam, role_name, all_blocked, sns, topic_arn)
+        else:
+            result["native_deny"] = {"mode": "native_session_deny",
+                                     "error": "BEDROCK_USER_ROLE_NAME not set"}
+
     print(json.dumps(result))
     return result

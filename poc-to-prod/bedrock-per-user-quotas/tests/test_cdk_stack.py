@@ -257,6 +257,38 @@ def test_reconciler_interval_is_configurable():
     )
 
 
+def test_native_session_deny_grants_no_iam_by_default():
+    template = _template({"manage_invocation_logging": "true"})
+    # No reconciler statement should carry iam:PutRolePolicy when the
+    # experiment is off (zero privilege-escalation surface).
+    policies = template.find_resources("AWS::IAM::Policy")
+    for policy in policies.values():
+        for stmt in policy["Properties"]["PolicyDocument"]["Statement"]:
+            actions = stmt.get("Action", [])
+            actions = actions if isinstance(actions, list) else [actions]
+            assert "iam:PutRolePolicy" not in actions
+
+
+def test_native_session_deny_grants_scoped_iam_when_enabled():
+    template = _template({
+        "manage_invocation_logging": "true",
+        "experimental_native_session_deny": "true",
+    })
+    template.has_resource_properties(
+        "AWS::IAM::Policy",
+        {
+            "PolicyDocument": {
+                "Statement": Match.array_with([
+                    Match.object_like({
+                        "Action": ["iam:PutRolePolicy", "iam:DeleteRolePolicy"],
+                        "Effect": "Allow",
+                    })
+                ])
+            }
+        },
+    )
+
+
 def test_admin_ui_disabled_by_default():
     template = _template({"manage_invocation_logging": "true"})
     template.resource_count_is("AWS::S3::Bucket", 0)

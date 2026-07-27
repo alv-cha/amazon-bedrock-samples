@@ -656,6 +656,26 @@ class QuotaGatewayStack(Stack):
             )
         )
 
+        # EXPERIMENTAL (opt-in, default OFF): let the reconciler cut off a
+        # blocked user's ALREADY-vended sessions before their TTL by managing a
+        # Deny-on-aws:SourceIdentity inline policy on the vended role. This is a
+        # privilege-escalation surface (iam:PutRolePolicy on that role) that
+        # AppSec must sign off on, so it is granted ONLY when explicitly
+        # enabled; when off, the reconciler holds no IAM write permission at
+        # all and TTL expiry remains the sole revocation bound.
+        if config.experimental_native_session_deny:
+            reconciler_fn.add_to_role_policy(
+                iam.PolicyStatement(
+                    effect=iam.Effect.ALLOW,
+                    actions=["iam:PutRolePolicy", "iam:DeleteRolePolicy"],
+                    resources=[bedrock_user_role.role_arn],
+                )
+            )
+            reconciler_fn.add_environment(
+                "EXPERIMENTAL_NATIVE_SESSION_DENY", "true")
+            reconciler_fn.add_environment(
+                "BEDROCK_USER_ROLE_NAME", bedrock_user_role.role_name)
+
         # Reconciler cadence (deploy-time, -c reconciler_interval_minutes,
         # default 5). A shorter interval tightens Mode A's bounded-overspend
         # window but costs more: the Logs Insights query re-scans from

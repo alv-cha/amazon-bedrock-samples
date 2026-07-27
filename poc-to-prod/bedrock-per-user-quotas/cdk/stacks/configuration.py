@@ -24,6 +24,7 @@ _DEPLOYMENT_KEYS = {
     "default_daily_output_tokens",
     "default_daily_usd",
     "default_mantle_project_id",
+    "experimental_native_session_deny",
     "invocation_log_group_name",
     "invoker_principal_arns",
     "jwt_audience",
@@ -53,6 +54,7 @@ _DEFAULTS = {
     "default_daily_output_tokens": 200_000,
     "default_daily_usd": 1.0,
     "default_mantle_project_id": "default",
+    "experimental_native_session_deny": False,
     "invocation_log_group_name": "",
     "invoker_principal_arns": [],
     "jwt_audience": "",
@@ -91,6 +93,7 @@ class DeploymentConfig:
     default_daily_output_tokens: int
     default_daily_usd: float
     default_mantle_project_id: str
+    experimental_native_session_deny: bool
     invocation_log_group_name: str
     invoker_principal_arns: tuple[str, ...]
     jwt_audience: str
@@ -240,6 +243,10 @@ class DeploymentConfig:
             default_mantle_project_id=_string(
                 "default_mantle_project_id", value("default_mantle_project_id")
             ) or "default",
+            experimental_native_session_deny=_boolean(
+                "experimental_native_session_deny",
+                value("experimental_native_session_deny"),
+            ),
             invocation_log_group_name=existing_log_group,
             invoker_principal_arns=tuple(invoker_arns),
             jwt_audience=_string("jwt_audience", value("jwt_audience")),

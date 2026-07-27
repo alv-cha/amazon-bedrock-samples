@@ -1,3 +1,4 @@
+import json
 import os
 from datetime import datetime, timezone
 
@@ -232,3 +233,103 @@ def test_blocks_at_exact_limit_boundary(fake_dynamodb, fake_sns, monkeypatch):
 
     result = reconciler.handler({}, None, dynamodb=fake_dynamodb, sns=fake_sns)
     assert result["blocked"] == ["edge"]
+
+
+# ---------------------------------------------------------------------------
+# C5: experimental SourceIdentity early-revocation (default OFF)
+# ---------------------------------------------------------------------------
+
+class _FakeIAM:
+    class exceptions:
+        class NoSuchEntityException(Exception):
+            pass
+
+    def __init__(self):
+        self.policies: dict[str, str] = {}
+        self.calls: list[tuple[str, str]] = []
+
+    def put_role_policy(self, RoleName, PolicyName, PolicyDocument):
+        self.calls.append(("put", PolicyName))
+        self.policies[PolicyName] = PolicyDocument
+
+    def delete_role_policy(self, RoleName, PolicyName):
+        self.calls.append(("delete", PolicyName))
+        if PolicyName not in self.policies:
+            raise self.exceptions.NoSuchEntityException()
+        del self.policies[PolicyName]
+
+
+def _enable_native_deny(monkeypatch):
+    monkeypatch.setenv("EXPERIMENTAL_NATIVE_SESSION_DENY", "true")
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", "BedrockUserRole")
+
+
+def test_native_deny_off_by_default_touches_no_iam(fake_dynamodb, fake_sns):
+    _seed_user(fake_dynamodb, "over", usd_limit=1.0)
+    _seed_usage(fake_dynamodb, "over", cost_usd=1.5)
+    iam = _FakeIAM()
+
+    result = reconciler.handler({}, None, dynamodb=fake_dynamodb, sns=fake_sns, iam=iam)
+    assert result["blocked"] == ["over"]
+    assert "native_deny" not in result   # feature not engaged
+    assert iam.calls == []               # zero IAM writes
+
+
+def test_native_deny_targets_only_blocked_identities(fake_dynamodb, fake_sns, monkeypatch):
+    _enable_native_deny(monkeypatch)
+    _seed_user(fake_dynamodb, "over", usd_limit=1.0)
+    _seed_usage(fake_dynamodb, "over", cost_usd=1.5)   # -> blocked this run
+    _seed_user(fake_dynamodb, "fine", usd_limit=1.0)
+    _seed_usage(fake_dynamodb, "fine", cost_usd=0.1)   # stays active
+    iam = _FakeIAM()
+
+    result = reconciler.handler({}, None, dynamodb=fake_dynamodb, sns=fake_sns, iam=iam)
+    assert result["native_deny"]["denied"] == 1
+    doc = json.loads(iam.policies[reconciler._NATIVE_DENY_POLICY_NAME])
+    identities = doc["Statement"][0]["Condition"]["StringEquals"]["aws:SourceIdentity"]
+    assert identities == [reconciler.session_name_for("over")]
+    assert reconciler.session_name_for("fine") not in identities
+
+
+def test_native_deny_clears_policy_when_nobody_blocked(fake_dynamodb, fake_sns, monkeypatch):
+    _enable_native_deny(monkeypatch)
+    _seed_user(fake_dynamodb, "fine", usd_limit=1.0)
+    _seed_usage(fake_dynamodb, "fine", cost_usd=0.1)
+    iam = _FakeIAM()
+
+    result = reconciler.handler({}, None, dynamodb=fake_dynamodb, sns=fake_sns, iam=iam)
+    assert result["native_deny"]["denied"] == 0
+    assert ("delete", reconciler._NATIVE_DENY_POLICY_NAME) in iam.calls
+
+
+def test_native_deny_overflow_falls_back_and_alarms(fake_dynamodb, fake_sns, monkeypatch):
+    _enable_native_deny(monkeypatch)
+    monkeypatch.setenv("SNS_TOPIC_ARN", "arn:fake")
+    monkeypatch.setattr(reconciler, "_MAX_DENY_SOURCE_IDENTITIES", 2)
+    for i in range(3):
+        _seed_user(fake_dynamodb, f"over{i}", usd_limit=1.0)
+        _seed_usage(fake_dynamodb, f"over{i}", cost_usd=1.5)
+    iam = _FakeIAM()
+
+    result = reconciler.handler({}, None, dynamodb=fake_dynamodb, sns=fake_sns, iam=iam)
+    assert result["native_deny"]["overflow"] is True
+    assert result["native_deny"]["denied"] == 0
+    assert iam.calls == []  # did not attempt a too-large PutRolePolicy
+    assert any("OVERFLOW" in p["Subject"] for p in fake_sns.published)
+
+
+def test_native_deny_iam_error_falls_back_to_ttl(fake_dynamodb, fake_sns, monkeypatch):
+    _enable_native_deny(monkeypatch)
+    monkeypatch.setenv("SNS_TOPIC_ARN", "arn:fake")
+    _seed_user(fake_dynamodb, "over", usd_limit=1.0)
+    _seed_usage(fake_dynamodb, "over", cost_usd=1.5)
+
+    class _BrokenIAM(_FakeIAM):
+        def put_role_policy(self, **kwargs):
+            raise RuntimeError("AccessDenied")
+
+    result = reconciler.handler({}, None, dynamodb=fake_dynamodb, sns=fake_sns, iam=_BrokenIAM())
+    # The run still succeeds (blocking happened); deny just fell back to TTL.
+    assert result["blocked"] == ["over"]
+    assert "error" in result["native_deny"]
+    assert any("IAM error" in p["Subject"] for p in fake_sns.published)
