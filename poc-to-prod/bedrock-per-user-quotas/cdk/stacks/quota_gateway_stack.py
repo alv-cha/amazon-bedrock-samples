@@ -1,18 +1,17 @@
-"""CDK stack for the Bedrock per-user quota gateway.
+"""CDK stack for runtime-only Amazon Bedrock per-user quotas.
 
 Resources:
 - DynamoDB: users table (limits/status per JWT subject), usage table (TTL)
-- Gateway Lambda: FastAPI behind the AWS Lambda Web Adapter, exposed via a
-  Function URL in RESPONSE_STREAM mode so SSE streaming passes through
+- Broker/admin Lambda: FastAPI behind an AWS_IAM Lambda Function URL
+- Short-lived STS role restricted to configured bedrock-runtime model ARNs
 - JWT identity: bring your own OIDC issuer via ``-c jwt_issuer=...``
   (optionally ``-c jwt_audience=...``), or let the stack create a demo
   Cognito User Pool
 - Admin key in Secrets Manager
-- Reconciler Lambda on a configurable EventBridge schedule (default 5 min) + SNS alert topic
-- CloudWatch dashboard over the gateway's EMF metrics
+- CloudWatch Logs subscription processor for event-driven metering + SNS
+- CloudWatch dashboard over broker and metering EMF metrics
 """
 
-import json
 import os
 
 import aws_cdk as cdk
@@ -26,11 +25,10 @@ from aws_cdk import (
     aws_cognito as cognito,
     aws_cognito_identitypool as idpool,
     aws_dynamodb as ddb,
-    aws_events as events,
-    aws_events_targets as targets,
     aws_iam as iam,
     aws_lambda as lambda_,
     aws_logs as logs,
+    aws_logs_destinations as logs_destinations,
     aws_s3 as s3,
     aws_s3_deployment as s3deploy,
     aws_secretsmanager as sm,
@@ -44,40 +42,25 @@ from .configuration import DeploymentConfig
 
 METRICS_NAMESPACE = "BedrockQuotaGateway"
 
-# MODEL_PRICES_JSON is injected into BOTH Lambdas. The gateway prices at
-# settle time; the reconciler is authoritative for native-vended traffic.
-#
-# CACHE-PRICING CAVEAT (Mode A): Bedrock model-invocation logs record only
-# input.inputTokenCount / output.outputTokenCount — there are NO cache-token
-# fields — so the reconciler cannot apply the gateway's prompt-cache
-# multipliers to native-vended traffic. The gateway (proxy path) is
-# cache-aware; the reconciler (native path) is not, so for cache-heavy
-# coding-agent workloads the two pricers differ and native dollar enforcement
-# is approximate. Cache-accurate native metering would require enabling
-# text-data delivery and parsing inputBodyJson. See README for the tradeoff.
-
 
 class QuotaGatewayStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
         config = DeploymentConfig.from_node(self.node)
+        if config.deprecated_options:
+            cdk.Annotations.of(self).add_warning(
+                "The runtime-only architecture ignores deprecated dual-mode "
+                "options: " + ", ".join(config.deprecated_options) + ". "
+                "Remove them from deployment configuration."
+            )
         alert_email = config.alert_email
         jwt_issuer = config.jwt_issuer
         jwt_audience = config.jwt_audience
         jwt_jwks_url = config.jwt_jwks_url
         jwt_user_claim = config.jwt_user_claim
-        # Vended-credential lifetime = the broker's AssumeRole DurationSeconds
-        # (VENDED_CREDENTIAL_TTL_SECONDS env). STS bounds AssumeRole duration to
-        # 900s–43200s. The vended role's max_session_duration is derived from it
-        # (see below) so DurationSeconds can never exceed the role's ceiling.
         vended_ttl_seconds = config.vended_ttl_seconds
-        # A role's max_session_duration floor is 3600s (STS), independent of the
-        # AssumeRole duration floor (900s), so lift the ceiling to at least 1h.
         max_session_seconds = max(vended_ttl_seconds, 3600)
-        # -c snapstart=true: resume the gateway from a Firecracker microVM
-        # snapshot instead of cold-starting (Python SnapStart). Requires
-        # publishing versions; the Function URL then targets an alias.
         use_snapstart = config.snapstart
 
         # ------------------------------------------------------------------
@@ -137,6 +120,44 @@ class QuotaGatewayStack(Stack):
             )
             # ID tokens carry the app client id as `aud`.
             jwt_audience = user_pool_client.user_pool_client_id
+            if config.admin_jwt_claim == "cognito:groups":
+                group_parameters = {
+                    "GroupName": config.admin_jwt_value,
+                    "UserPoolId": user_pool.user_pool_id,
+                    "Description": "Administrators of the Bedrock quota demo UI",
+                }
+                ensure_admin_group = cr.AwsCustomResource(
+                    self,
+                    "EnsureDemoAdminGroup",
+                    on_create=cr.AwsSdkCall(
+                        service="CognitoIdentityServiceProvider",
+                        action="createGroup",
+                        parameters=group_parameters,
+                        physical_resource_id=cr.PhysicalResourceId.of(
+                            "demo-admin-group"
+                        ),
+                        ignore_error_codes_matching="GroupExistsException",
+                    ),
+                    on_update=cr.AwsSdkCall(
+                        service="CognitoIdentityServiceProvider",
+                        action="createGroup",
+                        parameters=group_parameters,
+                        physical_resource_id=cr.PhysicalResourceId.of(
+                            "demo-admin-group"
+                        ),
+                        ignore_error_codes_matching="GroupExistsException",
+                    ),
+                    policy=cr.AwsCustomResourcePolicy.from_statements(
+                        [
+                            iam.PolicyStatement(
+                                actions=["cognito-idp:CreateGroup"],
+                                resources=[user_pool.user_pool_arn],
+                            )
+                        ]
+                    ),
+                    install_latest_aws_sdk=False,
+                )
+                ensure_admin_group.node.add_dependency(user_pool)
 
         # ------------------------------------------------------------------
         # DynamoDB
@@ -175,7 +196,7 @@ class QuotaGatewayStack(Stack):
         )
 
         # ------------------------------------------------------------------
-        # Gateway Lambda (FastAPI + Lambda Web Adapter, streaming)
+        # Broker/admin Lambda (FastAPI + Lambda Web Adapter)
         # ------------------------------------------------------------------
         # AWS Lambda Web Adapter public layer (zip packaging). Name/version
         # per https://github.com/awslabs/aws-lambda-web-adapter — override
@@ -187,7 +208,9 @@ class QuotaGatewayStack(Stack):
             self, "WebAdapterLayer", adapter_layer_arn,
         )
 
-        gateway_fn = lambda_.Function(
+        broker_api_fn = lambda_.Function(
+            # Keep the original construct ID so updating an existing
+            # deployment does not replace the Lambda or its Function URL.
             self, "GatewayFn",
             runtime=lambda_.Runtime.PYTHON_3_12,
             architecture=lambda_.Architecture.X86_64,
@@ -217,7 +240,7 @@ class QuotaGatewayStack(Stack):
             environment={
                 # Lambda Web Adapter wiring
                 "AWS_LAMBDA_EXEC_WRAPPER": "/opt/bootstrap",
-                "AWS_LWA_INVOKE_MODE": "response_stream",
+                "AWS_LWA_INVOKE_MODE": "buffered",
                 "PORT": "8080",
                 # App config
                 "USERS_TABLE": users_table.table_name,
@@ -233,13 +256,6 @@ class QuotaGatewayStack(Stack):
                     config.default_daily_output_tokens
                 ),
                 "USAGE_RETENTION_DAYS": str(config.usage_retention_days),
-                "MODE_B_ALLOWED_MODEL_IDS_JSON": json.dumps(
-                    config.mode_b_allowed_model_ids,
-                    separators=(",", ":"),
-                ),
-                # Single price source shared with the reconciler (prevents drift).
-                "MODEL_PRICES_JSON": model_prices_json,
-                "MODEL_FALLBACK_PRICE_JSON": fallback_price_json,
                 # JWT auth
                 "JWT_ISSUER": jwt_issuer,
                 "JWT_AUDIENCE": jwt_audience,
@@ -248,55 +264,27 @@ class QuotaGatewayStack(Stack):
                 # Admin-by-JWT (empty claim = shared key only)
                 "ADMIN_JWT_CLAIM": config.admin_jwt_claim,
                 "ADMIN_JWT_VALUE": config.admin_jwt_value,
-                # Mantle managed-project default + reconciler cadence (read-only
-                # surface for GET /admin/summary; the schedule is set on the rule)
-                "DEFAULT_MANTLE_PROJECT_ID": config.default_mantle_project_id,
-                "RECONCILER_INTERVAL_MINUTES": str(config.reconciler_interval_minutes),
             },
         )
 
-        users_table.grant_read_write_data(gateway_fn)
-        usage_table.grant_read_write_data(gateway_fn)
-        admin_secret.grant_read(gateway_fn)
-        # Permissions to mint short-term Bedrock API keys from the role and
-        # call the bedrock-mantle endpoint. Scope the project resource down
-        # if you use dedicated mantle Projects.
-        gateway_fn.role.add_managed_policy(
-            iam.ManagedPolicy.from_aws_managed_policy_name("AmazonBedrockMantleInferenceAccess")
-        )
-        # The AWS-managed inference policy includes Get*, List*, and
-        # CreateInference, but not DeleteInference. Grant only the missing
-        # action needed by the stored-response cleanup route.
-        gateway_fn.add_to_role_policy(
-            iam.PolicyStatement(
-                actions=["bedrock-mantle:DeleteInference"],
-                resources=[
-                    self.format_arn(
-                        service="bedrock-mantle",
-                        resource="project",
-                        resource_name="*",
-                    )
-                ],
-            )
-        )
+        users_table.grant_read_write_data(broker_api_fn)
+        usage_table.grant_read_data(broker_api_fn)
+        admin_secret.grant_read(broker_api_fn)
 
         # ------------------------------------------------------------------
-        # Per-user vended role (the API-agnostic enforcement path)
+        # Per-user vended role
         #
         # The broker assumes this role on behalf of an in-budget user, with
         # RoleSessionName + SourceIdentity = a sanitized id derived from the
-        # identity claim (reverse-mapped for metering). The user then calls
-        # Bedrock NATIVELY (InvokeModel / Converse / streaming, any provider)
-        # with the short-lived creds. The configured Mode A IAM resource ARNs
-        # determine which models users may call.
+        # identity claim (reverse-mapped for metering). The user then calls the
+        # bedrock-runtime endpoint directly with the short-lived credentials.
         # ------------------------------------------------------------------
         bedrock_user_role = iam.Role(
             self, "BedrockUserRole",
-            # Only the gateway (broker) Lambda role may assume this, and only
-            # while setting a SourceIdentity + session tag it can't forge for
-            # another user. Users never hold static Bedrock access (the
-            # deny-direct policy below enforces "must go through the broker").
-            assumed_by=iam.ArnPrincipal(gateway_fn.role.role_arn),
+            # Only the broker Lambda role may assume this. The broker assigns
+            # SourceIdentity and the quota-user session tag; users never hold
+            # static Bedrock access.
+            assumed_by=iam.ArnPrincipal(broker_api_fn.role.role_arn),
             # >= the vended TTL (and >= the STS 3600s floor), so the broker's
             # AssumeRole DurationSeconds can never exceed the role's ceiling.
             max_session_duration=Duration.seconds(max_session_seconds),
@@ -310,7 +298,7 @@ class QuotaGatewayStack(Stack):
         bedrock_user_role.assume_role_policy.add_statements(
             iam.PolicyStatement(
                 effect=iam.Effect.ALLOW,
-                principals=[iam.ArnPrincipal(gateway_fn.role.role_arn)],
+                principals=[iam.ArnPrincipal(broker_api_fn.role.role_arn)],
                 actions=["sts:SetSourceIdentity", "sts:TagSession"],
             )
         )
@@ -318,36 +306,33 @@ class QuotaGatewayStack(Stack):
             iam.PolicyStatement(
                 effect=iam.Effect.ALLOW,
                 actions=[
+                    "bedrock:CountTokens",
                     "bedrock:InvokeModel",
                     "bedrock:InvokeModelWithResponseStream",
-                    "bedrock:Converse",
-                    "bedrock:ConverseStream",
                 ],
-                # bedrock-runtime ONLY, deliberately. Model-invocation logging
-                # (the reconciler's metering source) captures ONLY the
-                # bedrock-runtime endpoint — mantle (OpenAI/Anthropic-compatible)
-                # calls are NOT logged, so granting bedrock-mantle:* here would
-                # let a user spend via vended creds with ZERO metering and no
-                # enforcement. Mode A's native path must stay on the logged
-                # endpoint. (Mode B proxies mantle in-band and meters there.)
-                # This IAM resource allowlist is intentionally independent
-                # from Mode B's request-body model ID allowlist.
-                resources=list(config.mode_a_allowed_model_arns),
+                # These IAM actions also authorize Converse and ConverseStream.
+                # Bearer-token access is intentionally not granted because
+                # bedrock:CallWithBearerToken is resource "*", which would
+                # weaken this model/inference-profile allowlist.
+                resources=list(config.allowed_model_arns),
             )
         )
         # Let the gateway role assume the vended role AND stamp the per-user
         # identity/tag. SetSourceIdentity + TagSession must be granted on the
         # *caller* side too, not just allowed by the trust policy.
-        gateway_fn.role.add_to_principal_policy(
+        broker_api_fn.role.add_to_principal_policy(
             iam.PolicyStatement(
                 effect=iam.Effect.ALLOW,
                 actions=["sts:AssumeRole", "sts:SetSourceIdentity", "sts:TagSession"],
                 resources=[bedrock_user_role.role_arn],
             )
         )
-        gateway_fn.add_environment("BEDROCK_USER_ROLE_ARN", bedrock_user_role.role_arn)
-        # Same knob that sized max_session_duration above (kept in lockstep).
-        gateway_fn.add_environment("VENDED_CREDENTIAL_TTL_SECONDS", str(vended_ttl_seconds))
+        broker_api_fn.add_environment(
+            "BEDROCK_USER_ROLE_ARN", bedrock_user_role.role_arn
+        )
+        broker_api_fn.add_environment(
+            "VENDED_CREDENTIAL_TTL_SECONDS", str(vended_ttl_seconds)
+        )
 
         # ------------------------------------------------------------------
         # Bedrock model-invocation logging -> CloudWatch Logs.
@@ -355,7 +340,7 @@ class QuotaGatewayStack(Stack):
         # This is the source of per-call token counts across every bedrock-
         # runtime invoke path (InvokeModel/Converse/streaming, all providers);
         # each record's identity.arn carries the RoleSessionName (= sanitized
-        # JWT sub) so the reconciler can meter per user.
+        # JWT claim) so the subscription processor can meter per user.
         #
         # IMPORTANT: model-invocation logging is a SINGLE ACCOUNT + REGION-WIDE
         # Bedrock setting (one config per region). Managing it from this stack
@@ -474,12 +459,13 @@ class QuotaGatewayStack(Stack):
         # otherwise it targets $LATEST directly.
         if use_snapstart:
             url_target = lambda_.Alias(
+                # Preserve the existing alias logical ID on stack updates.
                 self, "GatewayLiveAlias",
                 alias_name="live",
-                version=gateway_fn.current_version,
+                version=broker_api_fn.current_version,
             )
         else:
-            url_target = gateway_fn
+            url_target = broker_api_fn
 
         # The Function URL enforces IAM (SigV4) auth: callers must be
         # signed AWS principals, so the URL is not anonymously reachable
@@ -490,7 +476,7 @@ class QuotaGatewayStack(Stack):
         # app (which user is spending). Defense in depth.
         fn_url = url_target.add_function_url(
             auth_type=lambda_.FunctionUrlAuthType.AWS_IAM,
-            invoke_mode=lambda_.InvokeMode.RESPONSE_STREAM,
+            invoke_mode=lambda_.InvokeMode.BUFFERED,
         )
 
         # Principals allowed to invoke the URL (your app-server/backend
@@ -543,6 +529,33 @@ class QuotaGatewayStack(Stack):
                     ),
                 ],
             )
+            # The browser calls the IAM-authenticated Function URL from the
+            # CloudFront origin. Configure CORS at the Function URL so Lambda
+            # handles unsigned preflight requests before FastAPI, and restrict
+            # it to this distribution rather than allowing every website.
+            cfn_function_url = fn_url.node.default_child
+            if not isinstance(cfn_function_url, lambda_.CfnUrl):
+                raise TypeError("Function URL has no AWS::Lambda::Url child")
+            cfn_function_url.cors = lambda_.CfnUrl.CorsProperty(
+                allow_credentials=False,
+                allow_headers=[
+                    "authorization",
+                    "content-type",
+                    "x-amz-content-sha256",
+                    "x-amz-date",
+                    "x-amz-security-token",
+                    "x-quota-user-token",
+                ],
+                allow_methods=["GET", "POST", "PUT"],
+                allow_origins=[
+                    f"https://{ui_distribution.distribution_domain_name}"
+                ],
+                expose_headers=[
+                    "x-quota-limit-usd",
+                    "x-quota-window",
+                ],
+                max_age=3600,
+            )
             admin_identity_pool = idpool.IdentityPool(
                 self, "AdminIdentityPool",
                 allow_unauthenticated_identities=False,
@@ -569,13 +582,87 @@ class QuotaGatewayStack(Stack):
                     "'npm install && npm run build' in admin-ui/ before "
                     "'cdk deploy -c admin_ui=true'."
                 )
-            s3deploy.BucketDeployment(
+            ui_deployment = s3deploy.BucketDeployment(
                 self, "AdminUiDeployment",
                 sources=[s3deploy.Source.asset(ui_dist)],
                 destination_bucket=ui_bucket,
                 distribution=ui_distribution,
                 distribution_paths=["/*"],
+                # config.js is deployment-specific and is written by the
+                # custom resource below. Excluding it from sync also prevents
+                # later UI asset updates from pruning or overwriting it.
+                exclude=["config.js"],
             )
+            # Write deployment-specific public identifiers after the static
+            # bundle. No secret is included; the browser still obtains
+            # temporary AWS credentials from the Identity Pool and an ID token
+            # from Cognito. Using a custom resource lets CloudFormation resolve
+            # generated IDs instead of baking unresolved CDK tokens at synth.
+            ui_config_body = self.to_json_string(
+                {
+                    "gatewayUrl": fn_url.url,
+                    "region": self.region,
+                    "userPoolId": user_pool.user_pool_id,
+                    "userPoolClientId": user_pool_client.user_pool_client_id,
+                    "identityPoolId": admin_identity_pool.identity_pool_id,
+                }
+            )
+            ui_config_writer = cr.AwsCustomResource(
+                self,
+                "AdminUiRuntimeConfig",
+                on_create=cr.AwsSdkCall(
+                    service="S3",
+                    action="putObject",
+                    parameters={
+                        "Bucket": ui_bucket.bucket_name,
+                        "Key": "config.js",
+                        "Body": cdk.Fn.join(
+                            "",
+                            [
+                                "window.QUOTA_ADMIN_CONFIG = ",
+                                ui_config_body,
+                                ";\n",
+                            ],
+                        ),
+                        "ContentType": "application/javascript",
+                        "CacheControl": "no-store",
+                    },
+                    physical_resource_id=cr.PhysicalResourceId.of(
+                        "admin-ui-runtime-config"
+                    ),
+                ),
+                on_update=cr.AwsSdkCall(
+                    service="S3",
+                    action="putObject",
+                    parameters={
+                        "Bucket": ui_bucket.bucket_name,
+                        "Key": "config.js",
+                        "Body": cdk.Fn.join(
+                            "",
+                            [
+                                "window.QUOTA_ADMIN_CONFIG = ",
+                                ui_config_body,
+                                ";\n",
+                            ],
+                        ),
+                        "ContentType": "application/javascript",
+                        "CacheControl": "no-store",
+                    },
+                    physical_resource_id=cr.PhysicalResourceId.of(
+                        "admin-ui-runtime-config"
+                    ),
+                ),
+                policy=cr.AwsCustomResourcePolicy.from_statements(
+                    [
+                        iam.PolicyStatement(
+                            actions=["s3:PutObject"],
+                            resources=[ui_bucket.arn_for_objects("config.js")],
+                        )
+                    ]
+                ),
+                install_latest_aws_sdk=False,
+            )
+            ui_config_writer.node.add_dependency(ui_deployment)
             cdk.CfnOutput(self, "AdminUiUrl",
                           value=f"https://{ui_distribution.distribution_domain_name}",
                           description="Admin console (CloudFront). Sign in with the demo Cognito pool.")
@@ -599,12 +686,9 @@ class QuotaGatewayStack(Stack):
                 iam.PolicyStatement(
                     effect=iam.Effect.DENY,
                     actions=[
-                        "bedrock-mantle:CreateInference",
-                        "bedrock-mantle:CallWithBearerToken",
+                        "bedrock:CallWithBearerToken",
                         "bedrock:InvokeModel",
                         "bedrock:InvokeModelWithResponseStream",
-                        "bedrock:Converse",
-                        "bedrock:ConverseStream",
                     ],
                     resources=["*"],
                 ),
@@ -612,91 +696,60 @@ class QuotaGatewayStack(Stack):
         )
 
         # ------------------------------------------------------------------
-        # Reconciler + alerting
+        # Event-driven usage processor + alerting
         # ------------------------------------------------------------------
         alert_topic = sns.Topic(self, "QuotaAlerts", display_name="Bedrock quota gateway alerts")
         if alert_email:
             alert_topic.add_subscription(subs.EmailSubscription(alert_email))
 
-        reconciler_fn = lambda_.Function(
-            self, "ReconcilerFn",
+        usage_processor_fn = lambda_.Function(
+            self, "UsageProcessorFn",
             runtime=lambda_.Runtime.PYTHON_3_12,
             memory_size=256,
             timeout=Duration.minutes(2),
-            reserved_concurrent_executions=1,
             handler="handler.handler",
-            code=lambda_.Code.from_asset("../reconciler"),
+            code=lambda_.Code.from_asset("../usage_processor"),
             environment={
                 "USERS_TABLE": users_table.table_name,
                 "USAGE_TABLE": usage_table.table_name,
                 "SNS_TOPIC_ARN": alert_topic.topic_arn,
                 "WARN_THRESHOLD": str(config.warn_threshold),
                 "USAGE_RETENTION_DAYS": str(config.usage_retention_days),
-                # Native-vended usage EMF is emitted under the same namespace
-                # as the gateway's so the dashboard reflects Mode A traffic too.
                 "METRICS_NAMESPACE": METRICS_NAMESPACE,
-                # Same price source as the gateway so the authoritative
-                # reconciler cost can't drift from the gateway's settle cost.
                 "MODEL_PRICES_JSON": model_prices_json,
                 "MODEL_FALLBACK_PRICE_JSON": fallback_price_json,
-                # Source of per-user token counts (any Bedrock API/provider).
-                "INVOCATION_LOG_GROUP": invocation_log_group.log_group_name,
+                "BEDROCK_USER_ROLE_NAME": bedrock_user_role.role_name,
             },
         )
-        users_table.grant_read_write_data(reconciler_fn)
-        # Reconciler now WRITES authoritative metered usage (was read-only).
-        usage_table.grant_read_write_data(reconciler_fn)
-        alert_topic.grant_publish(reconciler_fn)
-        # Query the model-invocation logs via CloudWatch Logs Insights.
-        reconciler_fn.add_to_role_policy(
-            iam.PolicyStatement(
-                effect=iam.Effect.ALLOW,
-                actions=["logs:StartQuery", "logs:GetQueryResults", "logs:StopQuery"],
-                resources=["*"],  # Insights StartQuery does not support ARN scoping well
-            )
-        )
+        users_table.grant_read_write_data(usage_processor_fn)
+        usage_table.grant_read_write_data(usage_processor_fn)
+        alert_topic.grant_publish(usage_processor_fn)
 
-        # EXPERIMENTAL (opt-in, default OFF): let the reconciler cut off a
-        # blocked user's ALREADY-vended sessions before their TTL by managing a
-        # Deny-on-aws:SourceIdentity inline policy on the vended role. This is a
-        # privilege-escalation surface (iam:PutRolePolicy on that role) that
-        # AppSec must sign off on, so it is granted ONLY when explicitly
-        # enabled; when off, the reconciler holds no IAM write permission at
-        # all and TTL expiry remains the sole revocation bound.
-        if config.experimental_native_session_deny:
-            reconciler_fn.add_to_role_policy(
-                iam.PolicyStatement(
-                    effect=iam.Effect.ALLOW,
-                    actions=["iam:PutRolePolicy", "iam:DeleteRolePolicy"],
-                    resources=[bedrock_user_role.role_arn],
-                )
-            )
-            reconciler_fn.add_environment(
-                "EXPERIMENTAL_NATIVE_SESSION_DENY", "true")
-            reconciler_fn.add_environment(
-                "BEDROCK_USER_ROLE_NAME", bedrock_user_role.role_name)
-
-        # Reconciler cadence (deploy-time, -c reconciler_interval_minutes,
-        # default 5). A shorter interval tightens Mode A's bounded-overspend
-        # window but costs more: the Logs Insights query re-scans from
-        # UTC-day-start to now on every run (see reconciler/metering_ingest.py
-        # _window_epoch_bounds), so 1 min is roughly 5x the scan volume of
-        # 5 min. It is safe to re-run frequently — the reconciler is
-        # idempotent (metered_applied_* bookkeeping) and capped at one
-        # concurrent execution — so this is purely a cost/latency tradeoff:
-        # 1 = demo responsiveness, 5 = default, 15 = heavy log volume.
-        events.Rule(
-            self, "ReconcilerSchedule",
-            schedule=events.Schedule.rate(
-                Duration.minutes(config.reconciler_interval_minutes)
+        # CloudWatch Logs subscriptions are at-least-once. The processor uses
+        # the Bedrock requestId as a DynamoDB idempotency key and updates the
+        # daily aggregate in the same transaction.
+        logs.SubscriptionFilter(
+            self, "InvocationUsageSubscription",
+            log_group=invocation_log_group,
+            destination=logs_destinations.LambdaDestination(
+                usage_processor_fn
             ),
-            targets=[targets.LambdaFunction(reconciler_fn)],
+            filter_pattern=logs.FilterPattern.string_value(
+                "$.identity.arn",
+                "=",
+                f"*assumed-role/{bedrock_user_role.role_name}/*",
+            ),
         )
 
         # ------------------------------------------------------------------
         # Dashboard
         # ------------------------------------------------------------------
-        dashboard = cw.Dashboard(self, "Dashboard", dashboard_name="bedrock-per-user-quota-gateway")
+        dashboard = cw.Dashboard(
+            self,
+            "Dashboard",
+            # Preserve the deployed dashboard name for in-place upgrades.
+            dashboard_name="bedrock-per-user-quota-gateway",
+        )
 
         def search_widget(title: str, metric: str, stat: str = "Sum") -> cw.GraphWidget:
             return cw.GraphWidget(
@@ -718,7 +771,7 @@ class QuotaGatewayStack(Stack):
             search_widget("Requests per user", "Requests"),
         )
         dashboard.add_widgets(
-            search_widget("Quota throttles (429) per user", "Throttles"),
+            search_widget("Credential vends per user", "CredentialsVended"),
             cw.GraphWidget(
                 title="Tokens (all users)",
                 width=12,
@@ -734,8 +787,19 @@ class QuotaGatewayStack(Stack):
         # ------------------------------------------------------------------
         # Outputs
         # ------------------------------------------------------------------
-        cdk.CfnOutput(self, "GatewayUrl", value=fn_url.url,
-                      description="Set this (plus /v1) as base_url in OpenAI/Anthropic SDKs")
+        cdk.CfnOutput(
+            self,
+            "BrokerApiUrl",
+            value=fn_url.url,
+            description="AWS_IAM Function URL for credential vending and administration",
+        )
+        # Backwards-compatible output name for existing scripts and notebooks.
+        cdk.CfnOutput(
+            self,
+            "GatewayUrl",
+            value=fn_url.url,
+            description="Deprecated alias of BrokerApiUrl",
+        )
         cdk.CfnOutput(self, "AdminKeySecretArn", value=admin_secret.secret_arn)
         cdk.CfnOutput(self, "UsersTableName", value=users_table.table_name)
         cdk.CfnOutput(self, "UsageTableName", value=usage_table.table_name)
@@ -745,11 +809,21 @@ class QuotaGatewayStack(Stack):
         cdk.CfnOutput(self, "InvocationLogGroup", value=invocation_log_group.log_group_name,
                       description="Bedrock model-invocation logs used for per-user metering.")
         cdk.CfnOutput(self, "JwtIssuer", value=jwt_issuer,
-                      description="OIDC issuer whose JWTs the gateway accepts")
+                      description="OIDC issuer whose JWTs the broker accepts")
         cdk.CfnOutput(self, "DenyDirectBedrockPolicyArn", value=deny_direct.managed_policy_arn,
-                      description="Attach to non-gateway roles to prevent bypassing the gateway")
-        cdk.CfnOutput(self, "GatewayRoleArn", value=gateway_fn.role.role_arn,
-                      description="Role used by the Mode B gateway to invoke Bedrock")
+                      description="Attach to non-vended roles to prevent quota bypass")
+        cdk.CfnOutput(
+            self,
+            "BrokerApiRoleArn",
+            value=broker_api_fn.role.role_arn,
+            description="Control-plane role; it cannot invoke Bedrock models",
+        )
+        cdk.CfnOutput(
+            self,
+            "GatewayRoleArn",
+            value=broker_api_fn.role.role_arn,
+            description="Deprecated alias of BrokerApiRoleArn",
+        )
         cdk.CfnOutput(
             self, "ModelPriceSnapshot",
             value=model_prices_json,

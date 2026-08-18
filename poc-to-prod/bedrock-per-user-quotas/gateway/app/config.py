@@ -4,7 +4,6 @@ Everything is driven by environment variables so the same code runs in
 Lambda (set by CDK) and locally (uvicorn + a .env file).
 """
 
-import json
 import os
 from dataclasses import dataclass, field
 
@@ -13,31 +12,11 @@ def _env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
-def _env_string_set(name: str) -> frozenset[str]:
-    raw = _env(name, "[]")
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"{name} must contain a JSON array") from exc
-    if not isinstance(parsed, list) or any(
-        not isinstance(item, str) or not item for item in parsed
-    ):
-        raise ValueError(f"{name} must contain a JSON array of non-empty strings")
-    return frozenset(parsed)
-
-
 @dataclass(frozen=True)
 class Settings:
-    # --- upstream (bedrock-mantle) ---
-    aws_region: str = field(default_factory=lambda: _env("MANTLE_REGION", _env("AWS_REGION", "us-east-1")))
-    # Full base URL wins if set; otherwise it is derived from the region.
-    mantle_base_url: str = field(default_factory=lambda: _env("MANTLE_BASE_URL", ""))
-
-    # Bedrock Project (Mantle cost-attribution boundary) applied to Mode B
-    # inference when a user has no per-user mantle_project_id. "default" is the
-    # account's built-in project; set your own via DEFAULT_MANTLE_PROJECT_ID.
-    default_mantle_project_id: str = field(
-        default_factory=lambda: _env("DEFAULT_MANTLE_PROJECT_ID", "default"))
+    aws_region: str = field(
+        default_factory=lambda: _env("AWS_REGION", "us-east-1")
+    )
 
     # --- storage ---
     users_table: str = field(default_factory=lambda: _env("USERS_TABLE", "bedrock-quota-users"))
@@ -79,11 +58,6 @@ class Settings:
 
     # --- metrics ---
     metrics_namespace: str = field(default_factory=lambda: _env("METRICS_NAMESPACE", "BedrockQuotaGateway"))
-    # Reconciler cadence, surfaced read-only by GET /admin/summary so the UI can
-    # display it. It is set at deploy time on the EventBridge rule; this env var
-    # is informational only (changing it here does NOT change the schedule).
-    reconciler_interval_minutes: int = field(
-        default_factory=lambda: int(_env("RECONCILER_INTERVAL_MINUTES", "5")))
 
     # --- quota defaults applied to newly created users (admin API) ---
     default_daily_usd: float = field(default_factory=lambda: float(_env("DEFAULT_DAILY_USD", "1.0")))
@@ -93,31 +67,6 @@ class Settings:
     # timestamp; it is not the quota-window reset mechanism.
     usage_retention_days: int = field(
         default_factory=lambda: int(_env("USAGE_RETENTION_DAYS", "35")))
-
-    # Mode B application allowlist. Empty preserves compatibility by allowing
-    # every model ID; Mode A uses a separate IAM resource-ARN allowlist.
-    mode_b_allowed_model_ids: frozenset[str] = field(
-        default_factory=lambda: _env_string_set("MODE_B_ALLOWED_MODEL_IDS_JSON"))
-
-    # Output-token reservation used when the request does not specify
-    # max_tokens / max_output_tokens. Deliberately conservative.
-    fallback_max_output_tokens: int = field(default_factory=lambda: int(_env("FALLBACK_MAX_OUTPUT_TOKENS", "4096")))
-
-    # chars-per-token heuristic used for pre-flight input estimation.
-    chars_per_token: float = field(default_factory=lambda: float(_env("CHARS_PER_TOKEN", "4.0")))
-
-    request_timeout_seconds: float = field(default_factory=lambda: float(_env("REQUEST_TIMEOUT_SECONDS", "300")))
-
-    @property
-    def base_url(self) -> str:
-        """Root of the bedrock-mantle endpoint (no /v1 suffix).
-
-        OpenAI APIs live under /v1/..., the Anthropic Messages API lives
-        under /anthropic/v1/... .
-        """
-        if self.mantle_base_url:
-            return self.mantle_base_url.rstrip("/")
-        return f"https://bedrock-mantle.{self.aws_region}.api.aws"
 
 
 settings = Settings()

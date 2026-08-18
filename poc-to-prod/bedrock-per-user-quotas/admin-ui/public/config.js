@@ -5,7 +5,7 @@
 // reads window.QUOTA_ADMIN_CONFIG at load time so one build works for any
 // deployment. Do NOT put any secret here; these are all public identifiers.
 window.QUOTA_ADMIN_CONFIG = {
-  // CfnOutput GatewayUrl (Function URL, e.g. https://xxxx.lambda-url.us-east-1.on.aws/)
+  // CfnOutput BrokerApiUrl (AWS_IAM Function URL)
   gatewayUrl: "",
   region: "us-east-1",
   // CfnOutput DemoUserPoolId / DemoUserPoolClientId

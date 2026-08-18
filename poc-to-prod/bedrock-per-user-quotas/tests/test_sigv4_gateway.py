@@ -17,9 +17,9 @@ def test_httpx_auth_preserves_user_token_outside_authorization():
     )
     request = httpx.Request(
         "POST",
-        "https://example.lambda-url.us-east-1.on.aws/v1/responses",
+        "https://example.lambda-url.us-east-1.on.aws/v1/credentials",
         headers={"Authorization": "Bearer sdk-api-key"},
-        json={"model": "example", "input": "hello"},
+        content=b"",
     )
 
     signed = next(auth.auth_flow(request))

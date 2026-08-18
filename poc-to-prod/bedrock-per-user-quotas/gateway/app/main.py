@@ -1,59 +1,41 @@
-"""Per-user quota gateway for Amazon Bedrock.
+"""Control plane for runtime-only Amazon Bedrock per-user quotas.
 
-Users authenticate with the JWT their application already uses (any OIDC
-IdP — Cognito, Okta, Auth0, ...); the quota identity is a configurable claim
-(default ``sub``). Two enforcement modes share this app:
-
-- **Mode A — credential broker** (``POST /v1/credentials``, recommended):
-  verifies the JWT, checks the user's budget, and vends short-lived AWS
-  credentials so the app calls ``bedrock-runtime`` natively (any API/provider).
-  The gateway is out of the data path; metering is done asynchronously by the
-  reconciler from Bedrock model-invocation logs.
-
-- **Mode B — inline proxy** (``/v1/*`` and ``/anthropic/v1/*``): a drop-in
-  OpenAI/Anthropic-compatible proxy for the ``bedrock-mantle`` endpoint that
-  reserves each request's worst case against the user's daily budgets, forwards
-  it with a short-term Bedrock token minted from the gateway's own IAM role,
-  then settles the counters with real usage (including from SSE streams).
-  Over-budget requests receive HTTP 429 before any tokens are spent upstream.
-
-      client = OpenAI(
-          base_url="https://<gateway>/v1",
-          http_client=httpx.Client(
-              auth=FunctionUrlSigV4Auth("<user's JWT>", "<region>")
-          ),
-      )
+The application is deliberately not an inference proxy. It authenticates an
+OIDC identity, checks the latest event-driven usage aggregate, and vends a
+short-lived STS session that calls ``bedrock-runtime`` directly. The same API
+provides administrative quota management.
 """
 
-import json
+from __future__ import annotations
+
 import math
-import time
 from datetime import datetime, timezone
 
 import boto3
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 
 from . import emf
-from .auth import Identity, JwtError, JwtVerifier, extract_bearer, extract_user_token
+from .auth import (
+    Identity,
+    JwtError,
+    JwtVerifier,
+    extract_bearer,
+    extract_user_token,
+)
 from .broker import BrokerError, CredentialBroker
 from .config import settings
-from .metering import (
-    SseUsageExtractor,
-    estimate_input_tokens,
-    extract_usage_json,
-    requested_max_output_tokens,
-)
-from .pricing import MICRO
-from .quota import QuotaStore, Reservation, UserRecord
-from .upstream import MantleClient, response_headers
+from .quota import MICRO, QuotaStore, UserRecord
 
-app = FastAPI(title="Bedrock per-user quota gateway", docs_url=None, redoc_url=None)
+app = FastAPI(
+    title="Amazon Bedrock Runtime quota broker",
+    docs_url=None,
+    redoc_url=None,
+)
 
 _store: QuotaStore | None = None
-_mantle: MantleClient | None = None
 _verifier: JwtVerifier | None = None
-_broker: "CredentialBroker | None" = None
+_broker: CredentialBroker | None = None
 _admin_key: str | None = None
 
 
@@ -64,13 +46,6 @@ def store() -> QuotaStore:
     return _store
 
 
-def mantle() -> MantleClient:
-    global _mantle
-    if _mantle is None:
-        _mantle = MantleClient()
-    return _mantle
-
-
 def verifier() -> JwtVerifier:
     global _verifier
     if _verifier is None:
@@ -78,7 +53,7 @@ def verifier() -> JwtVerifier:
     return _verifier
 
 
-def broker() -> "CredentialBroker":
+def broker() -> CredentialBroker:
     global _broker
     if _broker is None:
         _broker = CredentialBroker()
@@ -86,114 +61,79 @@ def broker() -> "CredentialBroker":
 
 
 def admin_key() -> str:
-    """Admin key from Secrets Manager (ADMIN_KEY_SECRET_ARN) or env (local dev)."""
     global _admin_key
     if _admin_key is None:
         import os
+
         secret_arn = os.environ.get("ADMIN_KEY_SECRET_ARN")
         if secret_arn:
-            sm = boto3.client("secretsmanager", region_name=settings.aws_region)
-            _admin_key = sm.get_secret_value(SecretId=secret_arn)["SecretString"]
+            secrets = boto3.client(
+                "secretsmanager", region_name=settings.aws_region
+            )
+            _admin_key = secrets.get_secret_value(
+                SecretId=secret_arn
+            )["SecretString"]
         else:
             _admin_key = os.environ.get("ADMIN_API_KEY", "")
     return _admin_key
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _error(status: int, message: str, err_type: str, headers: dict | None = None) -> JSONResponse:
-    """OpenAI-style error body — SDKs surface these messages verbatim."""
+def _error(
+    status: int,
+    message: str,
+    error_type: str,
+    headers: dict | None = None,
+) -> JSONResponse:
     return JSONResponse(
         status_code=status,
-        content={"error": {"message": message, "type": err_type, "code": err_type}},
+        content={
+            "error": {
+                "message": message,
+                "type": error_type,
+                "code": error_type,
+            }
+        },
         headers=headers or {},
     )
 
 
 def _authenticate(request: Request) -> tuple[UserRecord | None, str]:
-    """Verify the caller's JWT and resolve the quota user record.
-
-    Returns (user, "") on success or (None, reason) on failure. The token
-    is normally read from X-Quota-User-Token so SigV4 can own Authorization.
-    Bearer Authorization and x-api-key remain supported for local deployments.
-    """
     token = extract_user_token(request.headers)
     if not token:
         return None, "Missing bearer token."
     try:
         identity: Identity = verifier().verify(token)
-    except JwtError as e:
-        return None, e.reason
+    except JwtError as exc:
+        return None, exc.reason
 
-    user = store().get_user(identity.user_id, use_cache=True)
+    user = store().get_user(identity.user_id)
     if user is None:
         if not settings.auto_provision_users:
-            return None, f"User '{identity.user_id}' is not provisioned on this gateway."
+            return (
+                None,
+                f"User '{identity.user_id}' is not provisioned on this broker.",
+            )
         display_name = str(
             identity.claims.get("email")
             or identity.claims.get("username")
             or identity.claims.get("cognito:username")
             or identity.user_id
         )
-        user = store().get_or_provision_user(identity.user_id, name=display_name)
+        user = store().get_or_provision_user(
+            identity.user_id, name=display_name
+        )
     return user, ""
 
 
-def _quota_headers(user: UserRecord, remaining_usd_micro: int | None) -> dict[str, str]:
-    # A 0 USD limit means "unlimited" (see quota._UNLIMITED_HEADROOM), so
-    # report "unlimited" rather than a misleading 0.000000 cap/remaining.
-    if not user.daily_usd_micro:
-        return {"X-Quota-Limit-USD": "unlimited"}
-    headers = {"X-Quota-Limit-USD": f"{user.daily_usd_micro / MICRO:.6f}"}
-    if remaining_usd_micro is not None:
-        headers["X-Quota-Remaining-USD"] = f"{max(remaining_usd_micro, 0) / MICRO:.6f}"
-    return headers
-
-
-def _model_allowed(model_id: str) -> bool:
-    allowed = settings.mode_b_allowed_model_ids
-    return not allowed or model_id in allowed
-
-
-def _mantle_project_for(user: UserRecord) -> str:
-    """Managed Bedrock Project for this user's Mode B traffic: the per-user
-    mantle_project_id if set, else the deployment default. Client-supplied
-    OpenAI-Project headers are never used (they aren't forwarded upstream)."""
-    return user.mantle_project_id or settings.default_mantle_project_id
-
-
-def _model_not_allowed(model_id: str) -> JSONResponse:
-    return _error(
-        403,
-        f"Model '{model_id}' is not allowed by this Mode B deployment.",
-        "model_not_allowed",
-    )
-
-
-# ---------------------------------------------------------------------------
-# Credential broker: the primary, API-agnostic path.
-#
-# Instead of proxying inference, hand an in-budget user short-lived AWS
-# credentials (RoleSessionName + SourceIdentity = a sanitized id derived from
-# their identity claim, reverse-mapped for metering) so they can
-# call Bedrock natively on any API/provider. Enforcement is at vend time:
-# blocked/over-budget users get 403 and simply can't obtain fresh creds, so
-# they lose access at their current session's TTL (bounded overspend).
-# ---------------------------------------------------------------------------
-
-def _is_over_budget(user: UserRecord) -> bool:
-    """Same-window budget check used to gate credential vending."""
-    usage = store().get_window_usage(user.user_id)
-    cost_micro = int(round(usage.get("cost_usd", 0.0) * MICRO))
-    if user.daily_usd_micro and cost_micro >= user.daily_usd_micro:
-        return True
-    if user.daily_input_tokens and usage.get("input_tokens", 0) >= user.daily_input_tokens:
-        return True
-    if user.daily_output_tokens and usage.get("output_tokens", 0) >= user.daily_output_tokens:
-        return True
-    return False
+def _quota_headers(user: UserRecord) -> dict[str, str]:
+    return {
+        "X-Quota-Limit-USD": (
+            f"{user.daily_usd_micro / MICRO:.6f}"
+            if user.daily_usd_micro
+            else "unlimited"
+        ),
+        "X-Quota-Window": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+    }
 
 
 @app.post("/v1/credentials")
@@ -201,302 +141,64 @@ async def vend_credentials(request: Request) -> Response:
     user, auth_error = _authenticate(request)
     if user is None:
         return _error(401, auth_error, "authentication_error")
+
+    user = store().refresh_auto_status(user)
     if not user.active:
-        return _error(403, f"User '{user.user_id}' is {user.status}.", "quota_blocked",
-                      headers=_quota_headers(user, None))
-    if _is_over_budget(user):
-        # Reflect the block so the reconciler/alerts and future vends agree.
-        store().set_user_status(user.user_id, "blocked", "auto: over budget at vend time")
+        return _error(
+            403,
+            f"User '{user.user_id}' is {user.status}.",
+            "quota_blocked",
+            headers=_quota_headers(user),
+        )
+    if store().is_over_budget(user):
+        store().set_user_status(
+            user.user_id,
+            "blocked",
+            "auto: quota exhausted at credential vend",
+        )
         emf.record_throttle(user.user_id, "-", "over-budget-at-vend")
-        return _error(429, "Daily quota exhausted; credentials not issued.",
-                      "quota_exceeded", headers=_quota_headers(user, 0))
-
-    try:
-        creds = broker().vend(Identity(user_id=user.user_id, claims={}))
-    except BrokerError as e:
-        return _error(e.status, e.reason, "broker_error")
-
-    # Persist RoleSessionName -> user_id so the reconciler can attribute
-    # model-invocation-log usage (which carries the session name in the ARN)
-    # back to this user's budget row.
-    store().record_session(creds.session_name, user.user_id)
-    emf.record_credentials_vended(user.user_id)
-
-    return JSONResponse(
-        {
-            "aws_access_key_id": creds.access_key_id,
-            "aws_secret_access_key": creds.secret_access_key,
-            "aws_session_token": creds.session_token,
-            "expiration": creds.expiration,
-            "region": settings.aws_region,
-            "user_id": creds.user_id,
-        },
-        headers=_quota_headers(user, None),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Inference proxy (Responses / Chat Completions / Anthropic Messages)
-# ---------------------------------------------------------------------------
-
-async def _proxy_inference(request: Request, path: str) -> Response:
-    user, auth_error = _authenticate(request)
-    if user is None:
-        return _error(401, f"Unauthorized: {auth_error}", "invalid_api_key")
-
-    raw = await request.body()
-    try:
-        body = json.loads(raw)
-        assert isinstance(body, dict)
-    except (ValueError, AssertionError):
-        return _error(400, "Request body must be a JSON object.", "invalid_request_error")
-
-    model_id = body.get("model")
-    if not isinstance(model_id, str) or not model_id:
-        return _error(400, "Missing required field: model.", "invalid_request_error")
-    if not _model_allowed(model_id):
-        return _model_not_allowed(model_id)
-
-    streaming = bool(body.get("stream", False))
-
-    # --- reserve -------------------------------------------------------
-    est_in = estimate_input_tokens(body, settings.chars_per_token)
-    max_out = requested_max_output_tokens(body, settings.fallback_max_output_tokens)
-    decision = store().reserve(user, model_id, est_in, max_out)
-    if not decision.allowed:
-        emf.record_throttle(user.user_id, model_id, decision.reason)
         return _error(
             429,
-            f"Daily quota exceeded for user '{user.user_id}': {decision.reason}. "
-            "The quota resets at 00:00 UTC.",
+            "Daily quota exhausted; credentials not issued.",
             "quota_exceeded",
-            headers=_quota_headers(user, 0),
-        )
-    reservation = decision.reservation
-    assert reservation is not None
-
-    # Chat Completions streams only report usage when asked to.
-    if streaming and path == "/v1/chat/completions":
-        opts = body.get("stream_options") or {}
-        opts["include_usage"] = True
-        body["stream_options"] = opts
-        raw = json.dumps(body).encode("utf-8")
-
-    started = time.monotonic()
-    incoming = dict(request.headers)
-    project_id = _mantle_project_for(user)
-
-    if streaming:
-        return await _stream_upstream(user, reservation, model_id, path, raw, incoming, started, decision, project_id)
-    return await _forward_upstream(user, reservation, model_id, path, raw, incoming, started, decision, project_id)
-
-
-async def _forward_upstream(user, reservation: Reservation, model_id, path, raw,
-                            incoming, started, decision, project_id=None) -> Response:
-    try:
-        upstream = await mantle().post_json(path, raw, incoming, project_id)
-    except Exception:
-        store().settle(reservation, None, None, failed=True)
-        emf.record_error(user.user_id, model_id, 502)
-        return _error(502, "Upstream bedrock-mantle request failed.", "upstream_error")
-
-    latency_ms = (time.monotonic() - started) * 1000
-
-    if upstream.status_code >= 400:
-        # Nothing was generated — release the reservation, pass the error through.
-        store().settle(reservation, None, None, failed=True)
-        emf.record_error(user.user_id, model_id, upstream.status_code)
-        return Response(
-            content=upstream.content,
-            status_code=upstream.status_code,
-            headers=response_headers(upstream),
+            headers=_quota_headers(user),
         )
 
     try:
-        usage = extract_usage_json(upstream.json())
-    except ValueError:
-        usage = None
-
-    if usage and usage.found:
-        cost_micro = store().settle(
-            reservation, usage.input_tokens, usage.output_tokens,
-            cache_write_tokens=usage.cache_write_tokens,
-            cache_read_tokens=usage.cache_read_tokens,
+        credentials = broker().vend(
+            Identity(user_id=user.user_id, claims={})
         )
-        in_tokens = usage.input_tokens + usage.cache_write_tokens + usage.cache_read_tokens
-        out_tokens = usage.output_tokens
-    else:
-        cost_micro = store().settle(reservation, None, None)
-        in_tokens = reservation.reserved_input_tokens
-        out_tokens = reservation.reserved_output_tokens
-    emf.record_request(user.user_id, model_id, in_tokens, out_tokens,
-                       cost_micro / MICRO, latency_ms, upstream.status_code)
+    except BrokerError as exc:
+        return _error(exc.status, exc.reason, "broker_error")
 
-    headers = response_headers(upstream)
-    headers.update(_quota_headers(user, decision.remaining_usd_micro))
-    return Response(content=upstream.content, status_code=upstream.status_code, headers=headers)
-
-
-async def _stream_upstream(user, reservation: Reservation, model_id, path, raw,
-                           incoming, started, decision, project_id=None) -> Response:
-    try:
-        upstream = await mantle().post_stream(path, raw, incoming, project_id)
-    except Exception:
-        store().settle(reservation, None, None, failed=True)
-        emf.record_error(user.user_id, model_id, 502)
-        return _error(502, "Upstream bedrock-mantle request failed.", "upstream_error")
-
-    if upstream.status_code >= 400:
-        content = await upstream.aread()
-        await upstream.aclose()
-        store().settle(reservation, None, None, failed=True)
-        emf.record_error(user.user_id, model_id, upstream.status_code)
-        return Response(content=content, status_code=upstream.status_code,
-                        headers=response_headers(upstream))
-
-    extractor = SseUsageExtractor()
-
-    async def tee():
-        try:
-            async for chunk in upstream.aiter_bytes():
-                extractor.feed(chunk)
-                yield chunk
-        finally:
-            await upstream.aclose()
-            extractor.close()
-            usage = extractor.usage
-            if usage.found:
-                cost_micro = store().settle(
-                    reservation, usage.input_tokens, usage.output_tokens,
-                    cache_write_tokens=usage.cache_write_tokens,
-                    cache_read_tokens=usage.cache_read_tokens,
-                )
-                in_tokens = usage.input_tokens + usage.cache_write_tokens + usage.cache_read_tokens
-                out_tokens = usage.output_tokens
-            else:
-                cost_micro = store().settle(reservation, None, None)
-                in_tokens = reservation.reserved_input_tokens
-                out_tokens = reservation.reserved_output_tokens
-            emf.record_request(
-                user.user_id, model_id, in_tokens, out_tokens,
-                cost_micro / MICRO, (time.monotonic() - started) * 1000, upstream.status_code,
-            )
-
-    headers = response_headers(upstream)
-    headers.update(_quota_headers(user, decision.remaining_usd_micro))
-    return StreamingResponse(tee(), status_code=upstream.status_code,
-                             headers=headers, media_type="text/event-stream")
-
-
-@app.post("/v1/responses")
-async def responses(request: Request) -> Response:
-    return await _proxy_inference(request, "/v1/responses")
-
-
-@app.post("/v1/chat/completions")
-async def chat_completions(request: Request) -> Response:
-    return await _proxy_inference(request, "/v1/chat/completions")
-
-
-@app.post("/anthropic/v1/messages")
-async def anthropic_messages(request: Request) -> Response:
-    # Mirrors mantle's own path: Anthropic SDK users set
-    # base_url = "<gateway>/anthropic".
-    return await _proxy_inference(request, "/anthropic/v1/messages")
-
-
-@app.post("/v1/messages")
-async def anthropic_messages_alias(request: Request) -> Response:
-    # Convenience alias for clients that put everything under /v1 — this is
-    # also the path Claude Code hits when ANTHROPIC_BASE_URL points here.
-    return await _proxy_inference(request, "/anthropic/v1/messages")
-
-
-# Pass-throughs that don't consume the generation quota -------------------
-
-@app.post("/anthropic/v1/messages/count_tokens")
-@app.post("/v1/messages/count_tokens")
-async def count_tokens(request: Request) -> Response:
-    """Token counting (used heavily by Claude Code). Free — no reservation."""
-    user, auth_error = _authenticate(request)
-    if user is None:
-        return _error(401, f"Unauthorized: {auth_error}", "invalid_api_key")
-    raw = await request.body()
-    try:
-        body = json.loads(raw)
-        model_id = body.get("model")
-    except (ValueError, AttributeError):
-        return _error(400, "Request body must be a JSON object.",
-                      "invalid_request_error")
-    if not isinstance(model_id, str) or not model_id:
-        return _error(400, "Missing required field: model.", "invalid_request_error")
-    if not _model_allowed(model_id):
-        return _model_not_allowed(model_id)
-    upstream = await mantle().post_json("/anthropic/v1/messages/count_tokens",
-                                        raw, dict(request.headers))
-    return Response(content=upstream.content, status_code=upstream.status_code,
-                    headers=response_headers(upstream))
-
-@app.get("/v1/models")
-async def list_models(request: Request) -> Response:
-    user, auth_error = _authenticate(request)
-    if user is None:
-        return _error(401, f"Unauthorized: {auth_error}", "invalid_api_key")
-    upstream = await mantle().get("/v1/models", {})
-    content = upstream.content
-    if settings.mode_b_allowed_model_ids and upstream.status_code < 400:
-        try:
-            payload = upstream.json()
-            if isinstance(payload, dict) and isinstance(payload.get("data"), list):
-                payload["data"] = [
-                    model for model in payload["data"]
-                    if isinstance(model, dict)
-                    and str(model.get("id", "")) in settings.mode_b_allowed_model_ids
-                ]
-                content = json.dumps(payload).encode("utf-8")
-        except ValueError:
-            pass
-    return Response(content=content, status_code=upstream.status_code,
-                    headers=response_headers(upstream))
-
-
-@app.get("/v1/responses/{response_id}")
-async def get_response(response_id: str, request: Request) -> Response:
-    user, auth_error = _authenticate(request)
-    if user is None:
-        return _error(401, f"Unauthorized: {auth_error}", "invalid_api_key")
-    upstream = await mantle().get(f"/v1/responses/{response_id}", dict(request.headers))
-    return Response(content=upstream.content, status_code=upstream.status_code,
-                    headers=response_headers(upstream))
-
-
-@app.delete("/v1/responses/{response_id}")
-async def delete_response(response_id: str, request: Request) -> Response:
-    """Stored-response cleanup (Codex and other Responses-API agents)."""
-    user, auth_error = _authenticate(request)
-    if user is None:
-        return _error(401, f"Unauthorized: {auth_error}", "invalid_api_key")
-    upstream = await mantle().delete(f"/v1/responses/{response_id}", dict(request.headers))
-    return Response(content=upstream.content, status_code=upstream.status_code,
-                    headers=response_headers(upstream))
+    store().record_session(credentials.session_name, user.user_id)
+    emf.record_credentials_vended(user.user_id)
+    return JSONResponse(
+        {
+            "aws_access_key_id": credentials.access_key_id,
+            "aws_secret_access_key": credentials.secret_access_key,
+            "aws_session_token": credentials.session_token,
+            "expiration": credentials.expiration,
+            "region": settings.aws_region,
+            "user_id": credentials.user_id,
+            "endpoint": (
+                f"https://bedrock-runtime.{settings.aws_region}.amazonaws.com"
+            ),
+        },
+        headers=_quota_headers(user),
+    )
 
 
 @app.get("/healthz")
 async def healthz() -> dict:
-    return {"status": "ok", "upstream": settings.base_url}
+    return {
+        "status": "ok",
+        "inference_endpoint": "bedrock-runtime",
+        "metering": "cloudwatch-logs-subscription",
+    }
 
-
-# ---------------------------------------------------------------------------
-# Admin API
-# ---------------------------------------------------------------------------
 
 def _jwt_grants_admin(token: str) -> bool:
-    """True if a verified JWT carries the configured admin claim/value.
-
-    Lets the browser UI authorize with a normal corporate login (via the
-    X-Quota-User-Token / Authorization path) instead of ever holding the
-    shared admin secret. Disabled unless ADMIN_JWT_CLAIM is configured.
-    """
     claim = settings.admin_jwt_claim
     if not claim:
         return False
@@ -514,8 +216,6 @@ def _jwt_grants_admin(token: str) -> bool:
 
 
 def _require_admin(request: Request) -> JSONResponse | None:
-    # 1) Shared admin key (CLI / server-to-server), via X-Quota-Admin-Key or
-    #    Authorization: Bearer.
     provided = extract_bearer(request.headers.get("x-quota-admin-key"))
     if not provided:
         authorization = request.headers.get("authorization")
@@ -524,7 +224,6 @@ def _require_admin(request: Request) -> JSONResponse | None:
     expected = admin_key()
     if expected and provided and provided == expected:
         return None
-    # 2) Admin-by-JWT (browser UI): a verified token with the admin claim.
     token = extract_user_token(request.headers)
     if token and _jwt_grants_admin(token):
         return None
@@ -559,29 +258,15 @@ def _limits_json(user: UserRecord) -> dict:
     }
 
 
-def _parse_mantle_project(body: dict) -> tuple[str, str]:
-    """Extract an optional mantle_project_id from an admin body.
-
-    Returns (project_id, "") on success (project_id is "" when unset) or
-    ("", error_message) when the field is present but invalid.
-    """
-    if "mantle_project_id" not in body:
-        return "", ""
-    raw = body["mantle_project_id"]
-    if raw is None:
-        return "", ""
-    if not isinstance(raw, str):
-        return "", "mantle_project_id must be a string."
-    return raw.strip(), ""
-
-
-def _parse_limits(body: dict, *, with_defaults: bool) -> tuple[dict, str]:
+def _parse_limits(
+    body: dict, *, with_defaults: bool
+) -> tuple[dict, str]:
     defaults = {
         "daily_usd": settings.default_daily_usd,
         "daily_input_tokens": settings.default_daily_input_tokens,
         "daily_output_tokens": settings.default_daily_output_tokens,
     }
-    values = {}
+    values: dict = {}
     for field_name, default in defaults.items():
         if field_name not in body:
             if with_defaults:
@@ -607,126 +292,128 @@ def _parse_limits(body: dict, *, with_defaults: bool) -> tuple[dict, str]:
 
 @app.post("/admin/users")
 async def create_user(request: Request) -> Response:
-    """Pre-provision a user (by their IdP subject) with non-default limits.
-
-    Optional when AUTO_PROVISION_USERS is on — users appear automatically
-    with default limits on their first authenticated request.
-    """
-    if (deny := _require_admin(request)) is not None:
-        return deny
+    if (denied := _require_admin(request)) is not None:
+        return denied
     body, error = await _admin_json_object(request)
     if error is not None:
         return error
     assert body is not None
     user_id = body.get("user_id")
     if not isinstance(user_id, str) or not user_id.strip():
-        return _error(400, "user_id is required (the IdP subject / configured claim value).",
-                      "invalid_request_error")
+        return _error(
+            400,
+            "user_id is required (the configured JWT claim value).",
+            "invalid_request_error",
+        )
     user_id = user_id.strip()
     name = body.get("name", user_id)
     if not isinstance(name, str) or not name.strip():
-        return _error(400, "name must be a non-empty string.",
-                      "invalid_request_error")
+        return _error(
+            400, "name must be a non-empty string.", "invalid_request_error"
+        )
     limits, limit_error = _parse_limits(body, with_defaults=True)
     if limit_error:
         return _error(400, limit_error, "invalid_request_error")
-    project_id, project_error = _parse_mantle_project(body)
-    if project_error:
-        return _error(400, project_error, "invalid_request_error")
-    store().put_user(
-        user_id=user_id,
-        name=name.strip(),
-        mantle_project_id=project_id,
-        **limits,
-    )
+    store().put_user(user_id=user_id, name=name.strip(), **limits)
     user = store().get_user(user_id)
     assert user is not None
-    return JSONResponse({
-        "user_id": user_id,
-        "provisioned": True,
-        "limits": _limits_json(user),
-        "mantle_project_id": user.mantle_project_id,
-    })
+    return JSONResponse(
+        {
+            "user_id": user_id,
+            "provisioned": True,
+            "limits": _limits_json(user),
+        }
+    )
 
 
 @app.get("/admin/users")
-async def list_users(request: Request, limit: int = 50,
-                     cursor: str | None = None) -> Response:
-    if (deny := _require_admin(request)) is not None:
-        return deny
+async def list_users(
+    request: Request, limit: int = 50, cursor: str | None = None
+) -> Response:
+    if (denied := _require_admin(request)) is not None:
+        return denied
     if limit < 1 or limit > 1000:
-        return _error(400, "limit must be between 1 and 1000.", "invalid_request_error")
+        return _error(
+            400, "limit must be between 1 and 1000.", "invalid_request_error"
+        )
     try:
-        users, next_cursor = store().list_users_page(limit=limit, cursor=cursor)
+        users, next_cursor = store().list_users_page(
+            limit=limit, cursor=cursor
+        )
     except ValueError:
         return _error(400, "Invalid cursor.", "invalid_request_error")
-    out = []
-    for user in users:
-        usage = store().get_window_usage(user.user_id)
-        out.append({
-            "user_id": user.user_id, "name": user.name, "status": user.status,
-            "limits": _limits_json(user),
-            "mantle_project_id": user.mantle_project_id,
-            "today": usage,
-        })
-    return JSONResponse({"users": out, "next_cursor": next_cursor})
+    return JSONResponse(
+        {
+            "users": [
+                {
+                    "user_id": user.user_id,
+                    "name": user.name,
+                    "status": user.status,
+                    "status_reason": user.status_reason,
+                    "limits": _limits_json(user),
+                    "today": store().get_window_usage(user.user_id),
+                }
+                for user in users
+            ],
+            "next_cursor": next_cursor,
+        }
+    )
 
 
 @app.get("/admin/summary")
 async def admin_summary(request: Request) -> Response:
-    """Deployment-wide summary, with enforcement and observability reported
-    SEPARATELY so an operator never conflates the two:
-
-    - enforcement: the authoritative DynamoDB state the gateway acts on
-      (user counts, blocked users, today's aggregate usage). as_of = now.
-    - observability: where the richer per-user metrics live (CloudWatch/EMF).
-      The gateway does not read metrics back, so this block points there
-      rather than duplicating numbers with a different freshness.
-    """
-    if (deny := _require_admin(request)) is not None:
-        return deny
+    if (denied := _require_admin(request)) is not None:
+        return denied
     now = datetime.now(timezone.utc)
     users = store().list_users()
-    blocked = [u.user_id for u in users if not u.active]
-    agg = {"cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0, "requests": 0}
-    for u in users:
-        usage = store().get_window_usage(u.user_id)
-        agg["cost_usd"] += usage.get("cost_usd", 0.0)
-        agg["input_tokens"] += usage.get("input_tokens", 0)
-        agg["output_tokens"] += usage.get("output_tokens", 0)
-        agg["requests"] += usage.get("requests", 0)
-    return JSONResponse({
-        "enforcement": {
-            "source": "dynamodb",
-            "as_of": now.isoformat(),
-            "window": now.strftime("%Y-%m-%d"),
-            "total_users": len(users),
-            "blocked_users": len(blocked),
-            "blocked_user_ids": blocked,
-            "today": agg,
-        },
-        "observability": {
-            "source": "cloudwatch_emf",
-            "metrics_namespace": settings.metrics_namespace,
-            "note": "Per-user metrics (Requests, InputTokens, OutputTokens, "
-                    "EstimatedCostUSD, LatencyMs, Throttles, Errors) are in "
-                    "CloudWatch under this namespace; query there for history.",
-        },
-        "reconciler_interval_minutes": settings.reconciler_interval_minutes,
-    })
+    blocked = [user.user_id for user in users if not user.active]
+    aggregate = {
+        "cost_usd": 0.0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "requests": 0,
+    }
+    for user in users:
+        usage = store().get_window_usage(user.user_id)
+        for key in aggregate:
+            aggregate[key] += usage.get(key, 0)
+    return JSONResponse(
+        {
+            "enforcement": {
+                "mode": "bounded_overspend",
+                "source": "dynamodb",
+                "as_of": now.isoformat(),
+                "window": now.strftime("%Y-%m-%d"),
+                "credential_ttl_seconds": (
+                    settings.vended_credential_ttl_seconds
+                ),
+                "total_users": len(users),
+                "blocked_users": len(blocked),
+                "blocked_user_ids": blocked,
+                "today": aggregate,
+            },
+            "observability": {
+                "source": "bedrock_model_invocation_logs",
+                "delivery": "cloudwatch_logs_subscription",
+                "metrics_namespace": settings.metrics_namespace,
+            },
+        }
+    )
 
 
-@app.get("/admin/users/{user_id}/usage")
-async def user_usage(user_id: str, request: Request, window: str | None = None) -> Response:
-    if (deny := _require_admin(request)) is not None:
-        return deny
+@app.get("/admin/users/{user_id:path}/usage")
+async def user_usage(
+    user_id: str, request: Request, window: str | None = None
+) -> Response:
+    if (denied := _require_admin(request)) is not None:
+        return denied
     return JSONResponse(store().get_window_usage(user_id, window))
 
 
-@app.put("/admin/users/{user_id}/limits")
+@app.put("/admin/users/{user_id:path}/limits")
 async def set_limits(user_id: str, request: Request) -> Response:
-    if (deny := _require_admin(request)) is not None:
-        return deny
+    if (denied := _require_admin(request)) is not None:
+        return denied
     body, error = await _admin_json_object(request)
     if error is not None:
         return error
@@ -739,45 +426,25 @@ async def set_limits(user_id: str, request: Request) -> Response:
     if not limits:
         return _error(
             400,
-            "At least one of daily_usd, daily_input_tokens, or "
-            "daily_output_tokens is required.",
+            "At least one daily quota is required.",
             "invalid_request_error",
         )
     store().set_user_limits(user_id, **limits)
     user = store().get_user(user_id)
     assert user is not None
-    return JSONResponse({
-        "user_id": user_id,
-        "updated": True,
-        "limits": _limits_json(user),
-    })
+    return JSONResponse(
+        {
+            "user_id": user_id,
+            "updated": True,
+            "limits": _limits_json(user),
+        }
+    )
 
 
-@app.put("/admin/users/{user_id}/mantle-project")
-async def set_mantle_project(user_id: str, request: Request) -> Response:
-    """Set or clear a user's managed Bedrock Project for Mantle (Mode B) cost
-    attribution. Send {"mantle_project_id": "proj_x"} to set, "" to clear."""
-    if (deny := _require_admin(request)) is not None:
-        return deny
-    body, error = await _admin_json_object(request)
-    if error is not None:
-        return error
-    assert body is not None
-    if store().get_user(user_id) is None:
-        return _error(404, f"User '{user_id}' was not found.", "not_found")
-    if "mantle_project_id" not in body:
-        return _error(400, "mantle_project_id is required.", "invalid_request_error")
-    project_id, project_error = _parse_mantle_project(body)
-    if project_error:
-        return _error(400, project_error, "invalid_request_error")
-    store().set_user_mantle_project(user_id, project_id)
-    return JSONResponse({"user_id": user_id, "mantle_project_id": project_id})
-
-
-@app.put("/admin/users/{user_id}/status")
+@app.put("/admin/users/{user_id:path}/status")
 async def set_status(user_id: str, request: Request) -> Response:
-    if (deny := _require_admin(request)) is not None:
-        return deny
+    if (denied := _require_admin(request)) is not None:
+        return denied
     body, error = await _admin_json_object(request)
     if error is not None:
         return error
@@ -785,7 +452,18 @@ async def set_status(user_id: str, request: Request) -> Response:
     if store().get_user(user_id) is None:
         return _error(404, f"User '{user_id}' was not found.", "not_found")
     status = body.get("status")
-    if status not in ("active", "blocked"):
-        return _error(400, "status must be 'active' or 'blocked'.", "invalid_request_error")
-    store().set_user_status(user_id, status, body.get("reason", "admin API"))
-    return JSONResponse({"user_id": user_id, "status": status})
+    if status not in {"active", "blocked"}:
+        return _error(
+            400,
+            "status must be 'active' or 'blocked'.",
+            "invalid_request_error",
+        )
+    reason = body.get("reason", "admin API")
+    if not isinstance(reason, str):
+        return _error(
+            400, "reason must be a string.", "invalid_request_error"
+        )
+    store().set_user_status(user_id, status, reason)
+    return JSONResponse(
+        {"user_id": user_id, "status": status, "reason": reason}
+    )

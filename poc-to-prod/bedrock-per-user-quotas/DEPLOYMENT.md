@@ -1,623 +1,600 @@
 # Deployment guide
 
-This is the canonical deployment guide for the Amazon Bedrock per-user quota
-sample. The stack always keeps the Lambda Function URL private with
-`AWS_IAM`; callers use SigV4 and send the end-user JWT separately in
-`X-Quota-User-Token`.
+This is the canonical deployment guide for the runtime-only per-user quota
+sample.
 
 ## Decisions before deployment
 
-Make these decisions before running `cdk deploy`:
-
 | Decision | Demo/personal account | Production/shared account |
 |---|---|---|
-| Identity provider | Stack-created Cognito demo pool | Existing OIDC IdP |
-| Quota identity | `sub` (one budget per user) | IdP-controlled user or tenant claim |
-| Enforcement mode | Mode A, Mode B, or both | Choose per workload; understand their different guarantees |
-| User creation | Auto-provision with defaults | Usually provision during onboarding |
-| Default limits | Small demo limits | Limits approved by the platform owner |
-| Mode B models | Model IDs enforced by the app | Explicit `mode_b_allowed_model_ids` |
-| Mode A models | `*` is convenient | Explicit Bedrock resource ARNs |
-| Function URL callers | Account principals for convenience | Explicit backend role ARNs |
-| Invocation logging | Let the stack manage it | Reuse the account's existing configuration |
-| Usage TTL | 35 days | Retention required by operations/compliance |
-| Stack deletion | `DESTROY` quota tables | `RETAIN` quota tables |
-| Direct Bedrock access | Acceptable for an isolated demo | Deny direct access with IAM/SCP or accept quota bypass |
-| Alerts | Optional email | Owned SNS subscription and response process |
-| Unknown model pricing | Conservative fallback | Review fallback against the most expensive enabled model |
+| Quota identity | JWT `sub` | Stable user, tenant, team, or project claim |
+| IdP | Stack-created Cognito | Existing OIDC IdP |
+| Enforcement | Bounded overspend | Accept and quantify bounded overspend |
+| Credential lifetime | 900 seconds | 900 seconds unless refresh load justifies more |
+| Runtime models | `*` for exploration | Explicit model and inference-profile ARNs |
+| Invocation logging | Stack managed | Reuse centrally managed logging |
+| Log subscription | Dedicated demo group | Confirm subscription-filter capacity and ownership |
+| Auto-provisioning | Enabled | Usually disabled |
+| Function URL callers | Account default | Explicit backend/admin role ARNs |
+| Usage retention | 35 days | Policy-defined value |
+| DynamoDB deletion | `DESTROY` | `RETAIN` |
+| Alerts | Personal email | Operations topic/email |
+| Admin UI | Stack-created Cognito path | Integrate corporate IdP and Identity Pool |
+| Direct Bedrock access | Optional demo deny policy | Required SCP, boundary, or equivalent deny |
+| Price fallback | Conservative default | Review against most expensive allowed model |
 
-### Mode A versus Mode B
+The hard architectural decision is the enforcement guarantee. This sample
+does not inspect each inference request. A user can continue spending with an
+already issued STS session until it expires.
 
-- **Mode A** vends short-lived STS credentials for native
-  `bedrock-runtime` APIs. Bedrock model-invocation logs are reconciled every
-  five minutes. A user may continue spending until the current credentials
-  expire and telemetry is reconciled, so this mode has bounded overspend.
-- **Mode B** proxies `bedrock-mantle`, reserves before the request, and settles
-  from actual usage. A request that cannot fit is rejected with HTTP 429
-  before inference, providing the hard pre-spend cap.
+## Runtime-only request flow
 
-Mode A requires model-invocation logging. Do not grant mantle actions to the
-vended role: mantle traffic is not the reconciler's metering source. Mode B
-does not weaken Mode A's logging requirements.
-
-### User claim versus tenant claim
-
-`jwt_user_claim` is the budget key:
-
-- `sub` gives every end user an independent budget.
-- An IdP-controlled claim such as `custom:tenant_id` shares one budget among
-  all users in that tenant.
-
-The claim must be signed, always present, and not editable by the end user.
-The gateway trusts one issuer per deployment. Deploy separate stacks or add
-issuer namespacing before accepting multiple issuers.
-
-### Cognito demo versus your IdP
-
-When `jwt_issuer` is empty, the stack creates a Cognito user pool and app
-client for demonstration. It is not an application onboarding system.
-Production should set `jwt_issuer`, normally set `jwt_audience`, and optionally
-set `jwt_jwks_url` only when OIDC discovery does not expose `jwks_uri`.
-
-## Prerequisites
-
-- Python 3.12 or newer, Node.js, the AWS CDK CLI, AWS CLI v2, `jq`, and a
-  running Docker-compatible container engine for Lambda asset bundling.
-- AWS credentials for the target account and region, plus permission to
-  bootstrap/deploy CloudFormation, IAM, Lambda, DynamoDB, CloudWatch, SNS,
-  Secrets Manager, Cognito when used, and `pricing:GetProducts`.
-- Bedrock model access for every configured model and access to the
-  `bedrock-mantle` endpoint when using Mode B.
-- In shared accounts, an existing model-invocation log group and confirmation
-  from its owner that Bedrock is already delivering the required records.
-
-Install the CDK CLI if it is not already available:
-
-```bash
-npm install --global aws-cdk
-cdk --version
-aws --version
-```
+1. The application obtains a JWT from Cognito or its own OIDC IdP.
+2. An authorized AWS principal SigV4-signs `POST /v1/credentials` to the
+   broker's `AWS_IAM` Function URL and sends the JWT in
+   `X-Quota-User-Token`.
+3. The broker verifies issuer, audience, signature, expiry, and the configured
+   identity claim.
+4. DynamoDB provides status, limits, and the latest daily usage.
+5. The broker assumes `BedrockUserRole` for 15 minutes and stamps a
+   collision-resistant session identity.
+6. The application calls `bedrock-runtime` directly with those credentials.
+7. Bedrock sends model invocation logs to CloudWatch Logs.
+8. A subscription invokes the usage processor.
+9. The processor deduplicates by Bedrock `requestId`, prices tokens, updates
+   DynamoDB, emits metrics, and sends warnings/blocks.
+10. A blocked identity cannot obtain another session.
 
 ## Configuration
 
-Pass a validated JSON file with:
+Pass a JSON file using:
 
 ```bash
-cdk synth -c deployment_config=config/demo.json
+npx cdk synth -c deployment_config=config/demo.json
 ```
 
-Individual CDK contexts take precedence over the file, preserving existing
-commands such as `-c jwt_issuer=...` and
-`-c invoker_principal_arns=arn1,arn2`.
+Direct `-c key=value` values override the file.
 
-| Key | Default without a file | Validation and effect |
+| Key | Default | Validation and meaning |
 |---|---:|---|
-| `auto_provision_users` | `true` | Boolean; first valid JWT creates a quota row |
-| `default_daily_usd` | `1.0` | Positive number for new users |
-| `default_daily_input_tokens` | `1000000` | Positive integer for new users |
-| `default_daily_output_tokens` | `200000` | Positive integer for new users |
-| `warn_threshold` | `0.8` | Number greater than 0 and less than 1 |
-| `usage_retention_days` | `35` | Positive integer used for usage-row TTL |
-| `retain_tables_on_delete` | `false` | Boolean; maps tables to `RETAIN` or `DESTROY` |
-| `manage_invocation_logging` | no implicit choice | Must be explicitly true, or false with an existing group |
-| `invocation_log_group_name` | empty | Existing group; incompatible with managed logging |
-| `mode_b_allowed_model_ids` | `[]` (allow all) | Application model IDs, never ARNs |
-| `mode_a_allowed_model_arns` | `["*"]` | Bedrock IAM resource ARNs or `*`, never model IDs |
-| `invoker_principal_arns` | `[]` (account root grant) | IAM principals allowed to invoke the Function URL |
-| `model_config` | `config/model-pricing.json` | JSON price/catalog configuration |
-| `jwt_user_claim` | `sub` | Non-empty signed JWT claim |
-| `vended_ttl_seconds` | `900` | 900 through 43200 seconds |
-| `snapstart` | `false` | Strict boolean |
-| `reconciler_interval_minutes` | `5` | Positive integer; EventBridge cadence (1 = demo, 5 = default, 15 = heavy log volume — shorter re-scans more Logs Insights data) |
-| `default_mantle_project_id` | `default` | Bedrock Project injected on Mode B when a user has no `mantle_project_id` |
-| `admin_jwt_claim` | empty | JWT claim that authorizes the `/admin` API (e.g. `cognito:groups`); empty = shared key only |
-| `admin_jwt_value` | empty | Required value in `admin_jwt_claim` (e.g. `quota-admins`) |
-| `admin_ui` | `false` | Boolean; deploy the S3+CloudFront admin console (demo Cognito pool only) |
-| `experimental_native_session_deny` | `false` | Boolean; reconciler revokes blocked users' vended sessions early via a SourceIdentity Deny — grants it `iam:PutRolePolicy` on the vended role (AppSec sign-off) |
+| `auto_provision_users` | `true` | Boolean; create a quota row on first valid JWT |
+| `default_daily_usd` | `1.0` | Positive number |
+| `default_daily_input_tokens` | `1000000` | Positive integer |
+| `default_daily_output_tokens` | `200000` | Positive integer |
+| `warn_threshold` | `0.8` | Greater than 0 and less than 1 |
+| `usage_retention_days` | `35` | Positive integer; DynamoDB TTL retention |
+| `retain_tables_on_delete` | `false` | `true` maps tables to `RETAIN` |
+| `vended_ttl_seconds` | `900` | Between 900 and 43200 seconds |
+| `allowed_model_arns` | `["*"]` | Non-empty Bedrock resource ARN list or `*` |
+| `invoker_principal_arns` | `[]` | IAM principals allowed to invoke the Function URL |
+| `manage_invocation_logging` | none | Explicit `true` or `false` required |
+| `invocation_log_group_name` | empty | Required when logging is externally managed |
+| `model_config` | `config/model-pricing.json` | Validated catalog, overrides, and fallback |
+| `jwt_issuer` | empty | Empty creates demo Cognito |
+| `jwt_audience` | empty | Required value depends on the IdP |
+| `jwt_jwks_url` | discovery | Explicit JWKS URL when discovery is unavailable |
+| `jwt_user_claim` | `sub` | Claim used as the quota key |
+| `admin_jwt_claim` | empty | Claim used for browser admin authorization |
+| `admin_jwt_value` | empty | Required claim value or group |
+| `admin_ui` | `false` | Demo Cognito only; requires both admin JWT fields |
+| `alert_email` | empty | Creates an SNS email subscription |
+| `snapstart` | `false` | Enable Python Lambda SnapStart for the broker |
+| `adapter_layer_arn` | regional default | Override Lambda Web Adapter layer |
 
-The CDK configuration requires positive default limits. The admin API permits
-zero for an individual limit, where zero means that dimension is unlimited.
-Block a user with the status endpoint rather than setting all limits to zero.
+Legacy `mode_a_allowed_model_arns` is accepted as an alias for
+`allowed_model_arns`. Former dual-mode keys synthesize only for migration and
+are ignored with a warning. Remove them.
 
-### Auto-provisioning and defaults
+For limits changed through the admin API, `0` disables that individual quota
+dimension. Deployment defaults must remain positive so auto-provisioned users
+never become unlimited accidentally.
 
-With auto-provisioning enabled, any identity carrying a valid JWT from the
-configured issuer receives the deployment defaults on first use. This is
-convenient for a demo but grants spend automatically. With it disabled, create
-the user or tenant through the admin API as part of onboarding.
+### Upgrading the former dual-mode stack
 
-### TTL and table retention are different
+The runtime-only update preserves the existing `GatewayFn` construct,
+Function URL, `GatewayUrl`, `GatewayRoleArn`, and CloudWatch dashboard name.
+`BrokerApiUrl` and `BrokerApiRoleArn` are the canonical output names after the
+update.
 
-`usage_retention_days` writes a DynamoDB TTL timestamp on daily usage rows.
-DynamoDB deletion after that timestamp is asynchronous. It does not control
-the 00:00 UTC quota reset. User records do not expire; short-lived
-session-to-user map rows expire separately after two days.
+The update deliberately removes the inference proxy routes, Mantle
+permissions, scheduled reconciler, and its EventBridge rule. Existing
+DynamoDB tables and daily rows remain compatible. Review the CloudFormation
+change set before deployment and update clients to:
 
-`retain_tables_on_delete` controls CloudFormation deletion:
+1. Call `POST /v1/credentials`.
+2. Build a normal `bedrock-runtime` client from the returned credentials.
+3. Stop using the old OpenAI/Anthropic proxy base URLs.
 
-- `false`: demo mode; `cdk destroy` deletes both quota tables.
-- `true`: production mode; stack deletion or table replacement retains data.
-  Retained tables are no longer managed by the deleted stack and require an
-  explicit migration/import decision before redeployment.
+There is no hard pre-spend cap after this migration. The sole guarantee is the
+bounded-overspend behavior described above.
 
-### Models, allowlists, and prices
+### Model and inference-profile IAM
 
-`cdk/config/model-pricing.json` has three independent sections:
+Production should list exact resources:
+
+```json
+{
+  "allowed_model_arns": [
+    "arn:aws:bedrock:us-east-1::foundation-model/PROVIDER.MODEL-ID",
+    "arn:aws:bedrock:us-east-1:111122223333:inference-profile/PROFILE-ID"
+  ]
+}
+```
+
+Inference profiles can also require permission to their underlying foundation
+model resources. Validate the complete policy for every profile used.
+
+The vended role does not grant `bedrock:CallWithBearerToken`. Bedrock API keys
+are therefore intentionally outside this sample. Applications use the
+temporary STS credentials and SigV4.
+
+### Price configuration
+
+`config/model-pricing.json` contains:
 
 ```json
 {
   "catalog_models": {
-    "gpt-oss-120b": [
-      "openai.gpt-oss-120b",
-      "openai.gpt-oss-120b-1:0"
-    ]
+    "price-list-model-name": ["runtime-model-id"]
   },
   "price_overrides": {
-    "anthropic.claude-opus-4-7": {
-      "input_per_mtok": 15.0,
-      "output_per_mtok": 75.0
+    "model-without-resolvable-standard-price": {
+      "input_per_mtok": 15,
+      "output_per_mtok": 75
     }
   },
   "fallback_price": {
-    "input_per_mtok": 15.0,
-    "output_per_mtok": 75.0
+    "input_per_mtok": 15,
+    "output_per_mtok": 75
   }
 }
 ```
 
-- `catalog_models` maps an AWS Price List model name to every application or
-  invocation-log model ID that should share that price. GPT OSS prices are
-  resolved dynamically this way.
-- `price_overrides` pins models not yet available from Price List. Claude Opus
-  4.7 uses this mechanism.
-- `fallback_price` prices unknown model IDs.
+AWS Price List is queried once during deployment. The resulting snapshot is
+injected only into the usage processor. No scheduled refresh exists.
 
-The custom resource queries AWS Price List once on stack create/update. There
-is no timer, background refresh, or request-time Pricing call. The exact same
-`MODEL_PRICES_JSON` token and fallback JSON are injected into gateway and
-reconciler.
+An unknown ID is charged at the fallback, which deployment raises to at least
+the highest input and output rates in the known snapshot. This can make USD
+usage higher than the final bill. It is not a universal upper bound for a more
+expensive model or a modality that is not billed by input/output tokens.
+Review pricing before adding models, inference profiles, service tiers, prompt
+caching, provisioned throughput, image/video generation, or separately billed
+tools. Add every model ID or profile ARN emitted by invocation logging to the
+pricing mapping when accurate USD enforcement is required.
 
-The default unknown-model fallback is deliberately expensive. At deployment,
-the resolver raises each fallback dimension to at least the highest known
-price in the captured snapshot. It prevents an unmapped model from appearing
-free, but it can overstate USD usage, reject Mode B requests earlier, or block
-Mode A users earlier than the provider's actual charge. Token quotas remain
-based on measured tokens. Review the fallback whenever enabling a more
-expensive model, and add a catalog mapping or override when accurate USD
-quotas matter.
+### Invocation logging ownership
 
-The allowlists are not interchangeable:
+Bedrock model invocation logging is an account- and Region-level setting.
 
-- `mode_b_allowed_model_ids` contains request-body IDs such as
-  `openai.gpt-oss-120b`. The proxy rejects other IDs and filters `/v1/models`.
-- `mode_a_allowed_model_arns` becomes the vended role's IAM `Resource` list.
-  Use foundation-model, inference-profile, or provisioned-model ARNs that
-  match the native APIs in your region.
+`manage_invocation_logging=true`:
 
-An empty Mode B list and Mode A `*` preserve the sample's historical behavior,
-but production should restrict both.
+- Creates a log group and Bedrock writer role.
+- Overwrites the Region's existing invocation logging configuration.
+- Disables prompt/response payload delivery.
+- Retains the logging configuration, role, and group on stack deletion because
+  the previous configuration cannot be reconstructed.
 
-## Walkthrough: Demo/personal account
+Use this only in a demo or account where the stack owns the setting.
 
-This path creates the demo Cognito pool, lets the stack manage regional
-invocation logging, auto-provisions users, and destroys quota tables on
-teardown.
+`manage_invocation_logging=false`:
 
-From the sample root:
+- Requires `invocation_log_group_name`.
+- Does not change the account-wide setting.
+- Adds a subscription filter for the vended role.
+
+In a shared account, confirm that the log group already receives Runtime
+invocation logs and has available subscription-filter capacity. This stack
+must not displace a security or central logging subscription.
+
+### TTL and reset
+
+The quota window changes at `00:00 UTC`; TTL does not reset quotas. TTL only
+removes old usage, request-id markers, and session mappings asynchronously.
+
+An identity automatically blocked in an earlier window is reactivated when it
+next requests credentials and the current window is under quota. A manually
+blocked identity is never automatically reactivated.
+
+## Demo/personal account
+
+### 1. Prerequisites
+
+- AWS CLI and an authorized profile.
+- Node.js and npm.
+- Python 3.12 or later.
+- Finch. Docker is not required.
+- Bedrock model access in the selected Region.
 
 ```bash
-export AWS_PROFILE=your-demo-profile
+cd poc-to-prod/bedrock-per-user-quotas
+
+export AWS_PROFILE=your-profile
 export AWS_REGION=us-east-1
+export AWS_DEFAULT_REGION=$AWS_REGION
+export CDK_DOCKER=finch
 export ALERT_EMAIL=you@example.com
-export ACCOUNT_ID=$(
-  aws --profile "$AWS_PROFILE" sts get-caller-identity \
-    --query Account --output text
-)
 
-python3 -m venv cdk/.venv
-source cdk/.venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r cdk/requirements.txt
-python -m pip install -r gateway/requirements.txt pytest
-
-cd cdk
-cdk bootstrap "aws://${ACCOUNT_ID}/${AWS_REGION}" \
-  --profile "$AWS_PROFILE"
-
-cdk synth \
-  --profile "$AWS_PROFILE" \
-  -c deployment_config=config/demo.json \
-  -c alert_email="$ALERT_EMAIL"
-
-cdk deploy \
-  --profile "$AWS_PROFILE" \
-  -c deployment_config=config/demo.json \
-  -c alert_email="$ALERT_EMAIL"
-cd ..
+aws sso login --profile "$AWS_PROFILE"   # omit for non-SSO credentials
+aws sts get-caller-identity
+finch vm start
+finch info
 ```
 
-The deploy captures the current configured price snapshot. Confirm the SNS
-subscription sent to `ALERT_EMAIL`; alerts are not delivered until confirmed.
-
-Inspect and export outputs:
+### 2. Build dependencies
 
 ```bash
-aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-  cloudformation describe-stacks \
-  --stack-name BedrockPerUserQuotaGateway \
-  --query 'Stacks[0].Outputs' --output table
+cd admin-ui
+npm ci
+npm run build
 
-export GATEWAY_URL=$(
-  aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-    cloudformation describe-stacks \
-    --stack-name BedrockPerUserQuotaGateway \
-    --query "Stacks[0].Outputs[?OutputKey=='GatewayUrl'].OutputValue | [0]" \
+cd ../cdk
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/pip install -r requirements.txt
+npm ci
+```
+
+### 3. Bootstrap, synthesize, and deploy
+
+```bash
+npx cdk bootstrap
+
+npx cdk synth \
+  -c deployment_config=config/demo.json \
+  -c alert_email="$ALERT_EMAIL"
+
+npx cdk deploy \
+  -c deployment_config=config/demo.json \
+  -c alert_email="$ALERT_EMAIL"
+```
+
+Confirm the SNS subscription from the email AWS sends. Until confirmed,
+warnings and block notifications are not delivered to that address.
+
+### 4. Read outputs
+
+```bash
+export STACK_NAME=BedrockPerUserQuotaGateway
+
+export BROKER_API_URL=$(
+  aws cloudformation describe-stacks \
+    --stack-name "$STACK_NAME" \
+    --query "Stacks[0].Outputs[?OutputKey=='BrokerApiUrl'].OutputValue | [0]" \
     --output text
 )
+
 export ADMIN_SECRET_ARN=$(
-  aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-    cloudformation describe-stacks \
-    --stack-name BedrockPerUserQuotaGateway \
+  aws cloudformation describe-stacks \
+    --stack-name "$STACK_NAME" \
     --query "Stacks[0].Outputs[?OutputKey=='AdminKeySecretArn'].OutputValue | [0]" \
     --output text
 )
+
 export ADMIN_KEY=$(
-  aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-    secretsmanager get-secret-value \
+  aws secretsmanager get-secret-value \
     --secret-id "$ADMIN_SECRET_ARN" \
-    --query SecretString --output text
+    --query SecretString \
+    --output text
 )
 ```
 
-Smoke-test the IAM-protected URL and admin path:
+### 5. Configure the demo administrator
+
+`config/demo.json` deploys the UI, creates the Cognito group `quota-admins`,
+and authorizes that group. Create an administrator and add it to the group:
 
 ```bash
-AWS_PROFILE="$AWS_PROFILE" AWS_REGION="$AWS_REGION" python -c '
-import os
-from examples.sigv4_gateway import signed_request
-r = signed_request("GET", os.environ["GATEWAY_URL"] + "/healthz")
-r.raise_for_status()
-print(r.json())
-'
+export USER_POOL_ID=$(
+  aws cloudformation describe-stacks \
+    --stack-name "$STACK_NAME" \
+    --query "Stacks[0].Outputs[?OutputKey=='DemoUserPoolId'].OutputValue | [0]" \
+    --output text
+)
 
-python examples/sigv4_gateway.py \
+aws cognito-idp admin-create-user \
+  --user-pool-id "$USER_POOL_ID" \
+  --username admin@example.com \
+  --user-attributes Name=email,Value=admin@example.com \
+  --message-action SUPPRESS
+
+aws cognito-idp admin-set-user-password \
+  --user-pool-id "$USER_POOL_ID" \
+  --username admin@example.com \
+  --password 'Demo-only-Change-Me-42!' \
+  --permanent
+
+aws cognito-idp admin-add-user-to-group \
+  --user-pool-id "$USER_POOL_ID" \
+  --username admin@example.com \
+  --group-name quota-admins
+```
+
+Open the `AdminUiUrl` output. The deployment writes `config.js` with the
+generated broker URL, Region, user pool/client, and identity pool. It contains
+no secret.
+
+### 6. Administrative smoke test
+
+```bash
+cd ..
+
+cdk/.venv/bin/python examples/sigv4_gateway.py \
+  --gateway-url "$BROKER_API_URL" \
   --profile "$AWS_PROFILE" \
   --region "$AWS_REGION" \
+  --admin-key "$ADMIN_KEY" \
   create-user demo-user \
-  --daily-usd 1 \
+  --daily-usd 2 \
   --daily-input-tokens 1000000 \
   --daily-output-tokens 200000
 
-python examples/sigv4_gateway.py \
+cdk/.venv/bin/python examples/sigv4_gateway.py \
+  --gateway-url "$BROKER_API_URL" \
   --profile "$AWS_PROFILE" \
   --region "$AWS_REGION" \
+  --admin-key "$ADMIN_KEY" \
   list-users
 ```
 
-For an inference smoke test, create a demo Cognito user and obtain its ID
-token with the notebook, then call Mode A or Mode B using that token. The
-demo runbook is in [DEMO.md](DEMO.md).
+### 7. Runtime smoke test
 
-## Walkthrough: Production/shared account
-
-This path uses an existing IdP and invocation log group, disables automatic
-user creation, restricts callers/models, retains DynamoDB tables, and makes
-bypass prevention an explicit rollout step.
-
-First define deployment-specific values. The example ARNs and issuer must be
-replaced:
+Obtain a JWT for the Cognito test user or use the notebook, then:
 
 ```bash
-export AWS_PROFILE=your-production-deployer-profile
-export AWS_INVOKER_PROFILE=your-gateway-invoker-profile
+export GATEWAY_URL="$BROKER_API_URL"
+export USER_JWT='your-test-user-jwt'
+export USER_ID='value-of-the-configured-jwt-claim'
+
+cdk/.venv/bin/python examples/demo_native_calls.py \
+  --model openai.gpt-oss-20b-1:0 \
+  --api converse \
+  --prompt "Reply with exactly: runtime quota demo"
+```
+
+The inference goes directly to `bedrock-runtime`. Allow invocation-log
+delivery time before checking usage:
+
+```bash
+cdk/.venv/bin/python examples/sigv4_gateway.py \
+  --gateway-url "$BROKER_API_URL" \
+  --profile "$AWS_PROFILE" \
+  --region "$AWS_REGION" \
+  --admin-key "$ADMIN_KEY" \
+  get-usage "$USER_ID"
+```
+
+## Production/shared account
+
+### 1. Create a private deployment file
+
+Keep the private copy beside `model-pricing.json` so relative paths remain
+valid. `config/*.local.json` is ignored by Git:
+
+```bash
+cd poc-to-prod/bedrock-per-user-quotas/cdk
+cp config/production.json config/production.local.json
+```
+
+Edit `config/production.local.json` and replace:
+
+- `alert_email`
+- `jwt_issuer`, `jwt_audience`, and `jwt_user_claim`
+- `invocation_log_group_name`
+- `invoker_principal_arns`
+- account, Region, model, and inference-profile ARNs
+- quota defaults, retention, and fallback prices
+
+Recommended shape:
+
+```json
+{
+  "alert_email": "platform-alerts@example.com",
+  "jwt_issuer": "https://your-idp.example.com",
+  "jwt_audience": "bedrock-runtime-quota-broker",
+  "jwt_user_claim": "tenant_id",
+  "admin_ui": false,
+  "admin_jwt_claim": "",
+  "admin_jwt_value": "",
+  "auto_provision_users": false,
+  "default_daily_usd": 25,
+  "default_daily_input_tokens": 10000000,
+  "default_daily_output_tokens": 2000000,
+  "warn_threshold": 0.75,
+  "usage_retention_days": 90,
+  "retain_tables_on_delete": true,
+  "vended_ttl_seconds": 900,
+  "manage_invocation_logging": false,
+  "invocation_log_group_name": "/central/bedrock/model-invocations",
+  "invoker_principal_arns": [
+    "arn:aws:iam::111122223333:role/QuotaBrokerInvoker"
+  ],
+  "allowed_model_arns": [
+    "arn:aws:bedrock:us-east-1::foundation-model/PROVIDER.MODEL-ID"
+  ],
+  "model_config": "model-pricing.json"
+}
+```
+
+### 2. Validate logging before deployment
+
+```bash
+aws bedrock get-model-invocation-logging-configuration
+
+aws logs describe-subscription-filters \
+  --log-group-name /central/bedrock/model-invocations
+```
+
+Confirm with the central logging owner that adding this stack's subscription is
+acceptable.
+
+### 3. Build, bootstrap, synthesize, and deploy
+
+```bash
+cd poc-to-prod/bedrock-per-user-quotas
+
+export AWS_PROFILE=your-production-profile
 export AWS_REGION=us-east-1
-export ALERT_EMAIL=platform-alerts@example.com
-export JWT_ISSUER=https://idp.example.com
-export JWT_AUDIENCE=bedrock-quota-gateway
-export JWT_USER_CLAIM=custom:tenant_id
-export INVOCATION_LOG_GROUP=/aws/bedrock/modelinvocations
-export INVOKER_PRINCIPAL_ARN=arn:aws:iam::111122223333:role/BedrockQuotaGatewayInvoker
-export MODE_A_MODEL_ARNS_JSON='[
-  "arn:aws:bedrock:us-east-1::foundation-model/openai.gpt-oss-120b-1:0",
-  "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-opus-4-7"
-]'
-export MODE_B_MODEL_IDS_JSON='[
-  "openai.gpt-oss-120b",
-  "anthropic.claude-opus-4-7"
-]'
-export ACCOUNT_ID=$(
-  aws --profile "$AWS_PROFILE" sts get-caller-identity \
-    --query Account --output text
-)
-export MODEL_CONFIG_PATH="$(pwd)/cdk/config/model-pricing.json"
-```
+export AWS_DEFAULT_REGION=$AWS_REGION
+export CDK_DOCKER=finch
+export DEPLOYMENT_CONFIG=config/production.local.json
 
-The existing log group must already receive Bedrock model-invocation logs for
-this account and region. Verify that its records include the assumed-role
-session identity used by Mode A before relying on USD or token enforcement.
-
-Generate a local deployment file from the reviewed production baseline:
-
-```bash
-jq \
-  --arg alert_email "$ALERT_EMAIL" \
-  --arg jwt_issuer "$JWT_ISSUER" \
-  --arg jwt_audience "$JWT_AUDIENCE" \
-  --arg jwt_user_claim "$JWT_USER_CLAIM" \
-  --arg log_group "$INVOCATION_LOG_GROUP" \
-  --arg invoker "$INVOKER_PRINCIPAL_ARN" \
-  --arg model_config "$MODEL_CONFIG_PATH" \
-  --argjson mode_a "$MODE_A_MODEL_ARNS_JSON" \
-  --argjson mode_b "$MODE_B_MODEL_IDS_JSON" \
-  '
-    .alert_email = $alert_email
-    | .jwt_issuer = $jwt_issuer
-    | .jwt_audience = $jwt_audience
-    | .jwt_user_claim = $jwt_user_claim
-    | .invocation_log_group_name = $log_group
-    | .invoker_principal_arns = [$invoker]
-    | .mode_a_allowed_model_arns = $mode_a
-    | .mode_b_allowed_model_ids = $mode_b
-    | .model_config = $model_config
-  ' cdk/config/production.json > /tmp/bedrock-quota-production.json
-```
-
-Review `/tmp/bedrock-quota-production.json`, the IdP claim ownership, all
-model ARNs, the fallback price, and the invoking backend role before
-continuing.
-
-Install, bootstrap, synth, and deploy:
-
-```bash
-python3 -m venv cdk/.venv
-source cdk/.venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r cdk/requirements.txt
-python -m pip install -r gateway/requirements.txt pytest
+aws sso login --profile "$AWS_PROFILE"
+aws sts get-caller-identity
+finch vm start
 
 cd cdk
-cdk bootstrap "aws://${ACCOUNT_ID}/${AWS_REGION}" \
-  --profile "$AWS_PROFILE"
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/pip install -r requirements.txt
+npm ci
 
-cdk synth \
-  --profile "$AWS_PROFILE" \
-  -c deployment_config=/tmp/bedrock-quota-production.json
-
-cdk deploy \
-  --profile "$AWS_PROFILE" \
-  -c deployment_config=/tmp/bedrock-quota-production.json
-cd ..
+npx cdk bootstrap
+npx cdk synth -c deployment_config="$DEPLOYMENT_CONFIG"
+npx cdk deploy -c deployment_config="$DEPLOYMENT_CONFIG"
 ```
 
-Confirm the SNS subscription; alerts are not delivered until an owner accepts
-it. Export the production outputs:
+Confirm the SNS subscription and record all CloudFormation outputs in the
+deployment system.
 
-```bash
-aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-  cloudformation describe-stacks \
-  --stack-name BedrockPerUserQuotaGateway \
-  --query 'Stacks[0].Outputs' --output table
+### 4. Corporate IdP and UI
 
-export GATEWAY_URL=$(
-  aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-    cloudformation describe-stacks \
-    --stack-name BedrockPerUserQuotaGateway \
-    --query "Stacks[0].Outputs[?OutputKey=='GatewayUrl'].OutputValue | [0]" \
-    --output text
-)
-export ADMIN_SECRET_ARN=$(
-  aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-    cloudformation describe-stacks \
-    --stack-name BedrockPerUserQuotaGateway \
-    --query "Stacks[0].Outputs[?OutputKey=='AdminKeySecretArn'].OutputValue | [0]" \
-    --output text
-)
-export ADMIN_KEY=$(
-  aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-    secretsmanager get-secret-value \
-    --secret-id "$ADMIN_SECRET_ARN" \
-    --query SecretString --output text
-)
+The backend accepts any OIDC issuer/JWKS configuration. The browser UI must
+also obtain temporary AWS credentials to SigV4-sign the `AWS_IAM` Function
+URL. The sample automatically creates that Identity Pool only for its demo
+Cognito pool.
+
+Keep `admin_ui=false` in this stack when `jwt_issuer` is configured. For a
+corporate IdP, build and host `admin-ui/` separately, create or reuse a Cognito
+Identity Pool that trusts the OIDC provider, grant its authenticated admin role
+`lambda:InvokeFunctionUrl`, and provide a deployment-specific `config.js`:
+
+```javascript
+window.QUOTA_ADMIN_CONFIG = {
+  gatewayUrl: "BROKER_API_URL",
+  region: "us-east-1",
+  userPoolId: "YOUR_AUTH_PROVIDER_CONFIGURATION",
+  userPoolClientId: "YOUR_CLIENT_ID",
+  identityPoolId: "YOUR_IDENTITY_POOL_ID"
+};
 ```
 
-The following smoke tests require AWS credentials for a principal listed in
-`invoker_principal_arns`; the deployer is not automatically granted access in
-production. `AWS_INVOKER_PROFILE` must resolve to that role. Check the
-IAM-protected health endpoint:
+The current React login implementation targets Cognito User Pools. Replacing
+`admin-ui/src/auth.ts` with the customer's OIDC login is an integration task,
+not a change to quota enforcement. The separately hosted UI also requires the
+Function URL CORS policy to allow its exact HTTPS origin and the SigV4 headers;
+the stack configures this automatically only for its own demo CloudFront
+distribution. Do not use a wildcard production origin. The shared admin key is
+for trusted CLI or backend use and must never be embedded in the browser.
 
-```bash
-AWS_PROFILE="$AWS_INVOKER_PROFILE" AWS_REGION="$AWS_REGION" python -c '
-import os
-from examples.sigv4_gateway import signed_request
-r = signed_request("GET", os.environ["GATEWAY_URL"] + "/healthz")
-r.raise_for_status()
-print(r.json())
-'
-```
+### 5. Prevent bypass
 
-Provision a tenant before presenting its JWT:
+The quotas have no effect if application users retain another principal that
+can call Bedrock directly.
 
-```bash
-python examples/sigv4_gateway.py \
-  --profile "$AWS_INVOKER_PROFILE" \
-  --region "$AWS_REGION" \
-  create-user tenant-acme \
-  --name "ACME" \
-  --daily-usd 25 \
-  --daily-input-tokens 10000000 \
-  --daily-output-tokens 2000000
-```
+Choose one:
 
-With a real ID token whose configured claim resolves to `tenant-acme`:
+- Attach the stack's `DenyDirectBedrockPolicyArn` to every non-vended role.
+- Apply a permission boundary.
+- Apply an organizational SCP.
 
-```bash
-export USER_JWT='replace-with-a-short-lived-id-token'
-
-AWS_PROFILE="$AWS_INVOKER_PROFILE" AWS_REGION="$AWS_REGION" python -c '
-import os
-from examples.sigv4_gateway import signed_request
-r = signed_request(
-    "POST",
-    os.environ["GATEWAY_URL"] + "/v1/credentials",
-    user_token=os.environ["USER_JWT"],
-)
-r.raise_for_status()
-body = r.json()
-print({"region": body["region"], "expiration": body["expiration"], "user_id": body["user_id"]})
-'
-```
-
-This checks JWT verification, claim extraction, quota lookup, IAM invocation,
-and Mode A credential vending without making an inference call.
-
-## Administrative commands
-
-The client uses `AWS_PROFILE`/`--profile` for SigV4 and reads `GATEWAY_URL`,
-`ADMIN_KEY`, and `AWS_REGION` from the environment when flags are omitted.
-For the commands below, select the authorized caller profile:
-
-```bash
-export GATEWAY_INVOKER_PROFILE="${AWS_INVOKER_PROFILE:-$AWS_PROFILE}"
-```
-
-Create a user or tenant with all three daily limits:
-
-```bash
-python examples/sigv4_gateway.py \
-  --profile "$GATEWAY_INVOKER_PROFILE" --region "$AWS_REGION" \
-  create-user tenant-acme \
-  --name "ACME" \
-  --daily-usd 25 \
-  --daily-input-tokens 10000000 \
-  --daily-output-tokens 2000000
-```
-
-List users, limits, status, and today's usage:
-
-```bash
-python examples/sigv4_gateway.py \
-  --profile "$GATEWAY_INVOKER_PROFILE" --region "$AWS_REGION" \
-  list-users
-```
-
-Update any or all limits:
-
-```bash
-python examples/sigv4_gateway.py \
-  --profile "$GATEWAY_INVOKER_PROFILE" --region "$AWS_REGION" \
-  update-user tenant-acme \
-  --daily-usd 30 \
-  --daily-input-tokens 12000000 \
-  --daily-output-tokens 2500000
-```
-
-Block and unblock:
-
-```bash
-python examples/sigv4_gateway.py \
-  --profile "$GATEWAY_INVOKER_PROFILE" --region "$AWS_REGION" \
-  block-user tenant-acme --reason "manual cost review"
-
-python examples/sigv4_gateway.py \
-  --profile "$GATEWAY_INVOKER_PROFILE" --region "$AWS_REGION" \
-  unblock-user tenant-acme --reason "review complete"
-```
-
-Query the current or a specific UTC quota window:
-
-```bash
-python examples/sigv4_gateway.py \
-  --profile "$GATEWAY_INVOKER_PROFILE" --region "$AWS_REGION" \
-  get-usage tenant-acme
-
-python examples/sigv4_gateway.py \
-  --profile "$GATEWAY_INVOKER_PROFILE" --region "$AWS_REGION" \
-  get-usage tenant-acme --window 2026-07-14
-```
-
-## Invocation logging ownership
-
-Bedrock model-invocation logging is one account-and-region-wide setting:
-
-- `manage_invocation_logging=true` lets this stack overwrite that setting.
-  The generated logging configuration, role, and log group are retained on
-  `cdk destroy` because the prior setting cannot be restored automatically.
-- `manage_invocation_logging=false` requires
-  `invocation_log_group_name`. The stack reads the group and does not mutate
-  regional logging.
-- Supplying an existing group together with managed logging is rejected.
-
-In a shared account, the security/logging owner should manage the regional
-configuration and grant this stack read/query access to its destination.
-
-## Preventing quota bypass
-
-Deployment is not complete until the account owner decides how direct Bedrock
-permissions are handled. Any principal that retains `bedrock:InvokeModel*`,
-`bedrock:Converse*`, or `bedrock-mantle:*` can bypass per-user quotas.
-
-The stack outputs `DenyDirectBedrockPolicyArn`. Attach it to every governed
-role in a single-account setup. For organization-wide enforcement, deploy an
-SCP equivalent to:
+Example SCP decision, with the deployed `BedrockUserRoleArn` as the only
+inference exception:
 
 ```json
 {
   "Version": "2012-10-17",
-  "Statement": [{
-    "Sid": "OnlyQuotaGatewayMayInvokeBedrock",
-    "Effect": "Deny",
-    "Action": [
-      "bedrock-mantle:CreateInference",
-      "bedrock-mantle:CallWithBearerToken",
-      "bedrock:InvokeModel",
-      "bedrock:InvokeModelWithResponseStream",
-      "bedrock:Converse",
-      "bedrock:ConverseStream"
-    ],
-    "Resource": "*",
-    "Condition": {
-      "ArnNotLike": {
-        "aws:PrincipalArn": [
-          "<GatewayRoleArn>",
-          "<BedrockUserRoleArn>"
-        ]
+  "Statement": [
+    {
+      "Sid": "RequireQuotaBrokerForBedrockRuntime",
+      "Effect": "Deny",
+      "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream",
+        "bedrock:CallWithBearerToken"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "ArnNotEquals": {
+          "aws:PrincipalArn": "BEDROCK_USER_ROLE_ARN"
+        }
       }
     }
-  }]
+  ]
 }
 ```
 
-Both output roles are exceptions: the gateway role serves Mode B and the
-vended role serves Mode A. Validate an SCP in a non-production OU first and
-account for break-glass, service, and deployment roles. Choosing not to apply
-a deny is valid only when bypass is explicitly accepted.
+Validate any SCP in a non-production OU. Account administrators and
+organization administrators remain capable of changing the policy.
 
-Restrict `invoker_principal_arns` independently. It controls who may reach the
-IAM-authenticated Function URL; it does not grant or deny direct Bedrock
-access.
+### 6. Production acceptance tests
 
-## Verification and teardown
+Verify all of the following:
 
-Run local verification without AWS changes:
+1. Unsigned broker request returns `401` or `403`.
+2. Allowed invoker role plus valid JWT receives STS credentials.
+3. Invalid issuer, audience, signature, expiry, or claim is rejected.
+4. Vended credentials can invoke only approved Runtime resources.
+5. A normal application role cannot invoke Bedrock directly.
+6. An invocation appears in DynamoDB through the log subscription.
+7. Re-delivering the same `requestId` does not increment usage twice.
+8. Warning and block SNS notifications arrive.
+9. Blocked identities cannot renew credentials.
+10. Previously issued credentials work only until STS expiry.
+11. Unknown models use the configured conservative fallback.
+12. Destroy testing confirms production tables are retained.
+
+## Administrative commands
 
 ```bash
-cdk/.venv/bin/python -m pytest tests -q
-git diff --check
+# Create
+python examples/sigv4_gateway.py \
+  --gateway-url "$BROKER_API_URL" --profile "$AWS_PROFILE" \
+  --region "$AWS_REGION" --admin-key "$ADMIN_KEY" \
+  create-user tenant-acme --name "ACME" \
+  --daily-usd 25 --daily-input-tokens 10000000 \
+  --daily-output-tokens 2000000
+
+# List
+python examples/sigv4_gateway.py \
+  --gateway-url "$BROKER_API_URL" --profile "$AWS_PROFILE" \
+  --region "$AWS_REGION" --admin-key "$ADMIN_KEY" list-users
+
+# Update all quota dimensions
+python examples/sigv4_gateway.py \
+  --gateway-url "$BROKER_API_URL" --profile "$AWS_PROFILE" \
+  --region "$AWS_REGION" --admin-key "$ADMIN_KEY" \
+  update-user tenant-acme --daily-usd 30 \
+  --daily-input-tokens 12000000 --daily-output-tokens 2500000
+
+# Block
+python examples/sigv4_gateway.py \
+  --gateway-url "$BROKER_API_URL" --profile "$AWS_PROFILE" \
+  --region "$AWS_REGION" --admin-key "$ADMIN_KEY" \
+  block-user tenant-acme --reason "security review"
+
+# Query today's usage
+python examples/sigv4_gateway.py \
+  --gateway-url "$BROKER_API_URL" --profile "$AWS_PROFILE" \
+  --region "$AWS_REGION" --admin-key "$ADMIN_KEY" \
+  get-usage tenant-acme
+
+# Unblock
+python examples/sigv4_gateway.py \
+  --gateway-url "$BROKER_API_URL" --profile "$AWS_PROFILE" \
+  --region "$AWS_REGION" --admin-key "$ADMIN_KEY" \
+  unblock-user tenant-acme
 ```
 
-Demo teardown:
+## Destruction
+
+Demo:
 
 ```bash
 cd cdk
-cdk destroy \
-  --profile "$AWS_PROFILE" \
-  -c deployment_config=config/demo.json
+npx cdk destroy -c deployment_config=config/demo.json
 ```
 
-The demo tables are deleted. Managed invocation-logging resources remain for
-manual review.
-
-For production, `retain_tables_on_delete=true` keeps both tables. Before
-destroying the stack, record their names, ownership, backup, and import or
-decommission plan. `cdk destroy` is not a data lifecycle policy.
+Production tables use `RETAIN` and survive stack deletion. Managed invocation
+logging resources are also retained because the stack cannot restore a prior
+account-wide logging configuration. Review and remove retained resources only
+through an explicit data-retention and logging-owner decision.

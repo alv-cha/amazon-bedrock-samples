@@ -1,4 +1,4 @@
-"""SigV4 clients for an IAM-authenticated Lambda Function URL.
+"""SigV4 clients for the IAM-authenticated broker/admin Function URL.
 
 SigV4 owns the HTTP Authorization header. Application credentials therefore
 travel in dedicated headers:
@@ -33,7 +33,7 @@ def _sign(method: str, url: str, headers: dict[str, str], body,
 
 
 class FunctionUrlSigV4Auth(httpx.Auth):
-    """httpx auth adapter suitable for OpenAI and Anthropic Python clients."""
+    """httpx auth adapter for broker and administrative API calls."""
 
     requires_request_body = True
 
@@ -147,7 +147,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--gateway-url",
         default=os.environ.get("GATEWAY_URL"),
-        help="GatewayUrl stack output (or GATEWAY_URL).",
+        help="BrokerApiUrl stack output (or GATEWAY_URL).",
     )
     parser.add_argument(
         "--region",

@@ -12,6 +12,6 @@ QuotaGatewayStack(
         account=os.environ.get("CDK_DEFAULT_ACCOUNT"),
         region=os.environ.get("CDK_DEFAULT_REGION", "us-east-1"),
     ),
-    description="Per-user quota monitoring and enforcement gateway for Amazon Bedrock",
+    description="Runtime-only per-user quota broker for Amazon Bedrock",
 )
 app.synth()

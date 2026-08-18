@@ -77,7 +77,7 @@ def test_vend_credentials_for_in_budget_user(client):
     assert call["Tags"] == [{"Key": "quota-user", "Value": session_name_for(sub)}]
     assert call["DurationSeconds"] == 900
 
-    # session -> user mapping persisted for the reconciler.
+    # Session -> user mapping persisted for the log subscription processor.
     assert store.resolve_session(session_name_for(sub)) == sub
 
 
@@ -156,7 +156,7 @@ def test_over_budget_user_gets_429_and_is_blocked(client):
     sub = "spender@corp"
     store.put_user(sub, name=sub, daily_usd=0.001,
                    daily_input_tokens=0, daily_output_tokens=0)
-    # Simulate the reconciler having written over-budget usage for today.
+    # Simulate the usage processor having written over-budget usage for today.
     window = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     store._usage.put_item(Item={  # noqa: SLF001 (test reaches into store)
         "user_id": sub, "window": window,
@@ -166,7 +166,7 @@ def test_over_budget_user_gets_429_and_is_blocked(client):
     resp = api.post("/v1/credentials", headers={"Authorization": f"Bearer {make_jwt(sub)}"})
     assert resp.status_code == 429
     assert sts.calls == []
-    # vend-time gate flips status to blocked so alerts/reconciler agree.
+    # The vend-time gate persists the same blocked state as event processing.
     assert store.get_user(sub).status == "blocked"
 
 

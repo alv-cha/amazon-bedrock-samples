@@ -18,11 +18,13 @@ _DEPLOYMENT_KEYS = {
     "admin_jwt_claim",
     "admin_jwt_value",
     "admin_ui",
+    "allowed_model_arns",
     "alert_email",
     "auto_provision_users",
     "default_daily_input_tokens",
     "default_daily_output_tokens",
     "default_daily_usd",
+    # Accepted only as migration inputs from the former dual-mode design.
     "default_mantle_project_id",
     "experimental_native_session_deny",
     "invocation_log_group_name",
@@ -48,24 +50,19 @@ _DEFAULTS = {
     "admin_jwt_claim": "",
     "admin_jwt_value": "",
     "admin_ui": False,
+    "allowed_model_arns": ["*"],
     "alert_email": "",
     "auto_provision_users": True,
     "default_daily_input_tokens": 1_000_000,
     "default_daily_output_tokens": 200_000,
     "default_daily_usd": 1.0,
-    "default_mantle_project_id": "default",
-    "experimental_native_session_deny": False,
     "invocation_log_group_name": "",
     "invoker_principal_arns": [],
     "jwt_audience": "",
     "jwt_issuer": "",
     "jwt_jwks_url": "",
     "jwt_user_claim": "sub",
-    "mode_a_allowed_model_arns": ["*"],
-    # Empty preserves the pre-configuration behavior: all Mode B model IDs.
-    "mode_b_allowed_model_ids": [],
     "model_config": "config/model-pricing.json",
-    "reconciler_interval_minutes": 5,
     "retain_tables_on_delete": False,
     "snapstart": False,
     "usage_retention_days": 35,
@@ -87,13 +84,13 @@ class DeploymentConfig:
     admin_jwt_claim: str
     admin_jwt_value: str
     admin_ui: bool
+    allowed_model_arns: tuple[str, ...]
     alert_email: str
     auto_provision_users: bool
     default_daily_input_tokens: int
     default_daily_output_tokens: int
     default_daily_usd: float
-    default_mantle_project_id: str
-    experimental_native_session_deny: bool
+    deprecated_options: tuple[str, ...]
     invocation_log_group_name: str
     invoker_principal_arns: tuple[str, ...]
     jwt_audience: str
@@ -101,10 +98,7 @@ class DeploymentConfig:
     jwt_jwks_url: str
     jwt_user_claim: str
     manage_invocation_logging: bool
-    mode_a_allowed_model_arns: tuple[str, ...]
-    mode_b_allowed_model_ids: tuple[str, ...]
     model_pricing: ModelPricingConfig
-    reconciler_interval_minutes: int
     retain_tables_on_delete: bool
     snapstart: bool
     usage_retention_days: int
@@ -162,29 +156,50 @@ class DeploymentConfig:
         )
         model_pricing = _model_pricing(model_source, model_base)
 
-        mode_b_ids = _string_list(
-            "mode_b_allowed_model_ids", value("mode_b_allowed_model_ids")
+        new_allowlist_explicit = (
+            node.try_get_context("allowed_model_arns") is not None
+            or "allowed_model_arns" in deployment
         )
-        for model_id in mode_b_ids:
-            if model_id.startswith("arn:"):
-                raise ValueError(
-                    "mode_b_allowed_model_ids accepts application model IDs, "
-                    f"not IAM ARNs: {model_id}"
-                )
-
-        mode_a_arns = _string_list(
-            "mode_a_allowed_model_arns", value("mode_a_allowed_model_arns")
+        legacy_allowlist_explicit = (
+            node.try_get_context("mode_a_allowed_model_arns") is not None
+            or "mode_a_allowed_model_arns" in deployment
         )
-        if not mode_a_arns:
-            raise ValueError("mode_a_allowed_model_arns must not be empty")
-        for model_arn in mode_a_arns:
+        if new_allowlist_explicit and legacy_allowlist_explicit:
+            raise ValueError(
+                "Use allowed_model_arns only; it replaces the legacy "
+                "mode_a_allowed_model_arns key."
+            )
+        allowed_model_arns = _string_list(
+            "allowed_model_arns",
+            (
+                value("allowed_model_arns")
+                if new_allowlist_explicit or not legacy_allowlist_explicit
+                else value("mode_a_allowed_model_arns")
+            ),
+        )
+        if not allowed_model_arns:
+            raise ValueError("allowed_model_arns must not be empty")
+        for model_arn in allowed_model_arns:
             if model_arn != "*" and (
                 not model_arn.startswith("arn:") or ":bedrock:" not in model_arn
             ):
                 raise ValueError(
-                    "mode_a_allowed_model_arns accepts Bedrock IAM resource "
+                    "allowed_model_arns accepts Bedrock IAM resource "
                     f"ARNs (or '*'), not model IDs: {model_arn}"
                 )
+
+        deprecated_options = tuple(
+            name
+            for name in (
+                "default_mantle_project_id",
+                "experimental_native_session_deny",
+                "mode_b_allowed_model_ids",
+                "reconciler_interval_minutes",
+            )
+            if node.try_get_context(name) is not None or name in deployment
+        )
+        if legacy_allowlist_explicit:
+            deprecated_options += ("mode_a_allowed_model_arns",)
 
         invoker_arns = _string_list(
             "invoker_principal_arns", value("invoker_principal_arns")
@@ -217,14 +232,40 @@ class DeploymentConfig:
         jwt_user_claim = _string("jwt_user_claim", value("jwt_user_claim"))
         if not jwt_user_claim:
             raise ValueError("jwt_user_claim must not be empty")
+        jwt_issuer = _string("jwt_issuer", value("jwt_issuer"))
+        admin_ui = _boolean("admin_ui", value("admin_ui"))
+        admin_jwt_claim = _string(
+            "admin_jwt_claim", value("admin_jwt_claim")
+        )
+        admin_jwt_value = _string(
+            "admin_jwt_value", value("admin_jwt_value")
+        )
+        if bool(admin_jwt_claim) != bool(admin_jwt_value):
+            raise ValueError(
+                "admin_jwt_claim and admin_jwt_value must be configured "
+                "together"
+            )
+        if admin_ui and jwt_issuer:
+            raise ValueError(
+                "admin_ui=true currently supports only the stack-created "
+                "demo Cognito pool; host and integrate the UI separately "
+                "when jwt_issuer is configured"
+            )
+        if admin_ui and not admin_jwt_claim:
+            raise ValueError(
+                "admin_ui=true requires admin_jwt_claim and "
+                "admin_jwt_value because the browser never receives the "
+                "shared admin secret"
+            )
 
         return cls(
             adapter_layer_arn=_string(
                 "adapter_layer_arn", value("adapter_layer_arn")
             ),
-            admin_jwt_claim=_string("admin_jwt_claim", value("admin_jwt_claim")),
-            admin_jwt_value=_string("admin_jwt_value", value("admin_jwt_value")),
-            admin_ui=_boolean("admin_ui", value("admin_ui")),
+            admin_jwt_claim=admin_jwt_claim,
+            admin_jwt_value=admin_jwt_value,
+            admin_ui=admin_ui,
+            allowed_model_arns=tuple(allowed_model_arns),
             alert_email=_string("alert_email", value("alert_email")),
             auto_provision_users=_boolean(
                 "auto_provision_users", value("auto_provision_users")
@@ -240,27 +281,15 @@ class DeploymentConfig:
             default_daily_usd=_positive_float(
                 "default_daily_usd", value("default_daily_usd")
             ),
-            default_mantle_project_id=_string(
-                "default_mantle_project_id", value("default_mantle_project_id")
-            ) or "default",
-            experimental_native_session_deny=_boolean(
-                "experimental_native_session_deny",
-                value("experimental_native_session_deny"),
-            ),
+            deprecated_options=deprecated_options,
             invocation_log_group_name=existing_log_group,
             invoker_principal_arns=tuple(invoker_arns),
             jwt_audience=_string("jwt_audience", value("jwt_audience")),
-            jwt_issuer=_string("jwt_issuer", value("jwt_issuer")),
+            jwt_issuer=jwt_issuer,
             jwt_jwks_url=_string("jwt_jwks_url", value("jwt_jwks_url")),
             jwt_user_claim=jwt_user_claim,
             manage_invocation_logging=manage_logging,
-            mode_a_allowed_model_arns=tuple(mode_a_arns),
-            mode_b_allowed_model_ids=tuple(mode_b_ids),
             model_pricing=model_pricing,
-            reconciler_interval_minutes=_positive_int(
-                "reconciler_interval_minutes",
-                value("reconciler_interval_minutes"),
-            ),
             retain_tables_on_delete=_boolean(
                 "retain_tables_on_delete", value("retain_tables_on_delete")
             ),

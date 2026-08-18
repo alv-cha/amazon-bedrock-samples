@@ -32,8 +32,8 @@ export interface UserRow {
   user_id: string;
   name: string;
   status: string;
+  status_reason: string;
   limits: { daily_usd: number; daily_input_tokens: number; daily_output_tokens: number };
-  mantle_project_id: string;
   today: { cost_usd: number; input_tokens: number; output_tokens: number; requests: number };
 }
 
@@ -42,13 +42,18 @@ export interface Summary {
     source: string;
     as_of: string;
     window: string;
+    mode: string;
+    credential_ttl_seconds: number;
     total_users: number;
     blocked_users: number;
     blocked_user_ids: string[];
     today: { cost_usd: number; input_tokens: number; output_tokens: number; requests: number };
   };
-  observability: { source: string; metrics_namespace: string; note: string };
-  reconciler_interval_minutes: number;
+  observability: {
+    source: string;
+    delivery: string;
+    metrics_namespace: string;
+  };
 }
 
 export const api = {
@@ -73,9 +78,4 @@ export const api = {
 
   setStatus: (cfg: AdminConfig, s: Session, userId: string, status: string): Promise<any> =>
     call(cfg, s, "PUT", `/admin/users/${encodeURIComponent(userId)}/status`, { status }),
-
-  setMantleProject: (cfg: AdminConfig, s: Session, userId: string, projectId: string): Promise<any> =>
-    call(cfg, s, "PUT", `/admin/users/${encodeURIComponent(userId)}/mantle-project`, {
-      mantle_project_id: projectId,
-    }),
 };

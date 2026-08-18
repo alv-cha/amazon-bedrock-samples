@@ -116,15 +116,13 @@ function SummaryCards({ summary }: { summary: Summary }) {
       <Card title="Observability (history)">
         <p style={{ color: "#666", marginTop: 0 }}>Source: {summary.observability.source}</p>
         <Kv k="Metrics namespace" v={summary.observability.metrics_namespace} />
-        <Kv k="Reconciler interval" v={`${summary.reconciler_interval_minutes} min (set at deploy: -c reconciler_interval_minutes)`} />
-        <p style={{ fontSize: 13, color: "#666" }}>{summary.observability.note}</p>
+        <Kv k="Delivery" v={summary.observability.delivery} />
+        <Kv k="Credential TTL" v={`${e.credential_ttl_seconds / 60} min`} />
       </Card>
       <div style={{ gridColumn: "1 / -1", fontSize: 13, color: "#555" }}>
-        <strong>Enforcement models:</strong> Mode A (credential broker) is
-        bounded overspend — a blocked user loses access at their next credential
-        refresh (within the vended TTL + reconciler lag). Mode B (inline proxy)
-        is a hard pre-spend cap (429 before any spend). This console shows the
-        authoritative DynamoDB state; richer per-user history lives in CloudWatch.
+        <strong>Enforcement:</strong> bounded overspend. A blocked identity
+        cannot refresh credentials; credentials already issued remain valid
+        until their STS expiration.
       </div>
     </section>
   );
@@ -134,6 +132,37 @@ function UsersTable({ cfg, session, users, onChanged }: {
   cfg: AdminConfig; session: Session; users: UserRow[]; onChanged: () => Promise<void>;
 }) {
   const [busy, setBusy] = useState<string>("");
+
+  function promptNumber(label: string, current: number): number | null {
+    const raw = prompt(label, String(current));
+    if (raw === null) return null;
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value < 0) {
+      alert("Enter a non-negative number.");
+      return null;
+    }
+    return value;
+  }
+
+  async function editLimits(user: UserRow) {
+    const dailyUsd = promptNumber(`Daily USD for ${user.user_id}`, user.limits.daily_usd);
+    if (dailyUsd === null) return;
+    const dailyInput = promptNumber(
+      `Daily input tokens for ${user.user_id}`,
+      user.limits.daily_input_tokens,
+    );
+    if (dailyInput === null) return;
+    const dailyOutput = promptNumber(
+      `Daily output tokens for ${user.user_id}`,
+      user.limits.daily_output_tokens,
+    );
+    if (dailyOutput === null) return;
+    await act("limits", () => api.setLimits(cfg, session, user.user_id, {
+      daily_usd: dailyUsd,
+      daily_input_tokens: Math.trunc(dailyInput),
+      daily_output_tokens: Math.trunc(dailyOutput),
+    }));
+  }
 
   async function act(label: string, fn: () => Promise<unknown>) {
     setBusy(label);
@@ -152,7 +181,7 @@ function UsersTable({ cfg, session, users, onChanged }: {
       <thead>
         <tr style={{ textAlign: "left", borderBottom: "2px solid #ddd" }}>
           <th>User</th><th>Status</th><th>Daily $</th><th>Today $</th>
-          <th>Mantle project</th><th>Actions</th>
+          <th>Daily input</th><th>Daily output</th><th>Today tokens</th><th>Actions</th>
         </tr>
       </thead>
       <tbody>
@@ -162,24 +191,19 @@ function UsersTable({ cfg, session, users, onChanged }: {
             <td style={{ color: u.status === "active" ? "#2a7" : "#c33" }}>{u.status}</td>
             <td>{u.limits.daily_usd}</td>
             <td>${u.today.cost_usd.toFixed(4)}</td>
-            <td>{u.mantle_project_id || <em style={{ color: "#999" }}>default</em>}</td>
+            <td>{u.limits.daily_input_tokens.toLocaleString()}</td>
+            <td>{u.limits.daily_output_tokens.toLocaleString()}</td>
+            <td>{u.today.input_tokens.toLocaleString()} / {u.today.output_tokens.toLocaleString()}</td>
             <td style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-              <button disabled={!!busy} onClick={() => {
-                const v = prompt(`Daily USD budget for ${u.user_id}`, String(u.limits.daily_usd));
-                if (v !== null) void act("limits", () => api.setLimits(cfg, session, u.user_id, { daily_usd: Number(v) }));
-              }}>Set $</button>
+              <button disabled={!!busy} onClick={() => void editLimits(u)}>Edit limits</button>
               <button disabled={!!busy} onClick={() =>
                 void act("status", () => api.setStatus(cfg, session, u.user_id,
                   u.status === "active" ? "blocked" : "active"))
               }>{u.status === "active" ? "Block" : "Unblock"}</button>
-              <button disabled={!!busy} onClick={() => {
-                const v = prompt(`Mantle project for ${u.user_id} (empty = default)`, u.mantle_project_id);
-                if (v !== null) void act("project", () => api.setMantleProject(cfg, session, u.user_id, v));
-              }}>Project</button>
             </td>
           </tr>
         ))}
-        {users.length === 0 && <tr><td colSpan={6} style={{ color: "#999", padding: 16 }}>No users yet.</td></tr>}
+        {users.length === 0 && <tr><td colSpan={8} style={{ color: "#999", padding: 16 }}>No users yet.</td></tr>}
       </tbody>
     </table>
   );

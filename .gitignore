@@ -70,3 +70,9 @@ config.py
 
 # CDK synth output for bedrock-per-user-quotas sample
 poc-to-prod/bedrock-per-user-quotas/cdk/cdk.out/
+
+# Local credentials/configuration for the per-user quota demo notebook
+poc-to-prod/bedrock-per-user-quotas/notebook/local-config.json
+
+# Private deployment overrides for the per-user quota sample
+poc-to-prod/bedrock-per-user-quotas/cdk/config/*.local.json

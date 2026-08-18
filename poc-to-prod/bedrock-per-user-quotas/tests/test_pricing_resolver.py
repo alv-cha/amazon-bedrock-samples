@@ -57,11 +57,11 @@ def test_snapshot_uses_standard_prices_and_maps_all_model_ids():
     pricing = _FakePricing([
         _product("native-in", "Input tokens", "0.0000700000",
                  feature="On-demand Inference"),
-        _product("mantle-in", "Input tokens", "0.0000700000",
+        _product("standard-in", "Input tokens", "0.0000700000",
                  service_tier="standard"),
         _product("native-out", "Output tokens", "0.0003000000",
                  feature="On-demand Inference"),
-        _product("mantle-out", "Output tokens", "0.0003000000",
+        _product("standard-out", "Output tokens", "0.0003000000",
                  service_tier="standard"),
         _product("flex", "Input tokens flex", "0.0000350000"),
         _product("priority", "Output tokens priority", "0.0005250000"),

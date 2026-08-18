@@ -1,47 +1,35 @@
-# Admin console (React SPA)
+# Runtime quota admin UI
 
-Optional admin UI for the Bedrock per-user quota gateway. Static React on
-S3 + CloudFront, authenticated with the demo Cognito user pool via a Cognito
-Identity Pool. The browser gets temporary AWS credentials from the Identity
-Pool and SigV4-signs its calls to the gateway's `AWS_IAM` Function URL. The
-Cognito ID token rides in `X-Quota-User-Token` and the gateway's admin-by-JWT
-authorization grants it — **no admin secret is ever held by the browser.**
+Static React console for the broker's administrative API.
 
-## Enable it
+It shows:
 
-Deploy the stack with the UI flag **and** an admin group claim so the login
-identity is authorized for the `/admin` API:
+- Current users and status.
+- Daily USD, input-token, and output-token limits.
+- Current UTC-day usage.
+- Runtime-only bounded-overspend guarantee.
+- STS credential lifetime and event-driven metering source.
 
-```bash
-cd cdk
-PATH=/tmp/quota-venv/bin:$PATH cdk deploy \
-  -c admin_ui=true \
-  -c admin_jwt_claim=cognito:groups \
-  -c admin_jwt_value=quota-admins
-```
+The browser never receives the shared admin secret. With the demo Cognito
+deployment it:
 
-The UI is only wired when the stack created the demo Cognito pool (i.e. no BYO
-`jwt_issuer`). For a bring-your-own issuer, create the Identity Pool + OIDC
-provider manually and point `config.js` at it — see `DEPLOYMENT.md`.
+1. Authenticates to the User Pool.
+2. Exchanges the ID token through the Cognito Identity Pool.
+3. SigV4-signs the broker's `AWS_IAM` Function URL.
+4. Sends the ID token in `X-Quota-User-Token`.
+5. Uses the configured admin group claim for `/admin` authorization.
 
-## Build and publish
+## Build
 
 ```bash
-cd admin-ui
-npm install
-npm run build          # -> dist/ (Vite)
+npm ci
+npm run build
 ```
 
-`cdk deploy` uploads `dist/` to the UI bucket automatically. After the first
-deploy, fill in `dist/config.js` (or `public/config.js` before building) with
-the CloudFormation outputs — `GatewayUrl`, `DemoUserPoolId`,
-`DemoUserPoolClientId`, `AdminIdentityPoolId`, region — and re-upload
-`config.js`. These are all public identifiers; put no secret there.
+`npx cdk deploy -c deployment_config=config/demo.json` uploads `dist/` and writes
+`config.js` with the generated public resource identifiers. No secret is
+written to the site.
 
-## Screens
-
-- **Summary** — enforcement (authoritative DynamoDB state) and observability
-  (CloudWatch namespace) shown separately, plus the deploy-time reconciler
-  interval (read-only) and a Mode A vs Mode B note.
-- **Users** — per-user daily budget, today's spend, status, and managed Mantle
-  project, with set-budget / block-unblock / set-project actions.
+For a customer IdP, replace the demo Cognito login integration and provide an
+Identity Pool or equivalent temporary AWS credential flow. See
+[`../DEPLOYMENT.md`](../DEPLOYMENT.md).

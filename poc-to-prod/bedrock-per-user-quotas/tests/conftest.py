@@ -14,10 +14,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "gateway"))
-sys.path.insert(0, str(ROOT / "reconciler"))
+sys.path.insert(0, str(ROOT / "usage_processor"))
 
 os.environ.setdefault("AWS_REGION", "us-east-1")
-os.environ.setdefault("MANTLE_REGION", "us-east-1")
 os.environ.setdefault("USERS_TABLE", "users-test")
 os.environ.setdefault("USAGE_TABLE", "usage-test")
 # HS256 dev-mode JWT verification for tests (no IdP / network needed).
@@ -41,7 +40,7 @@ class FakeTable:
         self.items[self._key(Item)] = dict(Item)
         return {}
 
-    def get_item(self, Key: dict):
+    def get_item(self, Key: dict, ConsistentRead: bool = False):
         item = self.items.get(self._key(Key))
         return {"Item": dict(item)} if item else {}
 
