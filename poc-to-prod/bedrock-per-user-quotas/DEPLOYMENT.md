@@ -293,25 +293,27 @@ export USER_POOL_ID=$(
 
 aws cognito-idp admin-create-user \
   --user-pool-id "$USER_POOL_ID" \
-  --username admin@example.com \
-  --user-attributes Name=email,Value=admin@example.com \
+  --username quota-admin \
+  --user-attributes \
+    Name=email,Value=admin@example.com \
+    Name=email_verified,Value=true \
   --message-action SUPPRESS
 
 aws cognito-idp admin-set-user-password \
   --user-pool-id "$USER_POOL_ID" \
-  --username admin@example.com \
+  --username quota-admin \
   --password 'Demo-only-Change-Me-42!' \
   --permanent
 
 aws cognito-idp admin-add-user-to-group \
   --user-pool-id "$USER_POOL_ID" \
-  --username admin@example.com \
+  --username quota-admin \
   --group-name quota-admins
 ```
 
 Open the `AdminUiUrl` output. The deployment writes `config.js` with the
 generated broker URL, Region, user pool/client, and identity pool. It contains
-no secret.
+no secret. Sign in as `quota-admin` or its verified `admin@example.com` alias.
 
 ### 6. Administrative smoke test
 
@@ -362,6 +364,23 @@ cdk/.venv/bin/python examples/sigv4_gateway.py \
   --admin-key "$ADMIN_KEY" \
   get-usage "$USER_ID"
 ```
+
+For the complete enforcement smoke test, run
+[`notebook/per_user_quota_demo.ipynb`](notebook/per_user_quota_demo.ipynb).
+Its main path:
+
+1. Reads the identity's current daily aggregate.
+2. Sets each token limit to current usage plus one token.
+3. Vends an STS session and invokes GPT OSS 20B with `Converse`.
+4. Displays the actual `Converse` response `usage`.
+5. Polls until invocation logging updates DynamoDB.
+6. Proves that a new credential request is rejected.
+7. Raises all limits through the admin API and proves vending recovers.
+8. Locates the matching request ID in the per-user CloudWatch EMF event.
+
+The notebook does not depend on `CountTokens`; support varies by model and it
+does not participate in enforcement. A separate optional diagnostic cell is
+disabled by default and reports a skip for unsupported models.
 
 ## Production/shared account
 

@@ -173,7 +173,11 @@ smoke tests, and cleanup.
 
 Use [DEMO.md](DEMO.md) as the presentation runbook and
 [`notebook/per_user_quota_demo.ipynb`](notebook/per_user_quota_demo.ipynb) for
-the executable capability walkthrough.
+the executable capability walkthrough. The notebook uses GPT OSS 20B
+`Converse`, displays actual response usage, waits for invocation-log metering,
+proves automatic quota rejection, raises the limits, and proves credential
+vending recovers. `CountTokens` is only an optional model-dependent
+diagnostic; it is not part of enforcement.
 
 ## Administrative client
 
