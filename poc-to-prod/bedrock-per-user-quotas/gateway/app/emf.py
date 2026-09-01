@@ -5,7 +5,7 @@ automatically -- no PutMetricData API calls, no extra latency on the hot
 path. Locally they are just structured log lines.
 
 Metrics (namespace configurable, default BedrockQuotaGateway):
-  CredentialsVended, Throttles
+  CredentialsVended, LeaseStarted, LeaseRefreshed, LeaseRetried, Throttles
 Dimensions: [UserId] and service-wide.
 """
 
@@ -50,4 +50,16 @@ def record_credentials_vended(user_id: str) -> None:
         dimensions=[["UserId"], []],
         properties={"UserId": user_id},
         metrics={"CredentialsVended": ("Count", 1)},
+    )
+
+
+def record_lease_event(user_id: str, event: str, generation: int) -> None:
+    """Emit one logical-lease lifecycle transition."""
+    allowed = {"LeaseStarted", "LeaseRefreshed", "LeaseRetried"}
+    if event not in allowed:
+        raise ValueError(f"unsupported lease event: {event}")
+    _emit(
+        dimensions=[["UserId"], []],
+        properties={"UserId": user_id, "LeaseGeneration": generation},
+        metrics={event: ("Count", 1)},
     )

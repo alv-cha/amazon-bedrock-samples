@@ -33,39 +33,63 @@ Region-specific.
 
 ## Enforcement guarantee
 
-This is **bounded-overspend enforcement**, not a synchronous hard cap.
-
-The broker refuses new credentials when the latest daily aggregate reaches any
-configured limit. Credentials already issued remain usable until their STS
-expiration.
+This remains **bounded-overspend enforcement**, not a synchronous hard cap.
+The broker never inspects inference requests. Exposure is:
 
 ```text
-possible overspend =
-    invocation-log delivery latency
-  + remaining credential lifetime
-  + concurrent calls made with those credentials
+invocation-log delivery latency
++ usage-processing latency
++ post-detection permission cutoff
++ concurrent or already-authorized requests
 ```
 
-The default STS duration is 15 minutes, which is the minimum accepted by
-`AssumeRole`. A one- or five-minute credential lifetime cannot be implemented
-with normal STS role sessions.
+The credential broker supports three explicit modes:
+
+| Mode | STS session | Post-detection behavior | Qualification |
+|---|---:|---|---|
+| `legacy` | 15–60 minutes | Blocks renewal; existing access ends at STS expiry | Default, existing behavior |
+| `lease` | 15 minutes | An immutable session policy ends Bedrock permission after 1, 5, or 15 minutes | Implemented; keep opt-in until the sandbox probe passes |
+| `revocation` | 60 minutes | Managed-policy shards deny blocked `aws:SourceIdentity` values after IAM propagation | Experimental; requires sandbox latency/capacity qualification |
+
+`AssumeRole` still has a 15-minute minimum. In lease mode, the keys last 15
+minutes but their embedded session policy contains an earlier
+`aws:CurrentTime` deadline. Extending that permission requires another broker
+check and STS session. The lazy credential provider caches one set for all
+Bedrock calls in the interval; it does not call `AssumeRole` per inference.
+
+The Lambda broker itself uses role chaining, so `vended_ttl_seconds` is limited
+to 3,600 seconds. An eight-hour session is rejected rather than synthesizing a
+configuration that fails at runtime.
+
+IAM updates are eventually consistent. Revocation mode reports propagation and
+capacity failures and falls back to the 60-minute session deadline. An
+operator-confirmed emergency stop closes new vending before applying a separate
+role-wide deny. Already-authorized streams may finish in every mode.
 
 If a workload requires a strict decision before every inference request, it
-must place an enforcement component in the inference data path. That is
-deliberately outside this simplified sample.
+must place an enforcement component in the inference data path. That remains
+outside this direct-to-Runtime architecture.
 
 ## Components
 
 | Component | Responsibility |
 |---|---|
-| Broker/admin Lambda | JWT validation, quota check, STS vending, admin API |
-| BedrockUserRole | Runtime-only permissions restricted by model ARN |
-| Users table | Identity, status, limits, and session reverse maps |
+| Broker/admin Lambda | JWT validation, quota check, logical lease, STS vending, admin API |
+| BedrockUserRole | Runtime-only permissions restricted by model ARN and permissions boundary |
+| Users table | Identity, status, limits, logical leases, session maps, control state |
 | Usage table | Daily aggregates and invocation idempotency markers |
 | Invocation logging | Trusted principal ARN, model, request ID, and tokens |
-| Usage processor | Event-driven pricing, deduplication, counters, blocking |
-| CloudWatch/SNS | Operational metrics, warnings, and block notifications |
-| Admin UI | User status, limits, and current usage |
+| Usage processor | Event-driven pricing, deduplication, counters, blocking, detection-lag metric |
+| Revocation processor | Optional sharded `SourceIdentity` deny reconciliation |
+| Emergency processor | Operator-controlled role-wide deny state machine |
+| CloudWatch/SNS | Operational metrics, alarms, warnings, and block notifications |
+| Admin UI | User controls plus read-only enforcement, emergency, revocation, alarm/DLQ, and qualification status |
+
+The admin UI's Operations panel is read-only. The broker reads CloudWatch
+metrics and alarm state server-side with `GetMetricData` and `DescribeAlarms`;
+the browser receives no CloudWatch permissions, emergency key, secret ARN, IAM
+policy controls, or emergency/revocation mutation buttons. Missing metrics and
+`INSUFFICIENT_DATA` are displayed as unknown rather than healthy.
 
 CloudWatch is the observability system. DynamoDB remains necessary because the
 broker needs a low-latency quota decision when credentials are requested.
@@ -130,6 +154,13 @@ quotas remain independent of the USD estimate.
 - The broker Function URL always uses `AWS_IAM`.
 - The broker role cannot invoke a model; only the vended role can.
 - The vended role receives only the required Runtime actions.
+- A managed permissions boundary caps the vended role at the configured
+  Bedrock actions and model resources, including when optional policy-writing
+  controllers are enabled.
+- Lease session policies can only reduce the role's model allowlist; their
+  `Resource: "*"` cannot grant access absent from the role and boundary.
+- Revocation and emergency processors can version only their designated
+  pre-attached policies. They cannot edit the role, trust policy, or boundary.
 - `allowed_model_arns` controls models and inference profiles at IAM.
 - Long-term and short-term Bedrock bearer keys are not vended. The
   `bedrock:CallWithBearerToken` permission requires `Resource: "*"` and would
@@ -196,7 +227,11 @@ python examples/sigv4_gateway.py \
 ```
 
 Commands: `create-user`, `list-users`, `update-user`, `block-user`,
-`unblock-user`, and `get-usage`.
+`unblock-user`, `get-usage`, `emergency-stop`, and `emergency-recover`.
+Emergency commands require the separate `EmergencyKeySecretArn`, a reason,
+and the API's explicit confirmation phrase; routine admin keys/JWTs cannot
+invoke them. Triggering one affects every vended session and must be an
+operator break-glass decision.
 
 ## Repository layout
 
@@ -205,7 +240,10 @@ Commands: `create-user`, `list-users`, `update-user`, `block-user`,
 | `cdk/` | Validated configuration and AWS infrastructure |
 | `gateway/` | Broker and administrative control-plane API |
 | `usage_processor/` | Invocation-log subscription consumer |
+| `revocation_processor/` | Optional sharded per-user IAM deny reconciler |
+| `emergency_processor/` | Operator-controlled shared-role deny controller |
 | `admin-ui/` | Static React administration console |
-| `examples/` | SigV4 admin and direct Runtime examples |
+| `examples/` | SigV4 admin, lazy credential provider, and Runtime examples |
+| `spikes/` | Guarded non-production qualification probes and results |
 | `notebook/` | Complete deployed capability walkthrough |
 | `tests/` | Unit, API, infrastructure, notebook, and pricing tests |

@@ -63,6 +63,7 @@ class FunctionUrlSigV4Auth(httpx.Auth):
 def signed_request(method: str, url: str, *, region: str | None = None,
                    user_token: str | None = None,
                    admin_key: str | None = None,
+                   emergency_key: str | None = None,
                    aws_session: boto3.Session | None = None,
                    http_client: httpx.Client | None = None,
                    timeout=None,
@@ -73,6 +74,8 @@ def signed_request(method: str, url: str, *, region: str | None = None,
         headers["X-Quota-User-Token"] = user_token
     if admin_key:
         headers["X-Quota-Admin-Key"] = admin_key
+    if emergency_key:
+        headers["X-Quota-Emergency-Key"] = emergency_key
 
     def send(client: httpx.Client) -> httpx.Response:
         request_kwargs = dict(kwargs)
@@ -112,6 +115,19 @@ def _admin_request_args(args) -> tuple[str, str, dict]:
         }
     if args.command == "list-users":
         return "GET", f"{base}/admin/users", {}
+    if args.command in {"emergency-stop", "emergency-recover"}:
+        activate = args.command == "emergency-stop"
+        return "POST", f"{base}/admin/emergency-stop", {
+            "json": {
+                "action": "activate" if activate else "recover",
+                "confirmation": (
+                    "STOP_ALL_BEDROCK_SESSIONS"
+                    if activate
+                    else "RESTORE_ALL_BEDROCK_SESSIONS"
+                ),
+                "reason": args.reason,
+            }
+        }
 
     user_id = quote(args.user_id, safe="")
     if args.command == "update-user":
@@ -161,7 +177,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--admin-key",
         default=os.environ.get("ADMIN_KEY"),
-        help="Admin API key (or ADMIN_KEY).",
+        help="Routine admin API key (or ADMIN_KEY).",
+    )
+    parser.add_argument(
+        "--emergency-key",
+        default=os.environ.get("EMERGENCY_ADMIN_KEY"),
+        help="Break-glass emergency key (or EMERGENCY_ADMIN_KEY).",
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -173,6 +194,12 @@ def _parser() -> argparse.ArgumentParser:
     create.add_argument("--daily-output-tokens", type=int, required=True)
 
     commands.add_parser("list-users")
+
+    emergency_stop = commands.add_parser("emergency-stop")
+    emergency_stop.add_argument("--reason", required=True)
+
+    emergency_recover = commands.add_parser("emergency-recover")
+    emergency_recover.add_argument("--reason", required=True)
 
     update = commands.add_parser("update-user")
     update.add_argument("user_id")
@@ -199,7 +226,13 @@ def main() -> None:
     args = parser.parse_args()
     if not args.gateway_url:
         parser.error("--gateway-url or GATEWAY_URL is required")
-    if not args.admin_key:
+    is_emergency = args.command in {"emergency-stop", "emergency-recover"}
+    if is_emergency and not args.emergency_key:
+        parser.error(
+            "--emergency-key or EMERGENCY_ADMIN_KEY is required for "
+            "break-glass commands"
+        )
+    if not is_emergency and not args.admin_key:
         parser.error("--admin-key or ADMIN_KEY is required")
     try:
         method, url, request_kwargs = _admin_request_args(args)
@@ -214,7 +247,8 @@ def main() -> None:
         method,
         url,
         region=args.region,
-        admin_key=args.admin_key,
+        admin_key=(None if is_emergency else args.admin_key),
+        emergency_key=(args.emergency_key if is_emergency else None),
         aws_session=session,
         **request_kwargs,
     )

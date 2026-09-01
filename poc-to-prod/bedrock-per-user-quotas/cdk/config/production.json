@@ -14,6 +14,13 @@
   "usage_retention_days": 90,
   "retain_tables_on_delete": true,
   "vended_ttl_seconds": 900,
+  "credential_enforcement_mode": "legacy",
+  "permission_lease_seconds": 300,
+  "refresh_overlap_seconds": 10,
+  "refresh_jitter_seconds": 5,
+  "vend_rate_limit_per_minute": 6,
+  "revocation_policy_shards": 19,
+  "revocation_reconcile_minutes": 5,
   "manage_invocation_logging": false,
   "invocation_log_group_name": "/aws/bedrock/modelinvocations",
   "invoker_principal_arns": [

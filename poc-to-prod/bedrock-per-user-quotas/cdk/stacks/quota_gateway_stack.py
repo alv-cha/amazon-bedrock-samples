@@ -12,6 +12,7 @@ Resources:
 - CloudWatch dashboard over broker and metering EMF metrics
 """
 
+import json
 import os
 
 import aws_cdk as cdk
@@ -22,11 +23,15 @@ from aws_cdk import (
     aws_cloudfront as cloudfront,
     aws_cloudfront_origins as cloudfront_origins,
     aws_cloudwatch as cw,
+    aws_cloudwatch_actions as cw_actions,
     aws_cognito as cognito,
     aws_cognito_identitypool as idpool,
     aws_dynamodb as ddb,
+    aws_events as events,
+    aws_events_targets as events_targets,
     aws_iam as iam,
     aws_lambda as lambda_,
+    aws_lambda_event_sources as lambda_event_sources,
     aws_logs as logs,
     aws_logs_destinations as logs_destinations,
     aws_s3 as s3,
@@ -34,6 +39,7 @@ from aws_cdk import (
     aws_secretsmanager as sm,
     aws_sns as sns,
     aws_sns_subscriptions as subs,
+    aws_sqs as sqs,
     custom_resources as cr,
 )
 from constructs import Construct
@@ -171,6 +177,9 @@ class QuotaGatewayStack(Stack):
             self, "UsersTable",
             partition_key=ddb.Attribute(name="user_id", type=ddb.AttributeType.STRING),
             billing_mode=ddb.BillingMode.PAY_PER_REQUEST,
+            # Emergency-stop state is always stream-driven. Revocation mode
+            # reuses this stream for its separate status sentinels.
+            stream=ddb.StreamViewType.NEW_AND_OLD_IMAGES,
             time_to_live_attribute="expires_at",
             removal_policy=table_removal_policy,
         )
@@ -192,6 +201,16 @@ class QuotaGatewayStack(Stack):
             description="Admin key for the quota gateway /admin API",
             generate_secret_string=sm.SecretStringGenerator(
                 exclude_punctuation=True, password_length=40,
+            ),
+        )
+        emergency_secret = sm.Secret(
+            self,
+            "EmergencyAdminKey",
+            description=(
+                "Break-glass key for role-wide Bedrock emergency stop"
+            ),
+            generate_secret_string=sm.SecretStringGenerator(
+                exclude_punctuation=True, password_length=48,
             ),
         )
 
@@ -247,6 +266,7 @@ class QuotaGatewayStack(Stack):
                 "USAGE_TABLE": usage_table.table_name,
                 "METRICS_NAMESPACE": METRICS_NAMESPACE,
                 "ADMIN_KEY_SECRET_ARN": admin_secret.secret_arn,
+                "EMERGENCY_KEY_SECRET_ARN": emergency_secret.secret_arn,
                 "AUTO_PROVISION_USERS": str(config.auto_provision_users).lower(),
                 "DEFAULT_DAILY_USD": str(config.default_daily_usd),
                 "DEFAULT_DAILY_INPUT_TOKENS": str(
@@ -256,6 +276,43 @@ class QuotaGatewayStack(Stack):
                     config.default_daily_output_tokens
                 ),
                 "USAGE_RETENTION_DAYS": str(config.usage_retention_days),
+                # Credential lifetime and refresh controls. The runtime keeps
+                # legacy behavior unless the lease/revocation mode is selected.
+                "CREDENTIAL_ENFORCEMENT_MODE": (
+                    config.credential_enforcement_mode
+                ),
+                "PERMISSION_LEASE_SECONDS": str(
+                    config.permission_lease_seconds
+                ),
+                "REFRESH_OVERLAP_SECONDS": str(
+                    config.refresh_overlap_seconds
+                ),
+                "REFRESH_JITTER_SECONDS": str(
+                    config.refresh_jitter_seconds
+                ),
+                "VEND_RATE_LIMIT_PER_MINUTE": str(
+                    config.vend_rate_limit_per_minute
+                ),
+                "REVOCATION_POLICY_SHARDS": str(
+                    config.revocation_policy_shards
+                ),
+                "REVOCATION_RECONCILE_MINUTES": str(
+                    config.revocation_reconcile_minutes
+                ),
+                "REVOCATION_POLICY_MAX_CHARACTERS": "6144",
+                "QUALIFICATION_STATUS_JSON": json.dumps(
+                    {
+                        "legacy": "baseline_existing_behavior",
+                        "lease": "pending_live_sandbox_probe",
+                        "revocation": (
+                            "experimental_pending_propagation_isolation_probe"
+                        ),
+                        "emergency": (
+                            "pending_live_activation_recovery_exercise"
+                        ),
+                    },
+                    separators=(",", ":"),
+                ),
                 # JWT auth
                 "JWT_ISSUER": jwt_issuer,
                 "JWT_AUDIENCE": jwt_audience,
@@ -270,6 +327,7 @@ class QuotaGatewayStack(Stack):
         users_table.grant_read_write_data(broker_api_fn)
         usage_table.grant_read_data(broker_api_fn)
         admin_secret.grant_read(broker_api_fn)
+        emergency_secret.grant_read(broker_api_fn)
 
         # ------------------------------------------------------------------
         # Per-user vended role
@@ -279,12 +337,35 @@ class QuotaGatewayStack(Stack):
         # identity claim (reverse-mapped for metering). The user then calls the
         # bedrock-runtime endpoint directly with the short-lived credentials.
         # ------------------------------------------------------------------
+        # A permissions boundary caps the vended role even when the optional
+        # revocation worker can update attached deny-policy versions. The
+        # worker cannot turn that write capability into IAM or wider-model
+        # permissions because those actions/resources are absent here.
+        bedrock_permissions_boundary = iam.ManagedPolicy(
+            self,
+            "BedrockUserPermissionsBoundary",
+            description=(
+                "Maximum permissions for sessions vended by the quota broker"
+            ),
+            statements=[
+                iam.PolicyStatement(
+                    effect=iam.Effect.ALLOW,
+                    actions=[
+                        "bedrock:CountTokens",
+                        "bedrock:InvokeModel",
+                        "bedrock:InvokeModelWithResponseStream",
+                    ],
+                    resources=list(config.allowed_model_arns),
+                )
+            ],
+        )
         bedrock_user_role = iam.Role(
             self, "BedrockUserRole",
             # Only the broker Lambda role may assume this. The broker assigns
             # SourceIdentity and the quota-user session tag; users never hold
             # static Bedrock access.
             assumed_by=iam.ArnPrincipal(broker_api_fn.role.role_arn),
+            permissions_boundary=bedrock_permissions_boundary,
             # >= the vended TTL (and >= the STS 3600s floor), so the broker's
             # AssumeRole DurationSeconds can never exceed the role's ceiling.
             max_session_duration=Duration.seconds(max_session_seconds),
@@ -316,6 +397,34 @@ class QuotaGatewayStack(Stack):
                 # weaken this model/inference-profile allowlist.
                 resources=list(config.allowed_model_arns),
             )
+        )
+        emergency_deny_policy = iam.ManagedPolicy(
+            self,
+            "EmergencyBedrockDenyPolicy",
+            description=(
+                "Operator-controlled role-wide Bedrock emergency stop"
+            ),
+            statements=[
+                iam.PolicyStatement(
+                    effect=iam.Effect.DENY,
+                    actions=[
+                        "bedrock:CountTokens",
+                        "bedrock:InvokeModel",
+                        "bedrock:InvokeModelWithResponseStream",
+                    ],
+                    resources=["*"],
+                    # No-op until the emergency processor replaces this
+                    # version with an unconditional deny.
+                    conditions={
+                        "StringEquals": {
+                            "aws:SourceIdentity": [
+                                "__emergency_stop_inactive__"
+                            ]
+                        }
+                    },
+                )
+            ],
+            roles=[bedrock_user_role],
         )
         # Let the gateway role assume the vended role AND stamp the per-user
         # identity/tag. SetSourceIdentity + TagSession must be granted on the
@@ -742,6 +851,341 @@ class QuotaGatewayStack(Stack):
         )
 
         # ------------------------------------------------------------------
+        # Operator-confirmed emergency stop. The admin API closes the strongly
+        # consistent vending gate first; this worker then applies/removes the
+        # shared-role deny and marks the control state stable.
+        # ------------------------------------------------------------------
+        operations_alarms: dict[str, cw.Alarm] = {}
+        emergency_dlq = sqs.Queue(
+            self,
+            "EmergencyStopDeadLetterQueue",
+            encryption=sqs.QueueEncryption.SQS_MANAGED,
+            retention_period=Duration.days(14),
+        )
+        emergency_fn = lambda_.Function(
+            self,
+            "EmergencyStopProcessorFn",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            memory_size=256,
+            timeout=Duration.minutes(2),
+            reserved_concurrent_executions=1,
+            handler="handler.handler",
+            code=lambda_.Code.from_asset("../emergency_processor"),
+            environment={
+                "USERS_TABLE": users_table.table_name,
+                "SNS_TOPIC_ARN": alert_topic.topic_arn,
+                "METRICS_NAMESPACE": METRICS_NAMESPACE,
+                "EMERGENCY_POLICY_ARN": (
+                    emergency_deny_policy.managed_policy_arn
+                ),
+            },
+        )
+        emergency_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["dynamodb:GetItem", "dynamodb:UpdateItem"],
+                resources=[users_table.table_arn],
+                conditions={
+                    "ForAllValues:StringEquals": {
+                        "dynamodb:LeadingKeys": [
+                            "CONFIG#EMERGENCY_STOP"
+                        ]
+                    }
+                },
+            )
+        )
+        alert_topic.grant_publish(emergency_fn)
+        emergency_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "iam:GetPolicy",
+                    "iam:GetPolicyVersion",
+                    "iam:ListPolicyVersions",
+                    "iam:CreatePolicyVersion",
+                    "iam:DeletePolicyVersion",
+                ],
+                resources=[emergency_deny_policy.managed_policy_arn],
+            )
+        )
+        emergency_fn.add_event_source(
+            lambda_event_sources.DynamoEventSource(
+                users_table,
+                starting_position=lambda_.StartingPosition.LATEST,
+                batch_size=10,
+                max_batching_window=Duration.seconds(1),
+                bisect_batch_on_error=True,
+                retry_attempts=10,
+                on_failure=lambda_event_sources.SqsDlq(emergency_dlq),
+                filters=[
+                    lambda_.FilterCriteria.filter(
+                        {
+                            "dynamodb": {
+                                "Keys": {
+                                    "user_id": {
+                                        "S": ["CONFIG#EMERGENCY_STOP"]
+                                    }
+                                }
+                            }
+                        }
+                    )
+                ],
+            )
+        )
+        events.Rule(
+            self,
+            "EmergencyStopReconciliationSchedule",
+            schedule=events.Schedule.rate(Duration.minutes(1)),
+            targets=[
+                events_targets.LambdaFunction(
+                    emergency_fn,
+                    event=events.RuleTargetInput.from_object(
+                        {"source": "aws.events"}
+                    ),
+                )
+            ],
+        )
+        emergency_failure_alarm = cw.Alarm(
+            self,
+            "EmergencyStopFailureAlarm",
+            metric=cw.Metric(
+                namespace=METRICS_NAMESPACE,
+                metric_name="EmergencyStopFailure",
+                statistic="Sum",
+                period=Duration.minutes(5),
+            ),
+            threshold=1,
+            evaluation_periods=1,
+        )
+        emergency_failure_alarm.add_alarm_action(
+            cw_actions.SnsAction(alert_topic)
+        )
+        operations_alarms["emergency_failure"] = emergency_failure_alarm
+        emergency_dlq_alarm = cw.Alarm(
+            self,
+            "EmergencyStopDlqAlarm",
+            metric=emergency_dlq.metric_approximate_number_of_messages_visible(
+                period=Duration.minutes(5)
+            ),
+            threshold=1,
+            evaluation_periods=1,
+        )
+        emergency_dlq_alarm.add_alarm_action(cw_actions.SnsAction(alert_topic))
+        operations_alarms["emergency_dlq"] = emergency_dlq_alarm
+
+        # ------------------------------------------------------------------
+        # Optional active-session revocation. IAM updates are isolated from
+        # usage accounting and serialized at concurrency one. This path stays
+        # opt-in until the non-production propagation probe qualifies it.
+        # ------------------------------------------------------------------
+        revocation_policies: list[iam.ManagedPolicy] = []
+        if config.credential_enforcement_mode == "revocation":
+            no_blocked_identity = "__no_blocked_quota_identity__"
+            for index in range(config.revocation_policy_shards):
+                policy = iam.ManagedPolicy(
+                    self,
+                    f"QuotaRevocationPolicy{index}",
+                    description=(
+                        "Dynamic SourceIdentity deny shard for Bedrock quota "
+                        "sessions"
+                    ),
+                    statements=[
+                        iam.PolicyStatement(
+                            effect=iam.Effect.DENY,
+                            actions=[
+                                "bedrock:CountTokens",
+                                "bedrock:InvokeModel",
+                                "bedrock:InvokeModelWithResponseStream",
+                            ],
+                            resources=["*"],
+                            conditions={
+                                "StringEquals": {
+                                    "aws:SourceIdentity": [
+                                        no_blocked_identity
+                                    ]
+                                }
+                            },
+                        )
+                    ],
+                    roles=[bedrock_user_role],
+                )
+                revocation_policies.append(policy)
+
+            revocation_dlq = sqs.Queue(
+                self,
+                "RevocationDeadLetterQueue",
+                encryption=sqs.QueueEncryption.SQS_MANAGED,
+                retention_period=Duration.days(14),
+            )
+            revocation_fn = lambda_.Function(
+                self,
+                "RevocationProcessorFn",
+                runtime=lambda_.Runtime.PYTHON_3_12,
+                memory_size=256,
+                timeout=Duration.minutes(2),
+                reserved_concurrent_executions=1,
+                handler="handler.handler",
+                code=lambda_.Code.from_asset("../revocation_processor"),
+                environment={
+                    "USERS_TABLE": users_table.table_name,
+                    "SNS_TOPIC_ARN": alert_topic.topic_arn,
+                    "METRICS_NAMESPACE": METRICS_NAMESPACE,
+                    "REVOCATION_POLICY_ARNS_JSON": cdk.Fn.to_json_string(
+                        [
+                            policy.managed_policy_arn
+                            for policy in revocation_policies
+                        ]
+                    ),
+                    "REVOCATION_POLICY_MAX_CHARACTERS": "6144",
+                },
+            )
+            users_table.grant_read_data(revocation_fn)
+            alert_topic.grant_publish(revocation_fn)
+            revocation_fn.add_to_role_policy(
+                iam.PolicyStatement(
+                    actions=[
+                        "iam:GetPolicy",
+                        "iam:GetPolicyVersion",
+                        "iam:ListPolicyVersions",
+                        "iam:CreatePolicyVersion",
+                        "iam:DeletePolicyVersion",
+                    ],
+                    resources=[
+                        policy.managed_policy_arn
+                        for policy in revocation_policies
+                    ],
+                )
+            )
+            revocation_fn.add_event_source(
+                lambda_event_sources.DynamoEventSource(
+                    users_table,
+                    starting_position=lambda_.StartingPosition.LATEST,
+                    batch_size=100,
+                    max_batching_window=Duration.seconds(5),
+                    bisect_batch_on_error=True,
+                    retry_attempts=10,
+                    on_failure=lambda_event_sources.SqsDlq(
+                        revocation_dlq
+                    ),
+                    filters=[
+                        lambda_.FilterCriteria.filter(
+                            {
+                                "dynamodb": {
+                                    "Keys": {
+                                        "user_id": {
+                                            "S": [
+                                                {"prefix": "REVOCATION#"}
+                                            ]
+                                        }
+                                    }
+                                }
+                            }
+                        )
+                    ],
+                )
+            )
+            events.Rule(
+                self,
+                "RevocationReconciliationSchedule",
+                schedule=events.Schedule.rate(
+                    Duration.minutes(
+                        config.revocation_reconcile_minutes
+                    )
+                ),
+                targets=[
+                    events_targets.LambdaFunction(
+                        revocation_fn,
+                        event=events.RuleTargetInput.from_object(
+                            {"source": "aws.events"}
+                        ),
+                    )
+                ],
+            )
+            revocation_failure_alarm = cw.Alarm(
+                self,
+                "RevocationSyncFailureAlarm",
+                metric=cw.Metric(
+                    namespace=METRICS_NAMESPACE,
+                    metric_name="RevocationSyncFailure",
+                    statistic="Sum",
+                    period=Duration.minutes(5),
+                ),
+                threshold=1,
+                evaluation_periods=1,
+            )
+            revocation_failure_alarm.add_alarm_action(
+                cw_actions.SnsAction(alert_topic)
+            )
+            operations_alarms["revocation_failure"] = (
+                revocation_failure_alarm
+            )
+            revocation_overflow_alarm = cw.Alarm(
+                self,
+                "RevocationPolicyOverflowAlarm",
+                metric=cw.Metric(
+                    namespace=METRICS_NAMESPACE,
+                    metric_name="RevocationPolicyOverflow",
+                    statistic="Sum",
+                    period=Duration.minutes(5),
+                ),
+                threshold=1,
+                evaluation_periods=1,
+            )
+            revocation_overflow_alarm.add_alarm_action(
+                cw_actions.SnsAction(alert_topic)
+            )
+            operations_alarms["revocation_overflow"] = (
+                revocation_overflow_alarm
+            )
+            revocation_dlq_alarm = cw.Alarm(
+                self,
+                "RevocationDlqAlarm",
+                metric=revocation_dlq.metric_approximate_number_of_messages_visible(
+                    period=Duration.minutes(5)
+                ),
+                threshold=1,
+                evaluation_periods=1,
+            )
+            revocation_dlq_alarm.add_alarm_action(
+                cw_actions.SnsAction(alert_topic)
+            )
+            operations_alarms["revocation_dlq"] = revocation_dlq_alarm
+            revocation_iterator_age_alarm = cw.Alarm(
+                self,
+                "RevocationIteratorAgeAlarm",
+                metric=revocation_fn.metric(
+                    "IteratorAge",
+                    statistic="Maximum",
+                    period=Duration.minutes(5),
+                ),
+                threshold=300_000,
+                evaluation_periods=1,
+            )
+            revocation_iterator_age_alarm.add_alarm_action(
+                cw_actions.SnsAction(alert_topic)
+            )
+            operations_alarms["revocation_iterator_age"] = (
+                revocation_iterator_age_alarm
+            )
+
+        broker_api_fn.add_environment(
+            "OPERATIONS_ALARM_NAMES_JSON",
+            cdk.Fn.to_json_string(
+                {
+                    key: alarm.alarm_name
+                    for key, alarm in operations_alarms.items()
+                }
+            ),
+        )
+        broker_api_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "cloudwatch:GetMetricData",
+                    "cloudwatch:DescribeAlarms",
+                ],
+                resources=["*"],
+            )
+        )
+
+        # ------------------------------------------------------------------
         # Dashboard
         # ------------------------------------------------------------------
         dashboard = cw.Dashboard(
@@ -783,6 +1227,58 @@ class QuotaGatewayStack(Stack):
                 ],
             ),
         )
+        dashboard.add_widgets(
+            cw.GraphWidget(
+                title="Invocation-to-detection lag (p95)",
+                width=12,
+                left=[
+                    cw.Metric(
+                        namespace=METRICS_NAMESPACE,
+                        metric_name="DetectionLagMilliseconds",
+                        statistic="p95",
+                        period=Duration.minutes(5),
+                    )
+                ],
+            ),
+            cw.GraphWidget(
+                title="Permission lease lifecycle",
+                width=12,
+                left=[
+                    cw.Metric(
+                        namespace=METRICS_NAMESPACE,
+                        metric_name=metric_name,
+                        statistic="Sum",
+                        period=Duration.minutes(5),
+                    )
+                    for metric_name in (
+                        "LeaseStarted",
+                        "LeaseRefreshed",
+                        "LeaseRetried",
+                    )
+                ],
+            ),
+        )
+
+        if config.credential_enforcement_mode == "revocation":
+            dashboard.add_widgets(
+                cw.GraphWidget(
+                    title="Revocation reconciliation",
+                    width=12,
+                    left=[
+                        cw.Metric(
+                            namespace=METRICS_NAMESPACE,
+                            metric_name=metric_name,
+                            statistic="Sum",
+                            period=Duration.minutes(5),
+                        )
+                        for metric_name in (
+                            "RevocationSyncSuccess",
+                            "RevocationSyncFailure",
+                            "RevocationPolicyOverflow",
+                        )
+                    ],
+                )
+            )
 
         # ------------------------------------------------------------------
         # Outputs
@@ -801,6 +1297,12 @@ class QuotaGatewayStack(Stack):
             description="Deprecated alias of BrokerApiUrl",
         )
         cdk.CfnOutput(self, "AdminKeySecretArn", value=admin_secret.secret_arn)
+        cdk.CfnOutput(
+            self,
+            "EmergencyKeySecretArn",
+            value=emergency_secret.secret_arn,
+            description="Break-glass key; never embed in the admin UI",
+        )
         cdk.CfnOutput(self, "UsersTableName", value=users_table.table_name)
         cdk.CfnOutput(self, "UsageTableName", value=usage_table.table_name)
         cdk.CfnOutput(self, "AlertTopicArn", value=alert_topic.topic_arn)
@@ -812,6 +1314,12 @@ class QuotaGatewayStack(Stack):
                       description="OIDC issuer whose JWTs the broker accepts")
         cdk.CfnOutput(self, "DenyDirectBedrockPolicyArn", value=deny_direct.managed_policy_arn,
                       description="Attach to non-vended roles to prevent quota bypass")
+        cdk.CfnOutput(
+            self,
+            "EmergencyDenyPolicyArn",
+            value=emergency_deny_policy.managed_policy_arn,
+            description="Operator-controlled shared-role emergency deny policy",
+        )
         cdk.CfnOutput(
             self,
             "BrokerApiRoleArn",

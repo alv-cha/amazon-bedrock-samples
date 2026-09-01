@@ -170,6 +170,36 @@ def test_subscription_event_updates_daily_usage(fake_dynamodb, fake_sns, monkeyp
     assert row["cost_micro"] == 200
 
 
+def test_emf_reports_invocation_to_detection_lag(
+    fake_dynamodb, fake_sns, monkeypatch, capsys
+):
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    _seed_user(fake_dynamodb, "alice")
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+    occurred_at = datetime.now(timezone.utc) - timedelta(seconds=2)
+
+    _run(
+        _subscription([_record(when=occurred_at)]),
+        fake_dynamodb,
+        fake_sns,
+    )
+
+    records = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if line.strip()
+    ]
+    emf = next(record for record in records if "_aws" in record)
+    metric_names = {
+        metric["Name"]
+        for metric in emf["_aws"]["CloudWatchMetrics"][0]["Metrics"]
+    }
+    assert "DetectionLagMilliseconds" in metric_names
+    assert emf["DetectionLagMilliseconds"] >= 2_000
+    assert emf["InvocationOccurredAt"] == occurred_at.isoformat()
+    assert emf["ProcessedAt"]
+
+
 def test_duplicate_delivery_is_idempotent(fake_dynamodb, fake_sns, monkeypatch):
     monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
     _seed_user(fake_dynamodb, "alice")
@@ -261,6 +291,10 @@ def test_processor_warns_once_then_blocks_at_any_limit(
     )["Item"]
     assert user["status"] == "blocked"
     assert user["status_reason"].startswith("auto:")
+    revocation_event = fake_dynamodb.Table(os.environ["USERS_TABLE"]).get_item(
+        Key={"user_id": "REVOCATION#alice"}
+    )["Item"]
+    assert revocation_event["desired_status"] == "blocked"
     assert len(fake_sns.published) == 2
     assert "BLOCKED" in fake_sns.published[1]["Subject"]
 

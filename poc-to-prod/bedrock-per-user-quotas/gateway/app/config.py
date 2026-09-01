@@ -55,6 +55,35 @@ class Settings:
     # user loses access at next refresh) but more AssumeRole calls.
     vended_credential_ttl_seconds: int = field(
         default_factory=lambda: int(_env("VENDED_CREDENTIAL_TTL_SECONDS", "900")))
+    # ``legacy`` preserves current behavior. ``lease`` adds an immutable,
+    # time-bounded STS session policy. ``revocation`` is reserved for the
+    # separately qualified SourceIdentity deny path.
+    credential_enforcement_mode: str = field(
+        default_factory=lambda: _env("CREDENTIAL_ENFORCEMENT_MODE", "legacy"))
+    permission_lease_seconds: int = field(
+        default_factory=lambda: int(_env("PERMISSION_LEASE_SECONDS", "300")))
+    refresh_overlap_seconds: int = field(
+        default_factory=lambda: int(_env("REFRESH_OVERLAP_SECONDS", "10")))
+    refresh_jitter_seconds: int = field(
+        default_factory=lambda: int(_env("REFRESH_JITTER_SECONDS", "5")))
+    vend_rate_limit_per_minute: int = field(
+        default_factory=lambda: int(_env("VEND_RATE_LIMIT_PER_MINUTE", "6")))
+    revocation_policy_shards: int = field(
+        default_factory=lambda: int(_env("REVOCATION_POLICY_SHARDS", "19")))
+    revocation_reconcile_minutes: int = field(
+        default_factory=lambda: int(_env("REVOCATION_RECONCILE_MINUTES", "5")))
+    revocation_policy_max_characters: int = field(
+        default_factory=lambda: int(_env("REVOCATION_POLICY_MAX_CHARACTERS", "6144")))
+    operations_alarm_names_json: str = field(
+        default_factory=lambda: _env("OPERATIONS_ALARM_NAMES_JSON", "{}"))
+    qualification_status_json: str = field(
+        default_factory=lambda: _env(
+            "QUALIFICATION_STATUS_JSON",
+            '{"legacy":"baseline_existing_behavior","lease":"pending_live_sandbox_probe",'
+            '"revocation":"experimental_pending_propagation_isolation_probe",'
+            '"emergency":"pending_live_activation_recovery_exercise"}',
+        )
+    )
 
     # --- metrics ---
     metrics_namespace: str = field(default_factory=lambda: _env("METRICS_NAMESPACE", "BedrockQuotaGateway"))

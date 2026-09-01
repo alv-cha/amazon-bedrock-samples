@@ -9,8 +9,8 @@ sample.
 |---|---|---|
 | Quota identity | JWT `sub` | Stable user, tenant, team, or project claim |
 | IdP | Stack-created Cognito | Existing OIDC IdP |
-| Enforcement | Bounded overspend | Accept and quantify bounded overspend |
-| Credential lifetime | 900 seconds | 900 seconds unless refresh load justifies more |
+| Enforcement | `legacy` until lease probe passes | Qualified lease mode; revocation remains experimental until propagation tests pass |
+| Credential lifetime | 900-second STS; optional 60/300/900-second permission lease | 900–3600-second STS; no role-chained session above one hour |
 | Runtime models | `*` for exploration | Explicit model and inference-profile ARNs |
 | Invocation logging | Stack managed | Reuse centrally managed logging |
 | Log subscription | Dedicated demo group | Confirm subscription-filter capacity and ownership |
@@ -24,8 +24,10 @@ sample.
 | Price fallback | Conservative default | Review against most expensive allowed model |
 
 The hard architectural decision is the enforcement guarantee. This sample
-does not inspect each inference request. A user can continue spending with an
-already issued STS session until it expires.
+does not inspect each inference request. `legacy` sessions remain usable until
+STS expiry; `lease` mode embeds an earlier immutable permission deadline; and
+experimental `revocation` mode depends on eventually consistent IAM policy
+propagation. Already-authorized streams may finish.
 
 ## Runtime-only request flow
 
@@ -36,14 +38,19 @@ already issued STS session until it expires.
 3. The broker verifies issuer, audience, signature, expiry, and the configured
    identity claim.
 4. DynamoDB provides status, limits, and the latest daily usage.
-5. The broker assumes `BedrockUserRole` for 15 minutes and stamps a
-   collision-resistant session identity.
-6. The application calls `bedrock-runtime` directly with those credentials.
-7. Bedrock sends model invocation logs to CloudWatch Logs.
-8. A subscription invokes the usage processor.
-9. The processor deduplicates by Bedrock `requestId`, prices tokens, updates
-   DynamoDB, emits metrics, and sends warnings/blocks.
-10. A blocked identity cannot obtain another session.
+5. The broker reserves one logical lease, assumes `BedrockUserRole`, and
+   stamps a collision-resistant session identity. STS keys last at least 15
+   minutes; lease mode can end Bedrock permission after 1, 5, or 15 minutes.
+6. A lazy refresh-aware provider caches that credential set for all Runtime
+   calls until the refresh window. It calls the broker/STS once per lease, not
+   once per inference.
+7. The application calls `bedrock-runtime` directly with those credentials.
+8. Bedrock sends model invocation logs to CloudWatch Logs.
+9. A subscription invokes the usage processor.
+10. The processor deduplicates by Bedrock `requestId`, prices tokens, updates
+    DynamoDB, emits metrics, and sends warnings/blocks.
+11. A blocked identity cannot obtain another logical lease. Optional revocation
+    reconciles existing sessions after IAM propagation.
 
 ## Configuration
 
@@ -64,7 +71,14 @@ Direct `-c key=value` values override the file.
 | `warn_threshold` | `0.8` | Greater than 0 and less than 1 |
 | `usage_retention_days` | `35` | Positive integer; DynamoDB TTL retention |
 | `retain_tables_on_delete` | `false` | `true` maps tables to `RETAIN` |
-| `vended_ttl_seconds` | `900` | Between 900 and 43200 seconds |
+| `vended_ttl_seconds` | `900` | 900–3600; Lambda broker role chaining rejects longer sessions |
+| `credential_enforcement_mode` | `legacy` | `legacy`, `lease`, or opt-in `revocation` |
+| `permission_lease_seconds` | `300` | `60`, `300`, or `900`; effective Bedrock permission, not STS lifetime |
+| `refresh_overlap_seconds` | `10` | Positive and less than permission lease |
+| `refresh_jitter_seconds` | `5` | Non-negative and less than refresh overlap |
+| `vend_rate_limit_per_minute` | `6` | Positive per-user attempts, including retries |
+| `revocation_policy_shards` | `19` | Immutable in revocation mode; plus emergency policy = 20 role attachments |
+| `revocation_reconcile_minutes` | `5` | Positive periodic repair interval in revocation mode |
 | `allowed_model_arns` | `["*"]` | Non-empty Bedrock resource ARN list or `*` |
 | `invoker_principal_arns` | `[]` | IAM principals allowed to invoke the Function URL |
 | `manage_invocation_logging` | none | Explicit `true` or `false` required |
@@ -80,6 +94,28 @@ Direct `-c key=value` values override the file.
 | `alert_email` | empty | Creates an SNS email subscription |
 | `snapstart` | `false` | Enable Python Lambda SnapStart for the broker |
 | `adapter_layer_arn` | regional default | Override Lambda Web Adapter layer |
+
+### Read-only Operations panel
+
+`GET /admin/operations` uses the routine admin authorization path and powers a
+read-only GUI panel. It combines deployed credential configuration, normalized
+emergency convergence state, conservative qualification metadata, p95
+`DetectionLagMilliseconds`, revocation freshness/failure/overflow metrics, and
+CloudWatch alarm states—including the emergency/revocation DLQ alarms.
+
+CloudWatch reads are performed by the broker role using only
+`cloudwatch:GetMetricData` and `cloudwatch:DescribeAlarms`. The browser still
+has only Function URL invocation permission. The response and UI never include
+the emergency key, secret ARN/value, IAM policy ARNs, incident reason, request
+ID, or mutation controls. If CloudWatch is denied or has no data, the endpoint
+returns local state with `unavailable`, `unknown`, `not_applicable`, or
+`INSUFFICIENT_DATA`; it does not label missing telemetry healthy and does not
+break user quota administration.
+
+Qualification shown in the panel is reviewed deployment metadata, not inferred
+from selected mode or alarm health. `legacy` remains baseline, while lease,
+revocation, and emergency live qualification remain pending until recorded in
+`spikes/QUALIFICATION.md`.
 
 Legacy `mode_a_allowed_model_arns` is accepted as an alias for
 `allowed_model_arns`. Former dual-mode keys synthesize only for migration and
@@ -105,8 +141,83 @@ change set before deployment and update clients to:
 2. Build a normal `bedrock-runtime` client from the returned credentials.
 3. Stop using the old OpenAI/Anthropic proxy base URLs.
 
-There is no hard pre-spend cap after this migration. The sole guarantee is the
-bounded-overspend behavior described above.
+There is no hard pre-spend cap after this migration. Every mode remains
+bounded overspend. Keep `credential_enforcement_mode=legacy` until the guarded
+sandbox probe in `spikes/lease_revocation_probe.py` validates lease expiration
+for the selected models/Region. Keep `revocation` experimental until targeted
+isolation and IAM propagation remain below the required cutoff across the
+recorded sample set.
+
+### Lease and revocation qualification
+
+A one- or five-minute **permission lease** is not a shorter STS credential. The
+broker passes an inline session policy with `DateLessThan` on
+`aws:CurrentTime`; the role policy, permissions boundary, and session policy
+are intersected. Renewal requires a new broker quota check and STS session.
+Use `examples/refreshable_bedrock.py` so normal Bedrock calls share the cached
+credentials and botocore coalesces concurrent refreshes.
+
+At a 50-second refresh interval, 1,000 continuously active users average 20
+STS requests/second, 3,000 average 60, and 10,000 average 200. These are
+absolute averages against the documented 600 requests/second regional default,
+which is shared with other STS operations. Use lazy refresh, jitter, rate
+limits, load testing, and actual account quota measurements.
+
+The guarded probe is dry-run by default:
+
+```bash
+cdk/.venv/bin/python spikes/lease_revocation_probe.py \
+  --profile YOUR_SANDBOX_PROFILE \
+  --role-arn arn:aws:iam::111122223333:role/YOUR_DEDICATED_SANDBOX_ROLE \
+  --managed-policy-arn arn:aws:iam::111122223333:policy/YOUR_PREATTACHED_SANDBOX_DENY \
+  --region us-east-1 \
+  --model-id YOUR_COUNT_TOKENS_MODEL
+```
+
+Live mode temporarily versions IAM policy and invokes Bedrock. Run it only
+after reviewing the printed account/role and explicitly approving those exact
+non-production resources. Record results in `spikes/QUALIFICATION.md`.
+
+The current broker's caller is a Lambda execution-role session, so
+`AssumeRole` is role chaining and cannot exceed 3,600 seconds. Eight-hour
+configuration is rejected. Supporting it requires a separate first-hop
+federation/token-issuer design with bypass and replay analysis.
+
+Revocation mode uses an immutable 19-shard layout plus one emergency managed
+policy: 20 role policy attachments in total. Verify that account quota before
+deployment. Changing the shard count in place is rejected because rehashing
+active identities can create a transient authorization gap; use a separately
+reviewed two-policy-set migration instead.
+
+### Emergency stop
+
+`POST /admin/emergency-stop` is an operator action, never an automatic quota
+reaction. Activation first puts the DynamoDB control state into `activating`,
+which makes the broker return `503`; a separate worker then applies the
+unconditional shared-role Bedrock deny and marks the state `active`. Recovery
+keeps vending closed in `recovering` until the deny has been replaced by its
+no-op policy version.
+
+Retrieve the separate `EmergencyKeySecretArn` only through the approved
+break-glass procedure, then export it as `EMERGENCY_ADMIN_KEY`. Routine admin
+keys and admin UI JWTs cannot invoke these operations.
+
+```bash
+python examples/sigv4_gateway.py \
+  --gateway-url "$BROKER_API_URL" --profile "$AWS_PROFILE" \
+  --region "$AWS_REGION" --emergency-key "$EMERGENCY_ADMIN_KEY" \
+  emergency-stop --reason "security incident"
+
+python examples/sigv4_gateway.py \
+  --gateway-url "$BROKER_API_URL" --profile "$AWS_PROFILE" \
+  --region "$AWS_REGION" --emergency-key "$EMERGENCY_ADMIN_KEY" \
+  emergency-recover --reason "incident resolved"
+```
+
+Both commands supply the API's explicit confirmation phrase. Activation can
+interrupt every user after IAM propagation; recovery is also eventually
+consistent. Review SNS alarms and the emergency-state endpoint before and
+after either action.
 
 ### Model and inference-profile IAM
 
@@ -422,6 +533,13 @@ Recommended shape:
   "usage_retention_days": 90,
   "retain_tables_on_delete": true,
   "vended_ttl_seconds": 900,
+  "credential_enforcement_mode": "legacy",
+  "permission_lease_seconds": 300,
+  "refresh_overlap_seconds": 10,
+  "refresh_jitter_seconds": 5,
+  "vend_rate_limit_per_minute": 6,
+  "revocation_policy_shards": 19,
+  "revocation_reconcile_minutes": 5,
   "manage_invocation_logging": false,
   "invocation_log_group_name": "/central/bedrock/model-invocations",
   "invoker_principal_arns": [
@@ -557,10 +675,16 @@ Verify all of the following:
 6. An invocation appears in DynamoDB through the log subscription.
 7. Re-delivering the same `requestId` does not increment usage twice.
 8. Warning and block SNS notifications arrive.
-9. Blocked identities cannot renew credentials.
-10. Previously issued credentials work only until STS expiry.
-11. Unknown models use the configured conservative fallback.
-12. Destroy testing confirms production tables are retained.
+9. Blocked identities cannot renew logical leases.
+10. In lease mode, new Bedrock authorization fails after the effective
+    permission deadline even though `sts_expiration` is later.
+11. Detection lag is reported separately from the post-detection cutoff.
+12. Revocation mode, when enabled, denies only the targeted `SourceIdentity`,
+    reports p50/p95/max propagation, and alarms/falls back on failure.
+13. Emergency activation closes vending before its role-wide deny; recovery
+    removes the deny before reopening vending.
+14. Unknown models use the configured conservative fallback.
+15. Destroy testing confirms production tables are retained.
 
 ## Administrative commands
 

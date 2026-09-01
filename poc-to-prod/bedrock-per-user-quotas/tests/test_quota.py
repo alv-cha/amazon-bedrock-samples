@@ -1,6 +1,14 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from app.quota import MICRO, QuotaStore, current_window
+import pytest
+
+from app.quota import (
+    MICRO,
+    LeaseNotRefreshable,
+    LeaseRateLimited,
+    QuotaStore,
+    current_window,
+)
 
 
 def _put_usage(store: QuotaStore, user_id: str, **values) -> None:
@@ -62,14 +70,147 @@ def test_positive_sub_micro_budget_is_not_unlimited(fake_dynamodb):
     assert store.get_user("tiny").daily_usd_micro == 1
 
 
+def test_usd_limits_round_to_nearest_micro_without_float_truncation(
+    fake_dynamodb,
+):
+    store = QuotaStore(dynamodb=fake_dynamodb)
+    store.put_user("alice", "Alice", 1.000044, 0, 0)
+    assert store.get_user("alice").daily_usd_micro == 1_000_044
+
+    store.set_user_limits("alice", daily_usd=2.000044)
+    assert store.get_user("alice").daily_usd_micro == 2_000_044
+
+
 def test_session_mapping_preserves_full_identity_and_has_ttl(fake_dynamodb):
     store = QuotaStore(dynamodb=fake_dynamodb)
+    store.put_user("auth0|full-subject", "Subject", 1, 10, 10)
     store.record_session("safe-session", "auth0|full-subject")
     assert store.resolve_session("safe-session") == "auth0|full-subject"
     item = fake_dynamodb.Table("users-test").get_item(
         Key={"user_id": "SESSION#safe-session"}
     )["Item"]
     assert item["expires_at"] > int(datetime.now(timezone.utc).timestamp())
+    assert [user.user_id for user in store.list_users()] == [
+        "auth0|full-subject"
+    ]
+
+
+def test_logical_lease_retry_never_extends_fixed_deadline(fake_dynamodb):
+    now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    store = QuotaStore(
+        dynamodb=fake_dynamodb,
+        lease_seconds=300,
+        refresh_overlap_seconds=10,
+        refresh_jitter_seconds=5,
+        vend_rate_limit_per_minute=6,
+        jitter_fn=lambda maximum: maximum,
+    )
+    store.put_user("alice", "Alice", 1, 10, 10)
+
+    first = store.reserve_lease("alice", "lease-a", now=now)
+    retry = store.reserve_lease(
+        "alice", "lease-a", now=now + timedelta(seconds=20)
+    )
+
+    assert first.created
+    assert not retry.created
+    assert retry.lease_id == first.lease_id
+    assert retry.generation == first.generation == 1
+    assert retry.expires_at == first.expires_at == now + timedelta(seconds=300)
+    assert retry.refresh_after == now + timedelta(seconds=295)
+
+    with pytest.raises(LeaseNotRefreshable) as error:
+        store.reserve_lease(
+            "alice", "lease-b", now=now + timedelta(seconds=20)
+        )
+    assert error.value.retry_after == first.refresh_after
+
+    replacement = store.reserve_lease(
+        "alice", "lease-b", now=first.refresh_after
+    )
+    assert replacement.created
+    assert replacement.generation == 2
+    assert replacement.expires_at > first.expires_at
+
+
+def test_vend_rate_limit_counts_retries_and_resets_next_minute(fake_dynamodb):
+    now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    store = QuotaStore(
+        dynamodb=fake_dynamodb,
+        lease_seconds=60,
+        refresh_overlap_seconds=10,
+        refresh_jitter_seconds=0,
+        vend_rate_limit_per_minute=2,
+        jitter_fn=lambda maximum: 0,
+    )
+    store.put_user("alice", "Alice", 1, 10, 10)
+
+    store.reserve_lease("alice", "lease-a", now=now)
+    store.reserve_lease("alice", "lease-a", now=now + timedelta(seconds=1))
+    with pytest.raises(LeaseRateLimited) as error:
+        store.reserve_lease(
+            "alice", "lease-a", now=now + timedelta(seconds=2)
+        )
+    assert error.value.retry_after == now + timedelta(minutes=1)
+
+    replacement = store.reserve_lease(
+        "alice", "lease-b", now=now + timedelta(minutes=1)
+    )
+    assert replacement.created
+
+
+def test_reserved_lease_is_never_rolled_back_after_publish(fake_dynamodb):
+    now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    store = QuotaStore(
+        dynamodb=fake_dynamodb,
+        lease_seconds=60,
+        refresh_overlap_seconds=10,
+        refresh_jitter_seconds=0,
+        vend_rate_limit_per_minute=6,
+        jitter_fn=lambda maximum: 0,
+    )
+    store.put_user("alice", "Alice", 1, 10, 10)
+    first = store.reserve_lease("alice", "lease-a", now=now)
+
+    retry = store.reserve_lease(
+        "alice", "lease-a", now=now + timedelta(seconds=1)
+    )
+    assert retry.expires_at == first.expires_at
+    with pytest.raises(LeaseNotRefreshable):
+        store.reserve_lease(
+            "alice", "lease-b", now=now + timedelta(seconds=2)
+        )
+    assert store.get_active_lease("alice").lease_id == "lease-a"
+
+
+def test_emergency_stop_state_keeps_vending_closed_through_recovery(
+    fake_dynamodb,
+):
+    now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    store = QuotaStore(dynamodb=fake_dynamodb)
+    assert not store.emergency_stop_active()
+
+    activating = store.set_emergency_desired(
+        active=True,
+        actor="admin@example.com",
+        reason="security exercise",
+        now=now,
+    )
+    assert activating["state"] == "activating"
+    assert store.emergency_stop_active()
+    store.mark_emergency_applied(active=True, now=now + timedelta(seconds=1))
+    assert store.get_emergency_state()["state"] == "active"
+
+    recovering = store.set_emergency_desired(
+        active=False,
+        actor="admin@example.com",
+        reason="exercise complete",
+        now=now + timedelta(seconds=2),
+    )
+    assert recovering["state"] == "recovering"
+    assert store.emergency_stop_active()
+    store.mark_emergency_applied(active=False, now=now + timedelta(seconds=3))
+    assert not store.emergency_stop_active()
     assert store.list_users() == []
 
 
@@ -94,6 +235,11 @@ def test_manual_block_is_never_auto_reactivated(fake_dynamodb):
     store.put_user("alice", "Alice", 1.0, 100, 50)
     store.set_user_status("alice", "blocked", "admin API")
     assert not store.refresh_auto_status(store.get_user("alice")).active
+    event = fake_dynamodb.Table("users-test").get_item(
+        Key={"user_id": "REVOCATION#alice"}
+    )["Item"]
+    assert event["desired_status"] == "blocked"
+    assert store.list_users()[0].user_id == "alice"
 
 
 def test_daily_windows_are_isolated(fake_dynamodb):

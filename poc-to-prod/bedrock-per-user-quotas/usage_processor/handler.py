@@ -320,6 +320,7 @@ def _evaluate_quota(
             return "manually-blocked"
         auto_reason = f"auto: quota exhausted in {window}"
         if status != "blocked" or reason != auto_reason:
+            changed_at = datetime.now(timezone.utc).isoformat()
             users_table.update_item(
                 Key={"user_id": user_id},
                 UpdateExpression=(
@@ -329,8 +330,23 @@ def _evaluate_quota(
                 ExpressionAttributeValues={
                     ":s": "blocked",
                     ":r": auto_reason,
-                    ":t": datetime.now(timezone.utc).isoformat(),
+                    ":t": changed_at,
                 },
+            )
+            refreshed_user = users_table.get_item(
+                Key={"user_id": user_id}, ConsistentRead=True
+            ).get("Item", {})
+            users_table.put_item(
+                Item={
+                    "user_id": f"REVOCATION#{user_id}",
+                    "maps_to": user_id,
+                    "desired_status": "blocked",
+                    "source_identity": str(
+                        refreshed_user.get("source_identity", "")
+                    ),
+                    "updated_at": changed_at,
+                    "expires_at": _ttl_epoch(datetime.now(timezone.utc)),
+                }
             )
             _notify(
                 sns,
@@ -366,9 +382,14 @@ def _evaluate_quota(
 def _emit_emf(
     user_id: str, usage: InvocationUsage, cost_micro: int, used_fallback: bool
 ) -> None:
+    processed_at = datetime.now(timezone.utc)
+    detection_lag_ms = max(
+        0,
+        int((processed_at - usage.occurred_at).total_seconds() * 1_000),
+    )
     record = {
         "_aws": {
-            "Timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+            "Timestamp": int(processed_at.timestamp() * 1000),
             "CloudWatchMetrics": [
                 {
                     "Namespace": METRICS_NAMESPACE,
@@ -378,6 +399,10 @@ def _emit_emf(
                         {"Name": "InputTokens", "Unit": "Count"},
                         {"Name": "OutputTokens", "Unit": "Count"},
                         {"Name": "EstimatedCostUSD", "Unit": "None"},
+                        {
+                            "Name": "DetectionLagMilliseconds",
+                            "Unit": "Milliseconds",
+                        },
                     ],
                 }
             ],
@@ -386,6 +411,9 @@ def _emit_emf(
         "Model": usage.model_id,
         "RequestId": usage.request_id,
         "PriceSource": "fallback" if used_fallback else "snapshot",
+        "InvocationOccurredAt": usage.occurred_at.isoformat(),
+        "ProcessedAt": processed_at.isoformat(),
+        "DetectionLagMilliseconds": detection_lag_ms,
         "Requests": 1,
         "InputTokens": usage.input_tokens,
         "OutputTokens": usage.output_tokens,

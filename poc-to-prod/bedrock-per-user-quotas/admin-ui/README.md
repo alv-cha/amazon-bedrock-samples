@@ -7,8 +7,21 @@ It shows:
 - Current users and status.
 - Daily USD, input-token, and output-token limits.
 - Current UTC-day usage.
-- Runtime-only bounded-overspend guarantee.
-- STS credential lifetime and event-driven metering source.
+- Runtime-only bounded-overspend guarantee and active enforcement mode.
+- Actual STS lifetime, effective permission cutoff, refresh overlap/jitter, and
+  invocation-to-detection lag metric.
+- Read-only emergency convergence, revocation capacity/freshness, qualification
+  gates, and CloudWatch alarm/DLQ alarm states.
+
+The Operations panel has no mutation controls. CloudWatch is queried by the
+broker Lambda; the browser receives no CloudWatch IAM permissions, emergency
+key, secret ARN/value, IAM policy controls, incident detail, or emergency and
+revocation action buttons. Incomplete metric queries and unresolved alarms
+cannot produce a green revocation status. Failed refreshes visibly mark cached
+data with its last successful timestamp, emergency qualification is separate
+from convergence, and permission-lease duration shows `Not active` outside
+lease mode. Missing telemetry is displayed as unknown or unavailable rather
+than healthy.
 
 The browser never receives the shared admin secret. With the demo Cognito
 deployment it:

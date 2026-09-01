@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import {
+  Activity,
   AlertCircle,
+  BellRing,
   Check,
   ChevronDown,
   CircleDollarSign,
+  Database,
   Gauge,
   KeyRound,
   Layers3,
@@ -12,6 +15,7 @@ import {
   Pencil,
   RefreshCw,
   Search,
+  ShieldAlert,
   ShieldCheck,
   Unlock,
   UserRound,
@@ -20,7 +24,7 @@ import {
 } from "lucide-react";
 import { loadConfig, type AdminConfig } from "./config";
 import { signIn, type Session } from "./auth";
-import { api, type Summary, type UserRow } from "./api";
+import { api, type Operations, type Summary, type UserRow } from "./api";
 
 type UserFilter = "all" | "active" | "blocked";
 
@@ -138,25 +142,50 @@ function Dashboard({
   onSignOut: () => void;
 }) {
   const [summary, setSummary] = useState<Summary | null>(null);
+  const [operations, setOperations] = useState<Operations | null>(null);
   const [users, setUsers] = useState<UserRow[]>([]);
   const [error, setError] = useState("");
+  const [operationsError, setOperationsError] = useState("");
+  const [operationsStale, setOperationsStale] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [operationsLoading, setOperationsLoading] = useState(true);
 
   async function refresh() {
     setLoading(true);
+    setOperationsLoading(true);
     setError("");
-    try {
-      const [nextSummary, nextUsers] = await Promise.all([
-        api.summary(cfg, session),
-        api.listUsers(cfg, session),
-      ]);
-      setSummary(nextSummary);
-      setUsers(nextUsers);
-    } catch (caught) {
-      setError((caught as Error).message);
-    } finally {
-      setLoading(false);
+    setOperationsError("");
+    const [summaryResult, usersResult, operationsResult] = await Promise.allSettled([
+      api.summary(cfg, session),
+      api.listUsers(cfg, session),
+      api.operations(cfg, session),
+    ]);
+
+    const coreErrors: string[] = [];
+    if (summaryResult.status === "fulfilled") {
+      setSummary(summaryResult.value);
+    } else {
+      coreErrors.push(summaryResult.reason instanceof Error ? summaryResult.reason.message : String(summaryResult.reason));
     }
+    if (usersResult.status === "fulfilled") {
+      setUsers(usersResult.value);
+    } else {
+      coreErrors.push(usersResult.reason instanceof Error ? usersResult.reason.message : String(usersResult.reason));
+    }
+    if (operationsResult.status === "fulfilled") {
+      setOperations(operationsResult.value);
+      setOperationsStale(false);
+    } else {
+      setOperationsStale(true);
+      setOperationsError(
+        operationsResult.reason instanceof Error
+          ? operationsResult.reason.message
+          : String(operationsResult.reason),
+      );
+    }
+    setError(coreErrors.join(" · "));
+    setLoading(false);
+    setOperationsLoading(false);
   }
 
   useEffect(() => {
@@ -175,10 +204,10 @@ function Dashboard({
             </div>
             <IconButton
               label="Refresh data"
-              disabled={loading}
+              disabled={loading || operationsLoading}
               onClick={() => void refresh()}
             >
-              <RefreshCw className={loading ? "spin" : ""} aria-hidden="true" size={18} />
+              <RefreshCw className={loading || operationsLoading ? "spin" : ""} aria-hidden="true" size={18} />
             </IconButton>
             <IconButton label="Sign out" onClick={onSignOut}>
               <LogOut aria-hidden="true" size={18} />
@@ -202,6 +231,13 @@ function Dashboard({
 
         {error && <ErrorMessage message={error} />}
         {summary ? <SummaryPanel summary={summary} /> : <SummarySkeleton />}
+
+        <OperationsPanel
+          error={operationsError}
+          loading={operationsLoading}
+          operations={operations}
+          stale={operationsStale}
+        />
 
         <UsersPanel
           cfg={cfg}
@@ -263,23 +299,238 @@ function SummaryPanel({ summary }: { summary: Summary }) {
           <span className="status-dot" aria-hidden="true" />
           <div>
             <strong>Enforcement active</strong>
-            <span>Bounded overspend</span>
+            <span>{enforcement.mode.replaceAll("_", " ")}</span>
           </div>
         </div>
         <SystemDetail label="Source" value={enforcement.source} />
         <SystemDetail label="Window" value={enforcement.window} />
         <SystemDetail
-          label="Credential TTL"
+          label="STS lifetime"
           value={`${Math.round(enforcement.credential_ttl_seconds / 60)} min`}
         />
         <SystemDetail
+          label="Permission cutoff"
+          value={`${Math.round(enforcement.post_detection_fallback_seconds / 60)} min fallback`}
+        />
+        <SystemDetail
+          label="Refresh"
+          value={`${enforcement.refresh_overlap_seconds}s overlap · ${enforcement.refresh_jitter_seconds}s jitter`}
+        />
+        <SystemDetail
           label="Telemetry"
-          value={`${summary.observability.source} · ${summary.observability.delivery}`}
+          value={`${summary.observability.source} · ${summary.observability.detection_lag_metric}`}
         />
         <SystemDetail label="Metrics" value={summary.observability.metrics_namespace} />
       </section>
     </>
   );
+}
+
+function OperationsPanel({
+  error,
+  loading,
+  operations,
+  stale,
+}: {
+  error: string;
+  loading: boolean;
+  operations: Operations | null;
+  stale: boolean;
+}) {
+  if (loading && !operations) {
+    return (
+      <section className="operations-panel" aria-label="Loading operational status">
+        <LoadingState label="Loading operational status" />
+      </section>
+    );
+  }
+
+  if (!operations) {
+    return (
+      <section className="operations-panel" aria-labelledby="operations-title">
+        <div className="panel-heading operations-heading">
+          <div>
+            <p className="eyebrow">Read-only</p>
+            <h2 id="operations-title">Operations</h2>
+            <p>Operational status is unavailable; quota administration remains independent.</p>
+          </div>
+        </div>
+        {error && <ErrorMessage message={error} />}
+      </section>
+    );
+  }
+
+  const config = operations.configuration;
+  const emergency = operations.emergency;
+  const metrics = operations.metrics;
+  const qualificationTone = stale
+    ? "gray"
+    : operations.qualification.status.includes("baseline")
+      ? "green"
+      : operations.qualification.status.includes("pending") || operations.qualification.status.includes("experimental")
+        ? "amber"
+        : "gray";
+  const emergencyQualificationPending =
+    operations.qualification.emergency_status.includes("pending") ||
+    operations.qualification.emergency_status.includes("unknown");
+  const emergencyTone = emergency.state === "active"
+    ? "red"
+    : stale
+      ? "gray"
+      : emergencyQualificationPending
+        ? "amber"
+        : emergency.state === "inactive" && emergency.converged
+          ? "green"
+          : "amber";
+  const reconciliationTone = stale
+    ? "gray"
+    : metrics.reconciliation_status === "current"
+      ? "green"
+      : metrics.reconciliation_status === "degraded"
+        ? "red"
+        : metrics.reconciliation_status === "not_applicable"
+          ? "gray"
+          : "amber";
+  const cloudwatchTone = !stale && operations.cloudwatch.status === "available" && metrics.telemetry_status === "complete"
+    ? "green"
+    : operations.cloudwatch.status === "partial"
+      ? "amber"
+      : "gray";
+
+  return (
+    <section className="operations-panel" aria-labelledby="operations-title">
+      <div className="panel-heading operations-heading">
+        <div>
+          <p className="eyebrow">Read-only</p>
+          <h2 id="operations-title">Operations</h2>
+          <p>Enforcement configuration, reconciliation freshness, alarms, and qualification gates.</p>
+        </div>
+        <div className="operations-heading-meta">
+          <span className={`ops-status ops-status-${stale ? "amber" : "gray"}`}>
+            <span aria-hidden="true" />
+            {stale ? `Cached from ${formatTimestamp(operations.as_of)} · refresh failed` : `Updated ${formatTimestamp(operations.as_of)}`}
+          </span>
+          <span className="read-only-label"><Lock aria-hidden="true" size={13} />No control actions</span>
+        </div>
+      </div>
+      {error && <ErrorMessage message={error} />}
+      <div className="operations-grid">
+        <OperationsCard
+          icon={<ShieldCheck aria-hidden="true" size={19} />}
+          title="Enforcement"
+          status={formatOperationalLabel(config.mode)}
+          tone={qualificationTone}
+        >
+          <OperationsRow label="Qualification" value={formatOperationalLabel(operations.qualification.status)} />
+          <OperationsRow label="STS / fallback" value={`${formatDuration(config.credential_ttl_seconds)} / ${formatDuration(config.post_detection_fallback_seconds)}`} />
+          <OperationsRow label="Permission lease" value={config.permission_lease_enabled && config.effective_permission_lease_seconds !== null ? formatDuration(config.effective_permission_lease_seconds) : "Not active"} />
+          <OperationsRow label="Refresh / rate" value={`${config.refresh_overlap_seconds}s overlap · ${config.refresh_jitter_seconds}s jitter · ${config.vend_rate_limit_per_minute}/min`} />
+        </OperationsCard>
+
+        <OperationsCard
+          icon={<ShieldAlert aria-hidden="true" size={19} />}
+          title="Emergency stop"
+          status={formatOperationalLabel(emergency.state)}
+          tone={emergencyTone}
+        >
+          <OperationsRow label="Converged" value={emergency.converged ? "Yes" : "No"} />
+          <OperationsRow label="Qualification" value={formatOperationalLabel(operations.qualification.emergency_status)} />
+          <OperationsRow label="Generation" value={`${emergency.applied_generation} / ${emergency.generation}`} />
+          <OperationsRow label="Requested" value={formatTimestamp(emergency.requested_at)} />
+          <OperationsRow label="Applied" value={formatTimestamp(emergency.applied_at)} />
+        </OperationsCard>
+
+        <OperationsCard
+          icon={<Database aria-hidden="true" size={19} />}
+          title="Revocation"
+          status={config.revocation_enabled ? formatOperationalLabel(metrics.reconciliation_status) : "Not applicable"}
+          tone={reconciliationTone}
+        >
+          <OperationsRow label="Policy capacity" value={config.revocation_enabled ? `${config.revocation_policy_shards} × ${config.revocation_policy_max_characters.toLocaleString()} chars` : "Not deployed"} />
+          <OperationsRow label="Desired identities" value={metrics.revoked_identities_desired === null ? "No data" : metrics.revoked_identities_desired.toLocaleString()} />
+          <OperationsRow label="Last reconciliation" value={formatTimestamp(metrics.last_reconciliation_at)} />
+          <OperationsRow label="Recent failures / overflow" value={`${metrics.recent_sync_failure_count ?? "No data"} / ${metrics.recent_overflow_count ?? "No data"}`} />
+        </OperationsCard>
+
+        <OperationsCard
+          icon={<Activity aria-hidden="true" size={19} />}
+          title="Telemetry"
+          status={formatOperationalLabel(operations.cloudwatch.status)}
+          tone={cloudwatchTone}
+        >
+          <OperationsRow label="Detection p95" value={formatMilliseconds(metrics.detection_lag_p95_ms)} />
+          <OperationsRow label="Evidence" value={formatOperationalLabel(metrics.telemetry_status)} />
+          <OperationsRow label="Metric sample" value={formatTimestamp(metrics.detection_lag_timestamp)} />
+          <OperationsRow label="Metric namespace" value={metrics.namespace} />
+          <OperationsRow label="Emergency failures" value={metrics.recent_emergency_failure_count === null ? "No data" : metrics.recent_emergency_failure_count.toLocaleString()} />
+        </OperationsCard>
+      </div>
+
+      <div className="alarm-strip" aria-label="Operational alarms">
+        <div className="alarm-title"><BellRing aria-hidden="true" size={16} /><strong>Alarms and DLQs</strong></div>
+        {operations.alarms.length ? operations.alarms.map((alarm) => (
+          <span className={`ops-status ops-status-${alarmTone(alarm.state)}`} key={alarm.key} title={alarm.updated_at ? `Updated ${formatTimestamp(alarm.updated_at)}` : "No state timestamp"}>
+            <span aria-hidden="true" />
+            {formatOperationalLabel(alarm.key)}: {formatOperationalLabel(alarm.state)}
+          </span>
+        )) : <span className="operations-muted">No alarm metadata configured.</span>}
+      </div>
+    </section>
+  );
+}
+
+function OperationsCard({
+  children,
+  icon,
+  status,
+  title,
+  tone,
+}: {
+  children: React.ReactNode;
+  icon: React.ReactNode;
+  status: string;
+  title: string;
+  tone: string;
+}) {
+  return (
+    <article className="operations-card">
+      <div className="operations-card-heading">
+        <div className="operations-card-title">{icon}<strong>{title}</strong></div>
+        <span className={`ops-status ops-status-${tone}`}><span aria-hidden="true" />{status}</span>
+      </div>
+      <dl>{children}</dl>
+    </article>
+  );
+}
+
+function OperationsRow({ label, value }: { label: string; value: string }) {
+  return <div><dt>{label}</dt><dd title={value}>{value}</dd></div>;
+}
+
+function alarmTone(state: string): string {
+  if (state === "OK") return "green";
+  if (state === "ALARM") return "red";
+  return "gray";
+}
+
+function formatOperationalLabel(value: string): string {
+  return value.replaceAll("_", " ");
+}
+
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  return `${seconds / 60} min`;
+}
+
+function formatMilliseconds(value: number | null): string {
+  if (value === null) return "No data";
+  return value >= 1000 ? `${(value / 1000).toFixed(2)}s` : `${Math.round(value)}ms`;
+}
+
+function formatTimestamp(value: string | null): string {
+  if (!value) return "No data";
+  const timestamp = new Date(value);
+  return Number.isNaN(timestamp.getTime()) ? "Invalid timestamp" : timestamp.toLocaleString();
 }
 
 function UsersPanel({

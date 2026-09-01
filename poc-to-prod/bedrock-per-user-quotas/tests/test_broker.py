@@ -5,15 +5,18 @@ RoleSessionName + SourceIdentity = JWT sub) instead of proxying inference.
 STS is faked; we assert the vend arguments and the enforcement responses.
 """
 
+import json
 import re
 import time
+from datetime import datetime, timedelta, timezone
 
 import jwt as pyjwt
 import pytest
 from fastapi.testclient import TestClient
 
 import app.main as gateway
-from app.broker import CredentialBroker, session_name_for
+from app.auth import Identity
+from app.broker import BrokerError, CredentialBroker, session_name_for
 from app.quota import QuotaStore
 
 SECRET = "test-jwt-secret"
@@ -31,14 +34,10 @@ class FakeSTS:
 
     def assume_role(self, **kwargs):
         self.calls.append(kwargs)
-
-        class _Dt:
-            def isoformat(self_inner):
-                return "2026-07-12T00:15:00+00:00"
-
         return {"Credentials": {
             "AccessKeyId": "ASIAFAKE", "SecretAccessKey": "secret",
-            "SessionToken": "token", "Expiration": _Dt(),
+            "SessionToken": "token",
+            "Expiration": datetime(2026, 7, 12, 0, 15, tzinfo=timezone.utc),
         }}
 
 
@@ -79,6 +78,84 @@ def test_vend_credentials_for_in_budget_user(client):
 
     # Session -> user mapping persisted for the log subscription processor.
     assert store.resolve_session(session_name_for(sub)) == sub
+
+
+def test_permission_lease_is_embedded_in_assume_role_session_policy(sts):
+    now = datetime(2026, 7, 12, 0, 0, tzinfo=timezone.utc)
+    broker = CredentialBroker(
+        sts_client=sts,
+        role_arn=ROLE_ARN,
+        ttl_seconds=900,
+        enforcement_mode="lease",
+        lease_seconds=300,
+        now_fn=lambda: now,
+    )
+    identity = Identity(
+        user_id="alice",
+        claims={"exp": int((now + timedelta(hours=1)).timestamp())},
+    )
+
+    credentials = broker.vend(identity)
+
+    call = sts.calls[0]
+    policy = json.loads(call["Policy"])
+    statement = policy["Statement"][0]
+    assert statement["Effect"] == "Allow"
+    assert statement["Resource"] == "*"
+    assert statement["Action"] == [
+        "bedrock:CountTokens",
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream",
+    ]
+    assert statement["Condition"] == {
+        "DateLessThan": {"aws:CurrentTime": "2026-07-12T00:05:00Z"}
+    }
+    assert len(call["Policy"]) < 2_048
+    assert credentials.expiration == "2026-07-12T00:05:00+00:00"
+    assert credentials.sts_expiration == "2026-07-12T00:15:00+00:00"
+
+
+def test_permission_lease_never_outlives_authenticating_jwt(sts):
+    now = datetime(2026, 7, 12, 0, 0, tzinfo=timezone.utc)
+    broker = CredentialBroker(
+        sts_client=sts,
+        role_arn=ROLE_ARN,
+        ttl_seconds=900,
+        enforcement_mode="lease",
+        lease_seconds=300,
+        now_fn=lambda: now,
+    )
+
+    credentials = broker.vend(
+        Identity(
+            user_id="alice",
+            claims={"exp": int((now + timedelta(seconds=60)).timestamp())},
+        )
+    )
+
+    assert credentials.expiration == "2026-07-12T00:01:00+00:00"
+    policy = json.loads(sts.calls[0]["Policy"])
+    assert policy["Statement"][0]["Condition"] == {
+        "DateLessThan": {"aws:CurrentTime": "2026-07-12T00:01:00Z"}
+    }
+
+
+@pytest.mark.parametrize("claims", [{}, {"exp": "not-a-timestamp"}])
+def test_permission_lease_requires_valid_jwt_expiration(sts, claims):
+    now = datetime(2026, 7, 12, 0, 0, tzinfo=timezone.utc)
+    broker = CredentialBroker(
+        sts_client=sts,
+        role_arn=ROLE_ARN,
+        enforcement_mode="lease",
+        lease_seconds=60,
+        now_fn=lambda: now,
+    )
+
+    with pytest.raises(BrokerError, match="expiration") as error:
+        broker.vend(Identity(user_id="alice", claims=claims))
+
+    assert error.value.status == 401
+    assert sts.calls == []
 
 
 # The three STS fields have DIFFERENT charsets; session_name_for must satisfy

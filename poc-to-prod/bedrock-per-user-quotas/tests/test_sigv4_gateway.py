@@ -64,6 +64,33 @@ def test_signed_admin_request_keeps_admin_key_outside_authorization():
     }
 
 
+def test_signed_emergency_request_uses_separate_break_glass_header():
+    class AwsSession:
+        def get_credentials(self):
+            return Credentials("AKID", "SECRET", "SESSION")
+
+    captured = {}
+
+    def handler(request):
+        captured["request"] = request
+        return httpx.Response(202, request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        signed_request(
+            "POST",
+            "https://example.lambda-url.us-east-1.on.aws/admin/emergency-stop",
+            region="us-east-1",
+            emergency_key="break-glass-secret",
+            aws_session=AwsSession(),
+            http_client=client,
+            json={"action": "activate"},
+        )
+
+    request = captured["request"]
+    assert request.headers["X-Quota-Emergency-Key"] == "break-glass-secret"
+    assert "X-Quota-Admin-Key" not in request.headers
+
+
 def test_admin_cli_create_and_update_include_all_quota_dimensions():
     create = _parser().parse_args([
         "--gateway-url", "https://example.test",
@@ -99,3 +126,32 @@ def test_admin_cli_create_and_update_include_all_quota_dimensions():
         "daily_input_tokens": 2_000_000,
         "daily_output_tokens": 400_000,
     }
+
+
+def test_admin_cli_emergency_commands_include_explicit_confirmation():
+    stop = _parser().parse_args([
+        "--gateway-url", "https://example.test",
+        "--admin-key", "secret",
+        "emergency-stop", "--reason", "security incident",
+    ])
+    method, url, kwargs = _admin_request_args(stop)
+    assert (method, url) == (
+        "POST",
+        "https://example.test/admin/emergency-stop",
+    )
+    assert kwargs["json"] == {
+        "action": "activate",
+        "confirmation": "STOP_ALL_BEDROCK_SESSIONS",
+        "reason": "security incident",
+    }
+
+    recover = _parser().parse_args([
+        "--gateway-url", "https://example.test",
+        "--admin-key", "secret",
+        "emergency-recover", "--reason", "incident resolved",
+    ])
+    _, _, kwargs = _admin_request_args(recover)
+    assert kwargs["json"]["action"] == "recover"
+    assert kwargs["json"]["confirmation"] == (
+        "RESTORE_ALL_BEDROCK_SESSIONS"
+    )

@@ -84,6 +84,25 @@ class FakeTable:
         key = self._key(Key)
         item = self.items.get(key, dict(Key))
 
+        import re
+
+        expression_text = UpdateExpression + " " + (ConditionExpression or "")
+        used_placeholders = set(re.findall(r":[A-Za-z0-9_]+", expression_text))
+        unused_placeholders = set(values) - used_placeholders
+        if unused_placeholders:
+            raise ClientError(
+                {
+                    "Error": {
+                        "Code": "ValidationException",
+                        "Message": (
+                            "unused expression values: "
+                            + ", ".join(sorted(unused_placeholders))
+                        ),
+                    }
+                },
+                "UpdateItem",
+            )
+
         if ConditionExpression and not self._condition_ok(ConditionExpression, item, values):
             raise ClientError(
                 {"Error": {"Code": "ConditionalCheckFailedException",
@@ -100,23 +119,76 @@ class FakeTable:
     # -- expression evaluation (targeted subset) --------------------------
     def _condition_ok(self, expr: str, item: dict, values: dict) -> bool:
         expr = expr.strip()
-        # Pattern: attribute_not_exists(f) OR (a <= :x AND b <= :y AND c <= :z)
-        if expr.startswith("attribute_not_exists"):
-            inner = expr[len("attribute_not_exists("):expr.index(")")]
-            rest = expr[expr.index(")") + 1:].strip()
-            if inner not in item:
-                return True
-            if rest.upper().startswith("OR"):
-                return self._condition_ok(rest[2:].strip(), item, values)
+
+        def strip_outer(text: str) -> str:
+            while text.startswith("(") and text.endswith(")"):
+                depth = 0
+                encloses_all = True
+                for index, character in enumerate(text):
+                    if character == "(":
+                        depth += 1
+                    elif character == ")":
+                        depth -= 1
+                    if depth == 0 and index < len(text) - 1:
+                        encloses_all = False
+                        break
+                if not encloses_all:
+                    break
+                text = text[1:-1].strip()
+            return text
+
+        def split_top_level(text: str, operator: str) -> list[str]:
+            depth = 0
+            start = 0
+            parts: list[str] = []
+            marker = f" {operator} "
+            index = 0
+            while index < len(text):
+                character = text[index]
+                if character == "(":
+                    depth += 1
+                elif character == ")":
+                    depth -= 1
+                elif depth == 0 and text.startswith(marker, index):
+                    parts.append(text[start:index].strip())
+                    index += len(marker)
+                    start = index
+                    continue
+                index += 1
+            if parts:
+                parts.append(text[start:].strip())
+            return parts
+
+        expr = strip_outer(expr)
+        for operator, reducer in (
+            ("OR", any),
+            ("AND", all),
+        ):
+            parts = split_top_level(expr, operator)
+            if parts:
+                return reducer(
+                    self._condition_ok(part, item, values) for part in parts
+                )
+
+        if expr.startswith("attribute_not_exists(") and expr.endswith(")"):
+            attribute = expr[len("attribute_not_exists(") : -1].strip()
+            return attribute not in item
+
+        import re
+
+        match = re.fullmatch(r"([A-Za-z0-9_]+)\s*(<=|<|=)\s*(:[A-Za-z0-9_]+)", expr)
+        if not match:
+            raise AssertionError(f"unsupported condition in fake: {expr}")
+        attribute, operator, placeholder = match.groups()
+        if attribute not in item:
             return False
-        if expr.startswith("(") and expr.endswith(")"):
-            expr = expr[1:-1]
-        for clause in expr.split(" AND "):
-            attr, op, placeholder = clause.strip().split(" ")
-            assert op == "<=", f"unsupported operator in fake: {op}"
-            if int(item.get(attr, 0)) > int(values[placeholder]):
-                return False
-        return True
+        left = item[attribute]
+        right = values[placeholder]
+        if operator == "<=":
+            return left <= right
+        if operator == "<":
+            return left < right
+        return left == right
 
     @staticmethod
     def _split_top_level(text: str) -> list[str]:

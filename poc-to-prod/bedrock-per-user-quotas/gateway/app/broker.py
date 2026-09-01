@@ -29,13 +29,16 @@ reverse-map row, so metering still attributes usage to the real user.
 
 import hashlib
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 import boto3
 from botocore.exceptions import ClientError
 
 from .auth import Identity
 from .config import settings
+from .session_policy import permission_lease_policy
 
 # The vended identity is used as RoleSessionName, SourceIdentity, AND a
 # session-tag VALUE. Their allowed charsets differ:
@@ -59,9 +62,12 @@ class VendedCredentials:
     access_key_id: str
     secret_access_key: str
     session_token: str
-    expiration: str  # ISO8601
+    expiration: str  # Effective usable deadline, ISO8601.
     user_id: str
     session_name: str
+    sts_expiration: str | None = None  # Actual STS credential expiration.
+    refresh_after: str | None = None
+    lease_id: str | None = None
 
 
 class BrokerError(Exception):
@@ -95,13 +101,69 @@ def session_name_for(sub: str) -> str:
 
 
 class CredentialBroker:
-    def __init__(self, sts_client=None, role_arn: str | None = None,
-                 ttl_seconds: int | None = None):
+    def __init__(
+        self,
+        sts_client=None,
+        role_arn: str | None = None,
+        ttl_seconds: int | None = None,
+        enforcement_mode: str | None = None,
+        lease_seconds: int | None = None,
+        now_fn: Callable[[], datetime] | None = None,
+    ):
         self._sts = sts_client or boto3.client("sts")
-        self._role_arn = role_arn if role_arn is not None else settings.bedrock_user_role_arn
-        self._ttl = ttl_seconds if ttl_seconds is not None else settings.vended_credential_ttl_seconds
+        self._role_arn = (
+            role_arn
+            if role_arn is not None
+            else settings.bedrock_user_role_arn
+        )
+        self._ttl = (
+            ttl_seconds
+            if ttl_seconds is not None
+            else settings.vended_credential_ttl_seconds
+        )
+        self._enforcement_mode = (
+            enforcement_mode
+            if enforcement_mode is not None
+            else settings.credential_enforcement_mode
+        )
+        self._lease_seconds = (
+            lease_seconds
+            if lease_seconds is not None
+            else settings.permission_lease_seconds
+        )
+        self._now = now_fn or (lambda: datetime.now(timezone.utc))
 
-    def vend(self, identity: Identity) -> VendedCredentials:
+    @staticmethod
+    def _jwt_expiration(identity: Identity) -> datetime:
+        raw = identity.claims.get("exp")
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise BrokerError(401, "token has no valid expiration claim")
+        try:
+            return datetime.fromtimestamp(raw, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError) as exc:
+            raise BrokerError(401, "token has no valid expiration claim") from exc
+
+    def _permission_deadline(
+        self, identity: Identity, now: datetime
+    ) -> datetime | None:
+        if self._enforcement_mode == "legacy":
+            return None
+        duration = (
+            self._lease_seconds
+            if self._enforcement_mode == "lease"
+            else self._ttl
+        )
+        jwt_expiration = self._jwt_expiration(identity)
+        if jwt_expiration <= now:
+            raise BrokerError(401, "token expiration is not in the future")
+        return min(now + timedelta(seconds=duration), jwt_expiration)
+
+    def vend(
+        self,
+        identity: Identity,
+        *,
+        permission_deadline: datetime | None = None,
+    ) -> VendedCredentials:
         """Assume the Bedrock role on behalf of a within-budget user.
 
         Callers must have already: (1) verified the JWT, (2) confirmed via
@@ -116,24 +178,47 @@ class CredentialBroker:
 
         session_name = session_name_for(sub)
         if not self._role_arn:
-            raise BrokerError(500, "broker role not configured (BEDROCK_USER_ROLE_ARN)")
-        try:
-            resp = self._sts.assume_role(
-                RoleArn=self._role_arn,
-                RoleSessionName=session_name,
-                # SourceIdentity and the session tag share RoleSessionName's
-                # charset limits, so we stamp the SAME sanitized identity in
-                # all three. Using the raw sub here would make STS reject the
-                # call for any sub containing '|', ':', or non-ASCII (Auth0,
-                # Google, Entra, ...). SourceIdentity is still tamper-resistant
-                # (can't be changed on re-assume) and propagates to CloudTrail;
-                # the full sub is recoverable via the SESSION# reverse map.
-                SourceIdentity=session_name,
-                DurationSeconds=self._ttl,
-                # Tag the session so cost-allocation / log queries can also
-                # filter by the app user without parsing the ARN.
-                Tags=[{"Key": "quota-user", "Value": session_name}],
+            raise BrokerError(
+                500,
+                "broker role not configured (BEDROCK_USER_ROLE_ARN)",
             )
+        now = self._now()
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise BrokerError(500, "broker clock must be timezone-aware")
+        if permission_deadline is None:
+            permission_deadline = self._permission_deadline(identity, now)
+        else:
+            if (
+                permission_deadline.tzinfo is None
+                or permission_deadline.utcoffset() is None
+            ):
+                raise BrokerError(
+                    500, "permission lease deadline must be timezone-aware"
+                )
+            jwt_expiration = self._jwt_expiration(identity)
+            permission_deadline = min(
+                permission_deadline, jwt_expiration
+            )
+            if permission_deadline <= now:
+                raise BrokerError(
+                    401, "permission lease deadline is not in the future"
+                )
+        assume_kwargs = {
+            "RoleArn": self._role_arn,
+            "RoleSessionName": session_name,
+            # SourceIdentity and the session tag share RoleSessionName's
+            # charset limits, so stamp the same sanitized identity in all
+            # three. The full JWT identity remains in the reverse map.
+            "SourceIdentity": session_name,
+            "DurationSeconds": self._ttl,
+            "Tags": [{"Key": "quota-user", "Value": session_name}],
+        }
+        if permission_deadline is not None:
+            assume_kwargs["Policy"] = permission_lease_policy(
+                permission_deadline
+            )
+        try:
+            resp = self._sts.assume_role(**assume_kwargs)
         except ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "STSError")
             # Trust-policy misconfig (can't set source identity / tags) is an
@@ -141,11 +226,18 @@ class CredentialBroker:
             raise BrokerError(500, f"could not vend credentials ({code})")
 
         creds = resp["Credentials"]
+        sts_expiration = creds["Expiration"].isoformat()
+        effective_expiration = (
+            permission_deadline.isoformat()
+            if permission_deadline is not None
+            else sts_expiration
+        )
         return VendedCredentials(
             access_key_id=creds["AccessKeyId"],
             secret_access_key=creds["SecretAccessKey"],
             session_token=creds["SessionToken"],
-            expiration=creds["Expiration"].isoformat(),
+            expiration=effective_expiration,
+            sts_expiration=sts_expiration,
             user_id=sub,
             session_name=session_name,
         )
