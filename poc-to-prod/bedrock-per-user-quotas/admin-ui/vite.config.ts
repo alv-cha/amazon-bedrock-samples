@@ -6,8 +6,5 @@ import react from "@vitejs/plugin-react";
 // deployment — see src/config.ts.
 export default defineConfig({
   plugins: [react()],
-  // amazon-cognito-identity-js still references the Node global alias in its
-  // browser bundle. Map it to the standard browser global at build time.
-  define: { global: "globalThis" },
   build: { outDir: "dist", sourcemap: false },
 });

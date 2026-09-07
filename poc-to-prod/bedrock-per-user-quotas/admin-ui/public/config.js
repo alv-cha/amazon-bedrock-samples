@@ -11,6 +11,11 @@ window.QUOTA_ADMIN_CONFIG = {
   // CfnOutput DemoUserPoolId / DemoUserPoolClientId
   userPoolId: "",
   userPoolClientId: "",
+  // Cognito managed-login origin, for example
+  // https://bedrock-quota-admin-....auth.us-east-1.amazoncognito.com
+  cognitoDomain: "",
+  // Public User Pool issuer used for callback checks and Identity Pool login.
+  cognitoIssuer: "",
   // CfnOutput AdminIdentityPoolId
   identityPoolId: "",
 };

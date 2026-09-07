@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Activity,
   AlertCircle,
@@ -8,7 +8,6 @@ import {
   CircleDollarSign,
   Database,
   Gauge,
-  KeyRound,
   Layers3,
   Lock,
   LogOut,
@@ -18,27 +17,80 @@ import {
   ShieldAlert,
   ShieldCheck,
   Unlock,
-  UserRound,
   Users,
   X,
 } from "lucide-react";
 import { loadConfig, type AdminConfig } from "./config";
-import { signIn, type Session } from "./auth";
-import { api, type Operations, type Summary, type UserRow } from "./api";
+import { beginSignIn, handleAuthCallback, type Session } from "./auth";
+import {
+  ApiError,
+  api,
+  apiErrorMessage,
+  isAdminUser,
+  type AdminUser,
+  type Operations,
+  type SetLimitsRequest,
+  type Summary,
+  type TransportResponse,
+  type UserRow,
+  type UserStatus,
+} from "./api";
+import { CreateUserWizard, GlobalAuditView, UserDetailDrawer } from "./OperationalUi";
+import { useModalLifecycle } from "./modal";
 
-type UserFilter = "all" | "active" | "blocked";
+export type UserFilter = "all" | "active" | "blocked";
+const USER_PAGE_SIZE = 25;
+
+export function mergeCanonicalUser(rows: UserRow[], updated: AdminUser): UserRow[] {
+  return rows.map((user) => user.user_id === updated.user_id && updated.version >= user.version
+    ? { ...updated, today: user.today }
+    : user);
+}
+
+export function mergeRefreshedUsers(current: UserRow[], refreshed: UserRow[]): UserRow[] {
+  const currentById = new Map(current.map((user) => [user.user_id, user]));
+  return refreshed.map((user) => {
+    const cached = currentById.get(user.user_id);
+    return cached && cached.version > user.version ? { ...cached, today: user.today } : user;
+  });
+}
 
 export function App() {
   const [cfg, setCfg] = useState<AdminConfig | null>(null);
   const [cfgError, setCfgError] = useState("");
+  const [authError, setAuthError] = useState("");
+  const [authReady, setAuthReady] = useState(false);
   const [session, setSession] = useState<Session | null>(null);
+  const [initialAuthHref] = useState(() => window.location.href);
 
   useEffect(() => {
+    let active = true;
+    let config: AdminConfig;
     try {
-      setCfg(loadConfig());
+      config = loadConfig();
+      setCfg(config);
     } catch (error) {
       setCfgError((error as Error).message);
+      return () => {
+        active = false;
+      };
     }
+
+    void handleAuthCallback(config, {
+      onReauthenticate: () => {
+        if (active) setSession(null);
+      },
+    }, initialAuthHref).then((nextSession) => {
+      if (active) setSession(nextSession);
+    }).catch((error: unknown) => {
+      if (active) setAuthError((error as Error).message);
+    }).finally(() => {
+      if (active) setAuthReady(true);
+    });
+
+    return () => {
+      active = false;
+    };
   }, []);
 
   if (cfgError) {
@@ -48,32 +100,37 @@ export function App() {
       </Centered>
     );
   }
-  if (!cfg) {
+  if (!cfg || !authReady) {
     return (
       <Centered>
-        <LoadingState label="Loading console" />
+        <LoadingState label={cfg ? "Completing sign in" : "Loading console"} />
       </Centered>
     );
   }
-  if (!session) return <Login cfg={cfg} onSignIn={setSession} />;
-  return <Dashboard cfg={cfg} session={session} onSignOut={() => setSession(null)} />;
+  if (!session) return <Login cfg={cfg} initialError={authError} />;
+  return (
+    <Dashboard
+      cfg={cfg}
+      session={session}
+      onSignOut={() => {
+        setSession(null);
+        session.logout();
+      }}
+    />
+  );
 }
 
-function Login({ cfg, onSignIn }: { cfg: AdminConfig; onSignIn: (session: Session) => void }) {
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
+function Login({ cfg, initialError }: { cfg: AdminConfig; initialError: string }) {
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
+  const [error, setError] = useState(initialError);
 
-  async function submit(event: React.FormEvent) {
-    event.preventDefault();
+  async function submit() {
     setBusy(true);
     setError("");
     try {
-      onSignIn(await signIn(cfg, email, password));
+      await beginSignIn(cfg);
     } catch (caught) {
       setError((caught as Error).message);
-    } finally {
       setBusy(false);
     }
   }
@@ -85,54 +142,30 @@ function Login({ cfg, onSignIn }: { cfg: AdminConfig; onSignIn: (session: Sessio
         <div className="login-heading">
           <p className="eyebrow">Administration</p>
           <h1 id="login-title">Sign in to quota controls</h1>
-          <p>Use your organization account to manage Bedrock access and daily limits.</p>
+          <p>Continue to the Cognito managed login for your organization account.</p>
         </div>
 
-        <form className="login-form" onSubmit={submit}>
-          <label>
-            <span>Email</span>
-            <div className="input-with-icon">
-              <UserRound aria-hidden="true" size={18} />
-              <input
-                autoComplete="username"
-                autoFocus
-                placeholder="you@example.com"
-                type="email"
-                value={email}
-                onChange={(event) => setEmail(event.target.value)}
-              />
-            </div>
-          </label>
-          <label>
-            <span>Password</span>
-            <div className="input-with-icon">
-              <KeyRound aria-hidden="true" size={18} />
-              <input
-                autoComplete="current-password"
-                placeholder="Enter your password"
-                type="password"
-                value={password}
-                onChange={(event) => setPassword(event.target.value)}
-              />
-            </div>
-          </label>
-          {error && <ErrorMessage message={error} />}
-          <button className="button button-primary login-submit" disabled={busy || !email || !password}>
-            {busy && <RefreshCw className="spin" aria-hidden="true" size={17} />}
-            {busy ? "Signing in" : "Sign in"}
-          </button>
-        </form>
+        {error && <ErrorMessage message={error} />}
+        <button
+          className="button button-primary login-submit"
+          disabled={busy}
+          onClick={() => void submit()}
+          type="button"
+        >
+          {busy && <RefreshCw className="spin" aria-hidden="true" size={17} />}
+          {busy ? "Redirecting" : "Continue to sign in"}
+        </button>
 
         <div className="login-security">
           <ShieldCheck aria-hidden="true" size={17} />
-          <span>Access is authorized by your identity provider group.</span>
+          <span>PKCE protects the redirect; access still requires the configured admin group.</span>
         </div>
       </section>
     </main>
   );
 }
 
-function Dashboard({
+export function Dashboard({
   cfg,
   session,
   onSignOut,
@@ -141,56 +174,160 @@ function Dashboard({
   session: Session;
   onSignOut: () => void;
 }) {
+  const [view, setView] = useState<"overview" | "audit">("overview");
   const [summary, setSummary] = useState<Summary | null>(null);
   const [operations, setOperations] = useState<Operations | null>(null);
   const [users, setUsers] = useState<UserRow[]>([]);
-  const [error, setError] = useState("");
+  const [usersNextCursor, setUsersNextCursor] = useState<string | null>(null);
+  const [userCursors, setUserCursors] = useState<Array<string | null>>([null]);
+  const [userPageIndex, setUserPageIndex] = useState(0);
+  const [userQuery, setUserQuery] = useState("");
+  const [userFilter, setUserFilter] = useState<UserFilter>("all");
+  const [selectedUserId, setSelectedUserId] = useState<string | null>(null);
+  const [summaryError, setSummaryError] = useState("");
+  const [usersError, setUsersError] = useState("");
   const [operationsError, setOperationsError] = useState("");
+  const [summaryStale, setSummaryStale] = useState(false);
+  const [usersStale, setUsersStale] = useState(false);
   const [operationsStale, setOperationsStale] = useState(false);
-  const [loading, setLoading] = useState(true);
+  const [summaryLoading, setSummaryLoading] = useState(true);
+  const [usersLoading, setUsersLoading] = useState(true);
   const [operationsLoading, setOperationsLoading] = useState(true);
+  const summaryRequest = useRef(0);
+  const usersRequest = useRef(0);
+  const operationsRequest = useRef(0);
 
-  async function refresh() {
-    setLoading(true);
-    setOperationsLoading(true);
-    setError("");
-    setOperationsError("");
-    const [summaryResult, usersResult, operationsResult] = await Promise.allSettled([
-      api.summary(cfg, session),
-      api.listUsers(cfg, session),
-      api.operations(cfg, session),
-    ]);
-
-    const coreErrors: string[] = [];
-    if (summaryResult.status === "fulfilled") {
-      setSummary(summaryResult.value);
-    } else {
-      coreErrors.push(summaryResult.reason instanceof Error ? summaryResult.reason.message : String(summaryResult.reason));
+  async function refreshSummary() {
+    const request = ++summaryRequest.current;
+    setSummaryLoading(true);
+    setSummaryError("");
+    try {
+      const next = await api.summary(cfg, session);
+      if (request !== summaryRequest.current) return;
+      setSummary(next);
+      setSummaryStale(false);
+    } catch (caught) {
+      if (request !== summaryRequest.current) return;
+      setSummaryError(apiErrorMessage(caught));
+      setSummaryStale(true);
+    } finally {
+      if (request === summaryRequest.current) setSummaryLoading(false);
     }
-    if (usersResult.status === "fulfilled") {
-      setUsers(usersResult.value);
-    } else {
-      coreErrors.push(usersResult.reason instanceof Error ? usersResult.reason.message : String(usersResult.reason));
-    }
-    if (operationsResult.status === "fulfilled") {
-      setOperations(operationsResult.value);
-      setOperationsStale(false);
-    } else {
-      setOperationsStale(true);
-      setOperationsError(
-        operationsResult.reason instanceof Error
-          ? operationsResult.reason.message
-          : String(operationsResult.reason),
-      );
-    }
-    setError(coreErrors.join(" · "));
-    setLoading(false);
-    setOperationsLoading(false);
   }
 
-  useEffect(() => {
-    void refresh();
-  }, []);
+  async function loadUsersPage({
+    cursor = userCursors[userPageIndex],
+    targetIndex = userPageIndex,
+    query = userQuery,
+    filter = userFilter,
+    resetHistory = false,
+  }: {
+    cursor?: string | null;
+    targetIndex?: number;
+    query?: string;
+    filter?: UserFilter;
+    resetHistory?: boolean;
+  } = {}): Promise<boolean> {
+    const request = ++usersRequest.current;
+    setUsersLoading(true);
+    setUsersError("");
+    try {
+      const page = await api.listUsersPage(cfg, session, {
+        limit: USER_PAGE_SIZE,
+        cursor,
+        status: filter === "all" ? undefined : filter,
+        query,
+      });
+      if (request !== usersRequest.current) return false;
+      setUsers((current) => mergeRefreshedUsers(current, page.users));
+      setUsersNextCursor(page.next_cursor);
+      setUserQuery(query);
+      setUserFilter(filter);
+      if (resetHistory) {
+        setUserCursors([null]);
+        setUserPageIndex(0);
+      } else {
+        setUserCursors((current) => targetIndex > userPageIndex
+          ? [...current.slice(0, userPageIndex + 1), cursor]
+          : current);
+        setUserPageIndex(targetIndex);
+      }
+      setSelectedUserId((current) => current && page.users.some((user) => user.user_id === current) ? current : null);
+      setUsersStale(false);
+      return true;
+    } catch (caught) {
+      if (request !== usersRequest.current) return false;
+      setUsersError(apiErrorMessage(caught));
+      setUsersStale(true);
+      return false;
+    } finally {
+      if (request === usersRequest.current) setUsersLoading(false);
+    }
+  }
+
+  async function refreshOperations() {
+    const request = ++operationsRequest.current;
+    setOperationsLoading(true);
+    setOperationsError("");
+    try {
+      const next = await api.operations(cfg, session);
+      if (request !== operationsRequest.current) return;
+      setOperations(next);
+      setOperationsStale(false);
+    } catch (caught) {
+      if (request !== operationsRequest.current) return;
+      setOperationsError(apiErrorMessage(caught));
+      setOperationsStale(true);
+    } finally {
+      if (request === operationsRequest.current) setOperationsLoading(false);
+    }
+  }
+
+  async function refresh() {
+    await Promise.allSettled([refreshSummary(), loadUsersPage(), refreshOperations()]);
+  }
+
+  function replaceUser(updated: AdminUser) {
+    usersRequest.current += 1;
+    setUsersLoading(false);
+    setUsers((current) => {
+      const cached = current.find((user) => user.user_id === updated.user_id);
+      if (cached && updated.version < cached.version) return current;
+      return userFilter !== "all" && updated.status !== userFilter
+        ? current.filter((user) => user.user_id !== updated.user_id)
+        : mergeCanonicalUser(current, updated);
+    });
+  }
+
+  function addCreatedUser(created: AdminUser, openDetails: boolean) {
+    const needle = userQuery.trim().toLocaleLowerCase();
+    const matches = (userFilter === "all" || created.status === userFilter) &&
+      (!needle || created.user_id.toLocaleLowerCase().includes(needle) || created.name.toLocaleLowerCase().includes(needle));
+    const fitsCurrentPage = userPageIndex === 0 && users.length < USER_PAGE_SIZE && matches;
+    if (fitsCurrentPage) {
+      const row: UserRow = {
+        ...created,
+        today: { cost_usd: 0, input_tokens: 0, output_tokens: 0, requests: 0 },
+      };
+      setUsers((current) => [row, ...current.filter((user) => user.user_id !== created.user_id)]);
+      if (openDetails) setSelectedUserId(created.user_id);
+    }
+    void refreshSummary();
+  }
+
+  function openAuditTarget(userId: string) {
+    setView("overview");
+    if (users.some((user) => user.user_id === userId)) {
+      setSelectedUserId(userId);
+      return;
+    }
+    setSelectedUserId(null);
+    void loadUsersPage({ cursor: null, targetIndex: 0, query: userId, filter: "all", resetHistory: true });
+  }
+
+  useEffect(() => { void refresh(); }, []);
+
+  const refreshing = summaryLoading || usersLoading || operationsLoading;
 
   return (
     <div className="app-shell">
@@ -198,54 +335,67 @@ function Dashboard({
         <div className="header-inner">
           <Brand />
           <div className="header-account">
-            <div className="account-copy">
-              <span>{session.email}</span>
-              <small>Administrator</small>
-            </div>
-            <IconButton
-              label="Refresh data"
-              disabled={loading || operationsLoading}
-              onClick={() => void refresh()}
-            >
-              <RefreshCw className={loading || operationsLoading ? "spin" : ""} aria-hidden="true" size={18} />
-            </IconButton>
-            <IconButton label="Sign out" onClick={onSignOut}>
-              <LogOut aria-hidden="true" size={18} />
-            </IconButton>
+            <div className="account-copy"><span>{session.email}</span><small>Administrator</small></div>
+            <IconButton label="Refresh data" onClick={() => void refresh()}><RefreshCw className={refreshing ? "spin" : ""} aria-hidden="true" size={18} /></IconButton>
+            <IconButton label="Sign out" onClick={onSignOut}><LogOut aria-hidden="true" size={18} /></IconButton>
           </div>
         </div>
       </header>
 
-      <main className="dashboard">
-        <div className="page-heading">
-          <div>
-            <p className="eyebrow">Amazon Bedrock</p>
-            <h1>Quota overview</h1>
-          </div>
-          {summary && (
-            <p className="updated-at">
-              Updated {new Date(summary.enforcement.as_of).toLocaleString()}
-            </p>
-          )}
+      <nav aria-label="Primary" className="primary-nav">
+        <div>
+          <button aria-current={view === "overview" ? "page" : undefined} onClick={() => setView("overview")} type="button">Overview</button>
+          <button aria-current={view === "audit" ? "page" : undefined} onClick={() => setView("audit")} type="button">Audit log</button>
         </div>
+      </nav>
 
-        {error && <ErrorMessage message={error} />}
-        {summary ? <SummaryPanel summary={summary} /> : <SummarySkeleton />}
+      <main className="dashboard">
+        {view === "overview" ? (
+          <>
+            <div className="page-heading">
+              <div><p className="eyebrow">Amazon Bedrock</p><h1>Quota overview</h1></div>
+              {summary && <p className="updated-at">Updated {new Date(summary.enforcement.as_of).toLocaleString()}</p>}
+            </div>
 
-        <OperationsPanel
-          error={operationsError}
-          loading={operationsLoading}
-          operations={operations}
-          stale={operationsStale}
-        />
+            {(summaryError || (summaryStale && summary)) && (
+              <div className="panel-feedback" aria-label="Summary refresh status">
+                {summaryStale && summary && <span className="ops-status ops-status-amber"><span aria-hidden="true" />Cached summary · refresh failed</span>}
+                {summaryError && <ErrorMessage message={summaryError} />}
+              </div>
+            )}
+            {summary ? <SummaryPanel summary={summary} /> : summaryLoading ? <SummarySkeleton /> : <UnavailableState label="Summary unavailable" />}
 
-        <UsersPanel
-          cfg={cfg}
-          loading={loading}
-          onChanged={refresh}
-          session={session}
-          users={users}
-        />
+            <OperationsPanel error={operationsError} loading={operationsLoading} operations={operations} stale={operationsStale} />
+
+            <UsersPanel
+              cfg={cfg}
+              enforcement={!summaryStale ? summary?.enforcement ?? null : null}
+              error={usersError}
+              filter={userFilter}
+              hasNext={Boolean(usersNextCursor)}
+              hasPrevious={userPageIndex > 0}
+              loading={usersLoading}
+              onCreateUser={addCreatedUser}
+              onFilterChange={(filter) => void loadUsersPage({ cursor: null, targetIndex: 0, query: userQuery, filter, resetHistory: true })}
+              onNext={() => usersNextCursor && void loadUsersPage({ cursor: usersNextCursor, targetIndex: userPageIndex + 1 })}
+              onPrevious={() => void loadUsersPage({ cursor: userCursors[userPageIndex - 1], targetIndex: userPageIndex - 1 })}
+              onSearch={(query) => void loadUsersPage({ cursor: null, targetIndex: 0, query, filter: userFilter, resetHistory: true })}
+              onSelectedUserChange={setSelectedUserId}
+              onSummaryRefresh={refreshSummary}
+              onUserChanged={replaceUser}
+              query={userQuery}
+              selectedUserId={selectedUserId}
+              session={session}
+              stale={usersStale}
+              users={users}
+            />
+          </>
+        ) : (
+          <>
+            <div className="page-heading"><div><p className="eyebrow">Amazon Bedrock</p><h1>Administrative history</h1></div></div>
+            <GlobalAuditView cfg={cfg} onTargetUser={openAuditTarget} session={session} />
+          </>
+        )}
       </main>
     </div>
   );
@@ -533,163 +683,184 @@ function formatTimestamp(value: string | null): string {
   return Number.isNaN(timestamp.getTime()) ? "Invalid timestamp" : timestamp.toLocaleString();
 }
 
-function UsersPanel({
+export function UsersPanel({
   cfg,
+  enforcement,
+  error,
+  filter = "all",
+  hasNext = false,
+  hasPrevious = false,
   loading,
-  onChanged,
+  onCreateUser,
+  onFilterChange = () => undefined,
+  onNext = () => undefined,
+  onPrevious = () => undefined,
+  onSearch = () => undefined,
+  onSelectedUserChange = () => undefined,
+  onSummaryRefresh,
+  onUserChanged,
+  query = "",
+  selectedUserId = null,
   session,
+  stale,
   users,
 }: {
   cfg: AdminConfig;
+  enforcement: Summary["enforcement"] | null;
+  error: string;
+  filter?: UserFilter;
+  hasNext?: boolean;
+  hasPrevious?: boolean;
   loading: boolean;
-  onChanged: () => Promise<void>;
+  onCreateUser?: (user: AdminUser, openDetails: boolean) => void;
+  onFilterChange?: (filter: UserFilter) => void;
+  onNext?: () => void;
+  onPrevious?: () => void;
+  onSearch?: (query: string) => void;
+  onSelectedUserChange?: (userId: string | null) => void;
+  onSummaryRefresh: () => Promise<void>;
+  onUserChanged: (user: AdminUser) => void;
+  query?: string;
+  selectedUserId?: string | null;
   session: Session;
+  stale: boolean;
   users: UserRow[];
 }) {
-  const [query, setQuery] = useState("");
-  const [filter, setFilter] = useState<UserFilter>("all");
+  const [searchDraft, setSearchDraft] = useState(query);
+  const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState<UserRow | null>(null);
-  const [busy, setBusy] = useState("");
+  const [statusChanging, setStatusChanging] = useState<UserRow | null>(null);
+  const [busyUsers, setBusyUsers] = useState<Set<string>>(() => new Set());
   const [actionError, setActionError] = useState("");
   const [notice, setNotice] = useState("");
+  const selectedUser = selectedUserId ? users.find((user) => user.user_id === selectedUserId) ?? null : null;
 
-  const visibleUsers = useMemo(() => {
-    const needle = query.trim().toLowerCase();
-    return users.filter((user) => {
-      const matchesFilter = filter === "all" || user.status === filter;
-      const matchesQuery =
-        !needle ||
-        user.user_id.toLowerCase().includes(needle) ||
-        user.name.toLowerCase().includes(needle);
-      return matchesFilter && matchesQuery;
+  useEffect(() => { setSearchDraft(query); }, [query]);
+  useEffect(() => {
+    if (!enforcement) setStatusChanging(null);
+  }, [enforcement]);
+
+  function setUserBusy(userId: string, busy: boolean) {
+    setBusyUsers((current) => {
+      const next = new Set(current);
+      if (busy) next.add(userId);
+      else next.delete(userId);
+      return next;
     });
-  }, [filter, query, users]);
+  }
 
-  async function act(
-    label: string,
+  function applyCanonicalUser(existing: UserRow, canonical: AdminUser): UserRow {
+    onUserChanged(canonical);
+    return { ...canonical, today: existing.today };
+  }
+
+  async function mutate(
+    user: UserRow,
     successMessage: string,
-    fn: () => Promise<unknown>,
+    fn: () => Promise<TransportResponse<{ user: AdminUser }>>,
   ): Promise<boolean> {
-    setBusy(label);
+    setUserBusy(user.user_id, true);
     setActionError("");
     setNotice("");
     try {
-      await fn();
-      await onChanged();
+      const result = await fn();
+      applyCanonicalUser(user, result.data.user);
       setNotice(successMessage);
+      void onSummaryRefresh().catch(() => undefined);
       return true;
     } catch (caught) {
-      setActionError((caught as Error).message);
+      let message = apiErrorMessage(caught);
+      if (caught instanceof ApiError && caught.status === 409 && caught.code === "version_conflict") {
+        const details = caught.details as { current_user?: unknown } | undefined;
+        const current = details?.current_user;
+        if (isAdminUser(current) && current.user_id === user.user_id && current.version > user.version) {
+          const reconciled = applyCanonicalUser(user, current);
+          if (editing?.user_id === user.user_id) setEditing(reconciled);
+          if (statusChanging?.user_id === user.user_id) setStatusChanging(reconciled);
+        } else {
+          message = apiErrorMessage(new ApiError(
+            "The version conflict response did not identify the requested user.",
+            409,
+            "invalid_response",
+            undefined,
+            caught.requestId,
+          ));
+        }
+      }
+      setActionError(message);
       return false;
     } finally {
-      setBusy("");
+      setUserBusy(user.user_id, false);
     }
   }
 
-  async function saveLimits(
-    user: UserRow,
-    limits: { daily_usd: number; daily_input_tokens: number; daily_output_tokens: number },
-  ) {
-    const saved = await act(
-      `limits:${user.user_id}`,
-      `Limits updated for ${displayName(user)}.`,
-      () => api.setLimits(cfg, session, user.user_id, limits),
-    );
+  async function saveLimits(user: UserRow, limits: SetLimitsRequest) {
+    const saved = await mutate(user, `Limits saved for ${displayName(user)}.`, () => api.setLimits(cfg, session, user, limits));
     if (saved) setEditing(null);
   }
 
-  async function toggleStatus(user: UserRow) {
-    const nextStatus = user.status === "active" ? "blocked" : "active";
-    await act(
-      `status:${user.user_id}`,
-      `${displayName(user)} is now ${nextStatus}.`,
-      () => api.setStatus(cfg, session, user.user_id, nextStatus),
-    );
+  async function saveStatus(user: UserRow, reason: string) {
+    const nextStatus: UserStatus = user.status === "active" ? "blocked" : "active";
+    const saved = await mutate(user, `${displayName(user)} is now ${nextStatus}.`, () => api.setStatus(cfg, session, user, nextStatus, reason));
+    if (saved) setStatusChanging(null);
+  }
+
+  function edit(user: UserRow) {
+    setActionError("");
+    setNotice("");
+    setEditing(user);
+  }
+
+  function changeStatus(user: UserRow) {
+    setActionError("");
+    setNotice("");
+    setStatusChanging(user);
   }
 
   return (
-    <section className="users-panel" aria-labelledby="users-title">
+    <section className="users-panel" aria-labelledby="users-title" aria-busy={loading}>
       <div className="panel-heading">
-        <div>
-          <h2 id="users-title">Users</h2>
-          <p>{users.length} identities with configured quota access</p>
-        </div>
-        <div className="user-tools">
-          <div className="search-field">
-            <Search aria-hidden="true" size={17} />
-            <input
-              aria-label="Search users"
-              placeholder="Search users"
-              type="search"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-            />
-          </div>
-          <div className="select-wrap">
-            <select
-              aria-label="Filter users by status"
-              value={filter}
-              onChange={(event) => setFilter(event.target.value as UserFilter)}
-            >
-              <option value="all">All statuses</option>
-              <option value="active">Active</option>
-              <option value="blocked">Blocked</option>
-            </select>
-            <ChevronDown aria-hidden="true" size={16} />
+        <div><h2 id="users-title">Users</h2><p>{error && users.length === 0 ? "User data unavailable" : `${users.length} identities on this page`}</p></div>
+        <div className="users-heading-actions">
+          {stale && users.length > 0 && <span className="ops-status ops-status-amber"><span aria-hidden="true" />Cached users · refresh failed</span>}
+          <button className="button button-primary" onClick={() => { setActionError(""); setNotice(""); setCreating(true); }} type="button">Create user</button>
+          <div className="user-tools">
+            <form className="search-form" onSubmit={(event) => { event.preventDefault(); onSearch(searchDraft.trim()); }}>
+              <div className="search-field"><Search aria-hidden="true" size={17} /><input aria-label="Search users" placeholder="Search users" type="search" value={searchDraft} onChange={(event) => setSearchDraft(event.target.value)} /></div>
+              <button className="button button-secondary" disabled={loading} type="submit">Search</button>
+            </form>
+            <div className="select-wrap"><select aria-label="Filter users by status" disabled={loading} value={filter} onChange={(event) => onFilterChange(event.target.value as UserFilter)}><option value="all">All statuses</option><option value="active">Active</option><option value="blocked">Blocked</option></select><ChevronDown aria-hidden="true" size={16} /></div>
           </div>
         </div>
       </div>
 
-      {actionError && <ErrorMessage message={actionError} dismiss={() => setActionError("")} />}
+      {error && <ErrorMessage message={error} />}
+      {actionError && !editing && !statusChanging && <ErrorMessage message={actionError} dismiss={() => setActionError("")} />}
       {notice && <SuccessMessage message={notice} dismiss={() => setNotice("")} />}
 
-      <div className="table-scroll">
+      <div aria-label="Users on current page" className="table-scroll" role="region" tabIndex={0}>
         <table>
-          <thead>
-            <tr>
-              <th>User</th>
-              <th>Status</th>
-              <th>USD usage</th>
-              <th>Input tokens</th>
-              <th>Output tokens</th>
-              <th>Requests</th>
-              <th><span className="sr-only">Actions</span></th>
-            </tr>
-          </thead>
-          <tbody>
-            {loading && users.length === 0 ? (
-              <TableSkeleton />
-            ) : (
-              visibleUsers.map((user) => (
-                <UserTableRow
-                  busy={busy}
-                  key={user.user_id}
-                  onEdit={() => {
-                    setActionError("");
-                    setNotice("");
-                    setEditing(user);
-                  }}
-                  onToggleStatus={() => void toggleStatus(user)}
-                  user={user}
-                />
-              ))
-            )}
-          </tbody>
+          <thead><tr><th>User</th><th>Status</th><th>USD usage</th><th>Input tokens</th><th>Output tokens</th><th>Requests</th><th><span className="sr-only">Actions</span></th></tr></thead>
+          <tbody>{loading && users.length === 0 ? <TableSkeleton /> : users.map((user) => (
+            <UserTableRow
+              busy={busyUsers.has(user.user_id)}
+              key={user.user_id}
+              onEdit={() => edit(user)}
+              onOpen={() => onSelectedUserChange(user.user_id)}
+              onRequestStatus={() => changeStatus(user)}
+              statusActionAvailable={enforcement !== null}
+              user={user}
+            />
+          ))}</tbody>
         </table>
-        {!loading && visibleUsers.length === 0 && (
-          <EmptyState hasFilters={Boolean(query) || filter !== "all"} />
-        )}
+        {!loading && users.length === 0 && (error ? <UnavailableState label="Users unavailable" /> : <EmptyState hasFilters={Boolean(query) || filter !== "all"} />)}
       </div>
+      <div className="pagination users-pagination"><span>{users.length} identities on this page</span><div><button className="button button-secondary" disabled={loading || !hasPrevious} onClick={onPrevious} type="button">Previous</button><button className="button button-secondary" disabled={loading || !hasNext} onClick={onNext} type="button">Next</button></div></div>
 
-      {editing && (
-        <LimitsDialog
-          apiError={actionError}
-          busy={busy === `limits:${editing.user_id}`}
-          onClose={() => setEditing(null)}
-          onSave={(limits) => void saveLimits(editing, limits)}
-          user={editing}
-        />
-      )}
+      {creating && <CreateUserWizard cfg={cfg} onClose={() => setCreating(false)} onCreated={(created, openDetails) => { onCreateUser?.(created, openDetails); setNotice(`${created.name || created.user_id} was created.`); }} session={session} />}
+      {selectedUser && <UserDetailDrawer cfg={cfg} onCanonical={onUserChanged} onClose={() => onSelectedUserChange(null)} onEdit={() => edit(selectedUser)} onStatus={() => changeStatus(selectedUser)} session={session} statusActionAvailable={enforcement !== null} suspended={Boolean(editing || statusChanging)} user={selectedUser} />}
+      {editing && <LimitsDialog apiError={actionError} busy={busyUsers.has(editing.user_id)} key={`${editing.user_id}:${editing.version}`} onClose={() => setEditing(null)} onSave={(limits) => void saveLimits(editing, limits)} user={editing} />}
+      {statusChanging && enforcement && <StatusDialog apiError={actionError} busy={busyUsers.has(statusChanging.user_id)} enforcement={enforcement} key={`${statusChanging.user_id}:${statusChanging.version}`} onClose={() => setStatusChanging(null)} onConfirm={(reason) => void saveStatus(statusChanging, reason)} user={statusChanging} />}
     </section>
   );
 }
@@ -697,16 +868,19 @@ function UsersPanel({
 function UserTableRow({
   busy,
   onEdit,
-  onToggleStatus,
+  onOpen,
+  onRequestStatus,
+  statusActionAvailable,
   user,
 }: {
-  busy: string;
+  busy: boolean;
   onEdit: () => void;
-  onToggleStatus: () => void;
+  onOpen: () => void;
+  onRequestStatus: () => void;
+  statusActionAvailable: boolean;
   user: UserRow;
 }) {
   const isActive = user.status === "active";
-  const isBusy = busy.endsWith(`:${user.user_id}`);
 
   return (
     <tr>
@@ -714,21 +888,30 @@ function UserTableRow({
         <div className="user-cell">
           <div className="user-avatar" aria-hidden="true">{initials(user)}</div>
           <div>
-            <strong title={user.name}>{displayName(user)}</strong>
+            <button className="user-name-button" disabled={busy} onClick={onOpen} title={user.name} type="button">{displayName(user)}</button>
             <span title={user.user_id}>{user.user_id}</span>
           </div>
         </div>
       </td>
       <td>
-        <span className={`status-badge status-${isActive ? "active" : "blocked"}`}>
-          <span aria-hidden="true" />
-          {user.status}
-        </span>
+        <div className="status-stack">
+          <span className={`status-badge status-${isActive ? "active" : "blocked"}`}>
+            <span aria-hidden="true" />
+            {user.status}
+          </span>
+          <details className="status-details">
+            <summary>Status details</summary>
+            <dl>
+              <div><dt>Origin</dt><dd>{user.status_origin || "Not provided"}</dd></div>
+              <div><dt>Reason</dt><dd>{user.status_reason || "Not provided"}</dd></div>
+            </dl>
+          </details>
+        </div>
       </td>
       <td>
         <QuotaUsage
           current={user.today.cost_usd}
-          format={(value) => formatUsd(value, 4)}
+          format={(value) => formatUsd(value, 6)}
           limit={user.limits.daily_usd}
         />
       </td>
@@ -749,16 +932,18 @@ function UserTableRow({
       <td className="request-count">{user.today.requests.toLocaleString()}</td>
       <td>
         <div className="row-actions">
-          <IconButton label={`Edit limits for ${displayName(user)}`} onClick={onEdit}>
+          <IconButton disabled={busy} label={`Edit limits for ${displayName(user)}`} onClick={onEdit}>
             <Pencil aria-hidden="true" size={17} />
           </IconButton>
           <IconButton
             danger={isActive}
-            disabled={isBusy}
-            label={`${isActive ? "Block" : "Unblock"} ${displayName(user)}`}
-            onClick={onToggleStatus}
+            disabled={busy || !statusActionAvailable}
+            label={statusActionAvailable
+              ? `${isActive ? "Block" : "Unblock"} ${displayName(user)}`
+              : `Status change unavailable for ${displayName(user)} until a fresh enforcement summary loads`}
+            onClick={onRequestStatus}
           >
-            {isBusy ? (
+            {busy ? (
               <RefreshCw className="spin" aria-hidden="true" size={17} />
             ) : isActive ? (
               <Lock aria-hidden="true" size={17} />
@@ -772,7 +957,7 @@ function UserTableRow({
   );
 }
 
-function QuotaUsage({
+export function QuotaUsage({
   current,
   format,
   limit,
@@ -781,8 +966,21 @@ function QuotaUsage({
   format: (value: number) => string;
   limit: number;
 }) {
-  const percentage = limit > 0 ? (current / limit) * 100 : current > 0 ? 100 : 0;
+  if (limit === 0) {
+    return (
+      <div className="quota-usage quota-unlimited">
+        <div>
+          <strong>{format(current)}</strong>
+          <span>of Unlimited</span>
+        </div>
+        <span className="unlimited-label">Unlimited</span>
+      </div>
+    );
+  }
+
+  const percentage = (current / limit) * 100;
   const level = percentage >= 100 ? "critical" : percentage >= 80 ? "warning" : "normal";
+  const roundedPercentage = Math.round(percentage);
 
   return (
     <div className="quota-usage">
@@ -791,10 +989,11 @@ function QuotaUsage({
         <span>of {format(limit)}</span>
       </div>
       <div
-        aria-label={`${Math.round(percentage)} percent used`}
+        aria-label={`${roundedPercentage} percent used`}
         aria-valuemax={100}
         aria-valuemin={0}
-        aria-valuenow={Math.min(Math.round(percentage), 100)}
+        aria-valuenow={Math.min(roundedPercentage, 100)}
+        aria-valuetext={`${format(current)} of ${format(limit)} used (${roundedPercentage} percent)`}
         className="progress-track"
         role="progressbar"
       >
@@ -807,7 +1006,7 @@ function QuotaUsage({
   );
 }
 
-function LimitsDialog({
+export function LimitsDialog({
   apiError,
   busy,
   onClose,
@@ -817,51 +1016,66 @@ function LimitsDialog({
   apiError: string;
   busy: boolean;
   onClose: () => void;
-  onSave: (limits: {
-    daily_usd: number;
-    daily_input_tokens: number;
-    daily_output_tokens: number;
-  }) => void;
+  onSave: (limits: SetLimitsRequest) => void;
   user: UserRow;
 }) {
   const [dailyUsd, setDailyUsd] = useState(String(user.limits.daily_usd));
   const [dailyInput, setDailyInput] = useState(String(user.limits.daily_input_tokens));
   const [dailyOutput, setDailyOutput] = useState(String(user.limits.daily_output_tokens));
+  const [reason, setReason] = useState("");
+  const [unlimitedConfirmed, setUnlimitedConfirmed] = useState(false);
   const [error, setError] = useState("");
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const firstFieldRef = useRef<HTMLInputElement>(null);
+  useModalLifecycle(busy, onClose, dialogRef, firstFieldRef);
 
-  useEffect(() => {
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    function onKeyDown(event: KeyboardEvent) {
-      if (event.key === "Escape" && !busy) onClose();
-    }
-    window.addEventListener("keydown", onKeyDown);
-    return () => {
-      document.body.style.overflow = previousOverflow;
-      window.removeEventListener("keydown", onKeyDown);
-    };
-  }, [busy, onClose]);
+  const usd = dailyUsd.trim() === "" ? Number.NaN : Number(dailyUsd);
+  const input = dailyInput.trim() === "" ? Number.NaN : Number(dailyInput);
+  const output = dailyOutput.trim() === "" ? Number.NaN : Number(dailyOutput);
+  const parsedLimits =
+    Number.isFinite(usd) && usd >= 0 &&
+    Number.isInteger(input) && input >= 0 &&
+    Number.isInteger(output) && output >= 0
+      ? { daily_usd: usd, daily_input_tokens: input, daily_output_tokens: output }
+      : null;
+
+  const unlimitedFields = parsedLimits ? [
+    user.limits.daily_usd > 0 && parsedLimits.daily_usd === 0 ? "USD" : "",
+    user.limits.daily_input_tokens > 0 && parsedLimits.daily_input_tokens === 0 ? "input tokens" : "",
+    user.limits.daily_output_tokens > 0 && parsedLimits.daily_output_tokens === 0 ? "output tokens" : "",
+  ].filter(Boolean) : [];
+
+  const belowUsageFields = parsedLimits ? [
+    parsedLimits.daily_usd > 0 && parsedLimits.daily_usd < user.today.cost_usd ? "USD" : "",
+    parsedLimits.daily_input_tokens > 0 && parsedLimits.daily_input_tokens < user.today.input_tokens ? "input tokens" : "",
+    parsedLimits.daily_output_tokens > 0 && parsedLimits.daily_output_tokens < user.today.output_tokens ? "output tokens" : "",
+  ].filter(Boolean) : [];
+  const reasonRequired = unlimitedFields.length > 0 || belowUsageFields.length > 0;
+
+  function changed(setter: (value: string) => void, value: string) {
+    setter(value);
+    setUnlimitedConfirmed(false);
+    setError("");
+  }
 
   function submit(event: React.FormEvent) {
     event.preventDefault();
-    const usd = Number(dailyUsd);
-    const input = Number(dailyInput);
-    const output = Number(dailyOutput);
-    if (
-      !Number.isFinite(usd) ||
-      usd < 0 ||
-      !Number.isInteger(input) ||
-      input < 0 ||
-      !Number.isInteger(output) ||
-      output < 0
-    ) {
-      setError("Enter a non-negative USD amount and whole token values.");
+    if (!parsedLimits) {
+      setError("Enter a non-negative USD amount and whole token values. Fields cannot be blank.");
+      return;
+    }
+    if (unlimitedFields.length > 0 && !unlimitedConfirmed) {
+      setError("Confirm that the selected limits should become Unlimited.");
+      return;
+    }
+    const trimmedReason = reason.trim();
+    if (reasonRequired && !trimmedReason) {
+      setError("Enter a reason for this sensitive limit change.");
       return;
     }
     onSave({
-      daily_usd: usd,
-      daily_input_tokens: input,
-      daily_output_tokens: output,
+      ...parsedLimits,
+      ...(trimmedReason ? { reason: trimmedReason } : {}),
     });
   }
 
@@ -869,7 +1083,16 @@ function LimitsDialog({
     <div className="dialog-backdrop" onMouseDown={(event) => {
       if (event.target === event.currentTarget && !busy) onClose();
     }}>
-      <div aria-labelledby="limits-title" aria-modal="true" className="dialog" role="dialog">
+      <div
+        aria-busy={busy}
+        aria-describedby="limits-zero-help"
+        aria-labelledby="limits-title"
+        aria-modal="true"
+        className="dialog"
+        ref={dialogRef}
+        role="dialog"
+        tabIndex={-1}
+      >
         <div className="dialog-header">
           <div>
             <p className="eyebrow">Daily allowance</p>
@@ -887,49 +1110,108 @@ function LimitsDialog({
           </div>
         </div>
         <form onSubmit={submit}>
+          <p className="field-help" id="limits-zero-help">Enter 0 for Unlimited. Current usage remains visible in the users table.</p>
           <div className="field-grid">
             <label>
               <span>USD limit</span>
               <div className="number-input">
                 <span aria-hidden="true">$</span>
                 <input
-                  autoFocus
+                  aria-describedby="limits-zero-help"
+                  aria-label="USD limit"
+                  disabled={busy}
                   min="0"
-                  step="0.01"
+                  ref={firstFieldRef}
+                  step="0.000001"
                   type="number"
                   value={dailyUsd}
-                  onChange={(event) => setDailyUsd(event.target.value)}
+                  onChange={(event) => changed(setDailyUsd, event.target.value)}
                 />
               </div>
             </label>
             <label>
               <span>Input token limit</span>
               <input
+                aria-describedby="limits-zero-help"
+                aria-label="Input token limit"
+                disabled={busy}
                 min="0"
                 step="1"
                 type="number"
                 value={dailyInput}
-                onChange={(event) => setDailyInput(event.target.value)}
+                onChange={(event) => changed(setDailyInput, event.target.value)}
               />
             </label>
             <label>
               <span>Output token limit</span>
               <input
+                aria-describedby="limits-zero-help"
+                aria-label="Output token limit"
+                disabled={busy}
                 min="0"
                 step="1"
                 type="number"
                 value={dailyOutput}
-                onChange={(event) => setDailyOutput(event.target.value)}
+                onChange={(event) => changed(setDailyOutput, event.target.value)}
               />
             </label>
           </div>
+          {belowUsageFields.length > 0 && (
+            <div className="safety-warning" role="status">
+              <ShieldAlert aria-hidden="true" size={18} />
+              <span>The new finite {formatList(belowUsageFields)} limit is below today&apos;s usage. Additional use may be blocked immediately.</span>
+            </div>
+          )}
+          {unlimitedFields.length > 0 && (
+            <div className="safety-warning safety-warning-critical">
+              <ShieldAlert aria-hidden="true" size={18} />
+              <label>
+                <input
+                  checked={unlimitedConfirmed}
+                  disabled={busy}
+                  onChange={(event) => setUnlimitedConfirmed(event.target.checked)}
+                  type="checkbox"
+                />
+                <span>I confirm the {formatList(unlimitedFields)} limit should change from a finite value to Unlimited.</span>
+              </label>
+            </div>
+          )}
+          <label className="reason-field">
+            <span>Reason {reasonRequired && <strong aria-hidden="true">*</strong>}</span>
+            <textarea
+              aria-describedby="limits-reason-help"
+              aria-required={reasonRequired}
+              disabled={busy}
+              onChange={(event) => {
+                setReason(event.target.value);
+                setError("");
+              }}
+              required={reasonRequired}
+              rows={3}
+              value={reason}
+            />
+          </label>
+          <p className="field-help" id="limits-reason-help">
+            {reasonRequired
+              ? "Required for Unlimited limits or finite limits below today's usage. "
+              : "Optional for this limit change. "}
+            When provided, the trimmed reason is stored with the immutable limit-change audit event.
+          </p>
           {error && <ErrorMessage message={error} />}
           {apiError && <ErrorMessage message={apiError} />}
           <div className="dialog-actions">
             <button className="button button-secondary" disabled={busy} onClick={onClose} type="button">
               Cancel
             </button>
-            <button className="button button-primary" disabled={busy} type="submit">
+            <button
+              className="button button-primary"
+              disabled={
+                busy ||
+                (unlimitedFields.length > 0 && !unlimitedConfirmed) ||
+                (reasonRequired && !reason.trim())
+              }
+              type="submit"
+            >
               {busy ? (
                 <RefreshCw className="spin" aria-hidden="true" size={17} />
               ) : (
@@ -942,6 +1224,147 @@ function LimitsDialog({
       </div>
     </div>
   );
+}
+
+export function StatusDialog({
+  apiError,
+  busy,
+  enforcement,
+  onClose,
+  onConfirm,
+  user,
+}: {
+  apiError: string;
+  busy: boolean;
+  enforcement: Summary["enforcement"];
+  onClose: () => void;
+  onConfirm: (reason: string) => void;
+  user: UserRow;
+}) {
+  const [reason, setReason] = useState("");
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const reasonRef = useRef<HTMLTextAreaElement>(null);
+  const nextStatus: UserStatus = user.status === "active" ? "blocked" : "active";
+  const blocking = nextStatus === "blocked";
+  useModalLifecycle(busy, onClose, dialogRef, reasonRef);
+
+  function submit(event: React.FormEvent) {
+    event.preventDefault();
+    const trimmed = reason.trim();
+    if (!trimmed) return;
+    onConfirm(trimmed);
+  }
+
+  return (
+    <div className="dialog-backdrop" onMouseDown={(event) => {
+      if (event.target === event.currentTarget && !busy) onClose();
+    }}>
+      <div
+        aria-busy={busy}
+        aria-describedby="status-enforcement-message"
+        aria-labelledby="status-title"
+        aria-modal="true"
+        className="dialog status-dialog"
+        ref={dialogRef}
+        role="dialog"
+        tabIndex={-1}
+      >
+        <div className="dialog-header">
+          <div>
+            <p className="eyebrow">Access status</p>
+            <h2 id="status-title">Confirm {blocking ? "block" : "unblock"}</h2>
+          </div>
+          <IconButton label="Close dialog" disabled={busy} onClick={onClose}>
+            <X aria-hidden="true" size={19} />
+          </IconButton>
+        </div>
+        <div className="dialog-user">
+          <div className="user-avatar" aria-hidden="true">{initials(user)}</div>
+          <div>
+            <strong>{displayName(user)}</strong>
+            <span>{user.user_id}</span>
+          </div>
+        </div>
+        <form onSubmit={submit}>
+          <div className="status-transition" aria-label={`Status changes from ${user.status} to ${nextStatus}`}>
+            <div><span>Current status</span><strong>{user.status}</strong></div>
+            <span aria-hidden="true">→</span>
+            <div><span>Next status</span><strong>{nextStatus}</strong></div>
+          </div>
+          <dl className="usage-snapshot" aria-label="Current usage and limits">
+            <div><dt>USD today</dt><dd>{formatUsd(user.today.cost_usd, 6)} of {formatLimit(user.limits.daily_usd, (value) => formatUsd(value, 6))}</dd></div>
+            <div><dt>Input tokens</dt><dd>{formatCompact(user.today.input_tokens)} of {formatLimit(user.limits.daily_input_tokens, formatCompact)}</dd></div>
+            <div><dt>Output tokens</dt><dd>{formatCompact(user.today.output_tokens)} of {formatLimit(user.limits.daily_output_tokens, formatCompact)}</dd></div>
+            <div><dt>Requests today</dt><dd>{user.today.requests.toLocaleString()}</dd></div>
+          </dl>
+          <div className={`enforcement-warning${blocking ? " enforcement-warning-destructive" : ""}`} id="status-enforcement-message">
+            <ShieldAlert aria-hidden="true" size={18} />
+            <div>
+              <strong>{formatOperationalLabel(enforcement.mode)} mode</strong>
+              <p>{statusEnforcementMessage(enforcement, nextStatus)}</p>
+            </div>
+          </div>
+          <label className="reason-field">
+            <span>Reason <strong aria-hidden="true">*</strong></span>
+            <textarea
+              aria-describedby="status-reason-help"
+              disabled={busy}
+              onChange={(event) => setReason(event.target.value)}
+              ref={reasonRef}
+              required
+              rows={3}
+              value={reason}
+            />
+          </label>
+          <p className="field-help" id="status-reason-help">Required. This trimmed reason is stored in the administrative audit trail.</p>
+          {apiError && <ErrorMessage message={apiError} />}
+          <div className="dialog-actions">
+            <button className="button button-secondary" disabled={busy} onClick={onClose} type="button">
+              Cancel
+            </button>
+            <button
+              className={`button ${blocking ? "button-danger" : "button-primary"}`}
+              disabled={busy || !reason.trim()}
+              type="submit"
+            >
+              {busy ? <RefreshCw className="spin" aria-hidden="true" size={17} /> : blocking ? <Lock aria-hidden="true" size={17} /> : <Unlock aria-hidden="true" size={17} />}
+              {busy ? "Saving" : blocking ? "Block user" : "Unblock user"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+export function statusEnforcementMessage(
+  enforcement: Summary["enforcement"],
+  nextStatus: UserStatus,
+): string {
+  if (nextStatus === "active") {
+    return "Unblocking allows new credentials to be issued. Configured daily limits continue to apply.";
+  }
+  const window = formatDuration(enforcement.post_detection_fallback_seconds);
+  if (enforcement.mode === "bounded_overspend") {
+    return `Blocking prevents new credentials from being issued. Existing credentials can remain usable for up to ${window}, so bounded overspend can continue during that window.`;
+  }
+  if (enforcement.mode === "permission_lease") {
+    return `Blocking prevents new credentials from being issued. Existing permissions can remain usable for up to ${window} after detection, so bounded overspend can continue until the lease expires.`;
+  }
+  if (enforcement.mode === "active_session_revocation") {
+    return "Blocking prevents new credentials and requests active-session revocation. Revocation is asynchronous, so bounded overspend can continue until reconciliation converges.";
+  }
+  return "Blocking prevents new credentials. Enforcement timing is not available in the current summary.";
+}
+
+function formatLimit(limit: number, format: (value: number) => string): string {
+  return limit === 0 ? "Unlimited" : format(limit);
+}
+
+function formatList(values: string[]): string {
+  if (values.length < 2) return values[0] ?? "";
+  if (values.length === 2) return `${values[0]} and ${values[1]}`;
+  return `${values.slice(0, -1).join(", ")}, and ${values[values.length - 1]}`;
 }
 
 function Brand() {
@@ -1058,6 +1481,15 @@ function TableSkeleton() {
         </tr>
       ))}
     </>
+  );
+}
+
+function UnavailableState({ label }: { label: string }) {
+  return (
+    <section className="unavailable-state" aria-label={label}>
+      <AlertCircle aria-hidden="true" size={22} />
+      <span>{label}</span>
+    </section>
   );
 }
 
