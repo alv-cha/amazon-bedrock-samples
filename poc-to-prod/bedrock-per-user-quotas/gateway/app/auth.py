@@ -42,6 +42,14 @@ class Identity:
     claims: dict
 
 
+@dataclass(frozen=True)
+class AdminPrincipal:
+    """Verified routine-admin identity safe to persist in audit records."""
+
+    actor: str
+    auth_method: str
+
+
 def extract_bearer(authorization_header: str | None) -> str | None:
     """Pull a bearer token out of an Authorization or x-api-key style value."""
     if not authorization_header:

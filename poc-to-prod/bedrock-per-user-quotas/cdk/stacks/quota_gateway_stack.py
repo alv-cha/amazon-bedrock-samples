@@ -12,6 +12,7 @@ Resources:
 - CloudWatch dashboard over broker and metering EMF metrics
 """
 
+import hashlib
 import json
 import os
 
@@ -40,6 +41,7 @@ from aws_cdk import (
     aws_sns as sns,
     aws_sns_subscriptions as subs,
     aws_sqs as sqs,
+    aws_ssm as ssm,
     custom_resources as cr,
 )
 from constructs import Construct
@@ -104,10 +106,84 @@ class QuotaGatewayStack(Stack):
         model_prices_json = price_snapshot.get_att_string("ModelPricesJson")
         fallback_price_json = price_snapshot.get_att_string("FallbackPriceJson")
 
+        # Runtime price configuration. The deployment snapshot seeds the
+        # parameter; a daily scheduled refresh keeps it aligned with the
+        # Pricing API so catalog price changes do not require a redeploy.
+        # Metering reads the parameter with a short cache and falls back to
+        # the env snapshot if Parameter Store is unavailable.
+        model_prices_parameter = ssm.StringParameter(
+            self,
+            "ModelPricesParameter",
+            string_value=cdk.Fn.join(
+                "",
+                [
+                    '{"models":',
+                    model_prices_json,
+                    ',"fallback":',
+                    fallback_price_json,
+                    "}",
+                ],
+            ),
+            description=(
+                "Bedrock model token prices used by quota metering; "
+                "refreshed daily from the AWS Pricing API"
+            ),
+        )
+        price_refresh_fn = lambda_.Function(
+            self,
+            "PriceRefreshFn",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            memory_size=256,
+            timeout=Duration.minutes(1),
+            handler="handler.scheduled_handler",
+            code=lambda_.Code.from_asset("pricing_resolver"),
+            environment={
+                "PRICES_PARAMETER_NAME": (
+                    model_prices_parameter.parameter_name
+                ),
+            },
+        )
+        price_refresh_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["pricing:GetProducts"],
+                resources=["*"],
+            )
+        )
+        model_prices_parameter.grant_write(price_refresh_fn)
+        events.Rule(
+            self,
+            "ModelPriceRefreshSchedule",
+            schedule=events.Schedule.rate(Duration.hours(24)),
+            targets=[
+                events_targets.LambdaFunction(
+                    price_refresh_fn,
+                    # Same properties shape as the deploy-time custom
+                    # resource, so both entrypoints share one contract.
+                    event=events.RuleTargetInput.from_object(
+                        {
+                            "RegionCode": self.region,
+                            "CatalogModels": (
+                                config.model_pricing.catalog_models
+                            ),
+                            "PinnedPrices": (
+                                config.model_pricing.price_overrides
+                            ),
+                            "FallbackPrice": (
+                                config.model_pricing.fallback_price
+                            ),
+                        }
+                    ),
+                )
+            ],
+        )
+
         # ------------------------------------------------------------------
         # Identity: BYO OIDC issuer, or a demo Cognito User Pool
         # ------------------------------------------------------------------
         user_pool = None
+        ui_bucket = None
+        ui_distribution = None
+        cognito_domain_url = None
         if not jwt_issuer:
             user_pool = cognito.UserPool(
                 self, "DemoUserPool",
@@ -115,14 +191,161 @@ class QuotaGatewayStack(Stack):
                 sign_in_aliases=cognito.SignInAliases(username=True, email=True),
                 removal_policy=RemovalPolicy.DESTROY,
             )
+
+            # Build the UI origin before adding OAuth URLs to the existing app
+            # client. The dependency direction is AppClient -> Distribution;
+            # CloudFront must not reference the app client or Function URL.
+            if config.admin_ui:
+                domain_suffix = hashlib.sha256(
+                    self.stack_name.encode("utf-8")
+                ).hexdigest()[:10]
+                cognito_domain_prefix = (
+                    f"bedrock-quota-admin-{self.account}-{self.region}-"
+                    f"{domain_suffix}"
+                )
+                ui_callback_url = None
+                ui_logout_url = None
+                ui_bucket = s3.Bucket(
+                    self, "AdminUiBucket",
+                    block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+                    encryption=s3.BucketEncryption.S3_MANAGED,
+                    enforce_ssl=True,
+                    removal_policy=RemovalPolicy.DESTROY,
+                    auto_delete_objects=True,
+                )
+                ui_security_headers = cloudfront.ResponseHeadersPolicy(
+                    self,
+                    "AdminUiSecurityHeaders",
+                    comment="Security headers for the Bedrock quota admin UI",
+                    security_headers_behavior=cloudfront.ResponseSecurityHeadersBehavior(
+                        content_security_policy=cloudfront.ResponseHeadersContentSecurityPolicy(
+                            content_security_policy="; ".join(
+                                [
+                                    "default-src 'self'",
+                                    "base-uri 'none'",
+                                    "object-src 'none'",
+                                    "frame-ancestors 'none'",
+                                    "form-action 'self'",
+                                    "img-src 'self' data:",
+                                    (
+                                        "connect-src 'self' "
+                                        f"https://*.lambda-url.{self.region}.on.aws "
+                                        f"https://cognito-identity.{self.region}.{self.url_suffix} "
+                                        f"https://*.auth.{self.region}.amazoncognito.com "
+                                        f"https://*.auth.{self.region}.amazoncognito.com.cn"
+                                    ),
+                                ]
+                            ),
+                            override=True,
+                        ),
+                        content_type_options=cloudfront.ResponseHeadersContentTypeOptions(
+                            override=True
+                        ),
+                        frame_options=cloudfront.ResponseHeadersFrameOptions(
+                            frame_option=cloudfront.HeadersFrameOption.DENY,
+                            override=True,
+                        ),
+                        referrer_policy=cloudfront.ResponseHeadersReferrerPolicy(
+                            referrer_policy=(
+                                cloudfront.HeadersReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN
+                            ),
+                            override=True,
+                        ),
+                        strict_transport_security=cloudfront.ResponseHeadersStrictTransportSecurity(
+                            access_control_max_age=Duration.days(365),
+                            include_subdomains=True,
+                            preload=True,
+                            override=True,
+                        ),
+                    ),
+                )
+                ui_distribution = cloudfront.Distribution(
+                    self, "AdminUiDistribution",
+                    default_root_object="index.html",
+                    default_behavior=cloudfront.BehaviorOptions(
+                        origin=cloudfront_origins.S3BucketOrigin.with_origin_access_control(
+                            ui_bucket
+                        ),
+                        viewer_protocol_policy=(
+                            cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS
+                        ),
+                        response_headers_policy=ui_security_headers,
+                    ),
+                    # SPA: client-side routes resolve to index.html.
+                    error_responses=[
+                        cloudfront.ErrorResponse(
+                            http_status=403,
+                            response_http_status=200,
+                            response_page_path="/index.html",
+                        ),
+                        cloudfront.ErrorResponse(
+                            http_status=404,
+                            response_http_status=200,
+                            response_page_path="/index.html",
+                        ),
+                    ],
+                )
+                ui_origin = (
+                    f"https://{ui_distribution.distribution_domain_name}"
+                )
+                ui_callback_url = f"{ui_origin}/auth/callback"
+                ui_logout_url = f"{ui_origin}/"
+
+            # Preserve this scope and construct ID: the notebook, broker JWT
+            # audience, Identity Pool, and browser all reuse this public client.
             user_pool_client = user_pool.add_client(
                 "DemoAppClient",
                 auth_flows=cognito.AuthFlow(user_password=True, user_srp=True),
                 generate_secret=False,
                 id_token_validity=Duration.hours(12),
+                disable_o_auth=not config.admin_ui,
+                o_auth=(
+                    cognito.OAuthSettings(
+                        flows=cognito.OAuthFlows(
+                            authorization_code_grant=True,
+                            implicit_code_grant=False,
+                        ),
+                        scopes=[
+                            cognito.OAuthScope.OPENID,
+                            cognito.OAuthScope.EMAIL,
+                            cognito.OAuthScope.PROFILE,
+                        ],
+                        callback_urls=[ui_callback_url],
+                        default_redirect_uri=ui_callback_url,
+                        logout_urls=[ui_logout_url],
+                    )
+                    if config.admin_ui
+                    else None
+                ),
             )
+            if config.admin_ui:
+                login_domain = user_pool.add_domain(
+                    "AdminManagedLoginDomain",
+                    cognito_domain=cognito.CognitoDomainOptions(
+                        domain_prefix=cognito_domain_prefix
+                    ),
+                    managed_login_version=(
+                        cognito.ManagedLoginVersion.NEWER_MANAGED_LOGIN
+                    ),
+                )
+                cognito_domain_url = login_domain.base_url()
+                managed_login_branding = cognito.CfnManagedLoginBranding(
+                    self,
+                    "AdminManagedLoginBranding",
+                    user_pool_id=user_pool.user_pool_id,
+                    client_id=user_pool_client.user_pool_client_id,
+                    use_cognito_provided_values=True,
+                )
+                domain_resource = login_domain.node.default_child
+                if not isinstance(domain_resource, cognito.CfnUserPoolDomain):
+                    raise TypeError(
+                        "Managed login domain has no AWS::Cognito::UserPoolDomain child"
+                    )
+                managed_login_branding.add_dependency(domain_resource)
+
             jwt_issuer = (
-                f"https://cognito-idp.{self.region}.amazonaws.com/{user_pool.user_pool_id}"
+                f"https://cognito-idp.{self.region}.{self.url_suffix}/"
+                f"{user_pool.user_pool_id}"
             )
             # ID tokens carry the app client id as `aud`.
             jwt_audience = user_pool_client.user_pool_client_id
@@ -191,6 +414,30 @@ class QuotaGatewayStack(Stack):
             billing_mode=ddb.BillingMode.PAY_PER_REQUEST,
             time_to_live_attribute="expires_at",
             removal_policy=table_removal_policy,
+        )
+
+        admin_audit_table = ddb.Table(
+            self,
+            "AdminAuditTable",
+            partition_key=ddb.Attribute(
+                name="subject_id", type=ddb.AttributeType.STRING
+            ),
+            sort_key=ddb.Attribute(
+                name="event_key", type=ddb.AttributeType.STRING
+            ),
+            billing_mode=ddb.BillingMode.PAY_PER_REQUEST,
+            time_to_live_attribute="expires_at",
+            removal_policy=table_removal_policy,
+        )
+        admin_audit_table.add_global_secondary_index(
+            index_name="scope-event-key-index",
+            partition_key=ddb.Attribute(
+                name="scope", type=ddb.AttributeType.STRING
+            ),
+            sort_key=ddb.Attribute(
+                name="event_key", type=ddb.AttributeType.STRING
+            ),
+            projection_type=ddb.ProjectionType.ALL,
         )
 
         # ------------------------------------------------------------------
@@ -264,6 +511,8 @@ class QuotaGatewayStack(Stack):
                 # App config
                 "USERS_TABLE": users_table.table_name,
                 "USAGE_TABLE": usage_table.table_name,
+                "ADMIN_AUDIT_TABLE": admin_audit_table.table_name,
+                "ADMIN_AUDIT_RETENTION_DAYS": "365",
                 "METRICS_NAMESPACE": METRICS_NAMESPACE,
                 "ADMIN_KEY_SECRET_ARN": admin_secret.secret_arn,
                 "EMERGENCY_KEY_SECRET_ARN": emergency_secret.secret_arn,
@@ -326,6 +575,16 @@ class QuotaGatewayStack(Stack):
 
         users_table.grant_read_write_data(broker_api_fn)
         usage_table.grant_read_data(broker_api_fn)
+        admin_audit_table.grant_read_write_data(broker_api_fn)
+        broker_api_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["dynamodb:TransactWriteItems"],
+                resources=[
+                    users_table.table_arn,
+                    admin_audit_table.table_arn,
+                ],
+            )
+        )
         admin_secret.grant_read(broker_api_fn)
         emergency_secret.grant_read(broker_api_fn)
 
@@ -609,35 +868,8 @@ class QuotaGatewayStack(Stack):
         # manual Identity Pool + OIDC-provider path.
         # ------------------------------------------------------------------
         if config.admin_ui and user_pool is not None:
-            ui_bucket = s3.Bucket(
-                self, "AdminUiBucket",
-                block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
-                encryption=s3.BucketEncryption.S3_MANAGED,
-                enforce_ssl=True,
-                removal_policy=RemovalPolicy.DESTROY,
-                auto_delete_objects=True,
-            )
-            ui_distribution = cloudfront.Distribution(
-                self, "AdminUiDistribution",
-                default_root_object="index.html",
-                default_behavior=cloudfront.BehaviorOptions(
-                    origin=cloudfront_origins.S3BucketOrigin.with_origin_access_control(
-                        ui_bucket
-                    ),
-                    viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-                ),
-                # SPA: client-side routes resolve to index.html.
-                error_responses=[
-                    cloudfront.ErrorResponse(
-                        http_status=403, response_http_status=200,
-                        response_page_path="/index.html",
-                    ),
-                    cloudfront.ErrorResponse(
-                        http_status=404, response_http_status=200,
-                        response_page_path="/index.html",
-                    ),
-                ],
-            )
+            if ui_bucket is None or ui_distribution is None or cognito_domain_url is None:
+                raise RuntimeError("Admin UI resources were not initialized")
             # The browser calls the IAM-authenticated Function URL from the
             # CloudFront origin. Configure CORS at the Function URL so Lambda
             # handles unsigned preflight requests before FastAPI, and restrict
@@ -650,6 +882,8 @@ class QuotaGatewayStack(Stack):
                 allow_headers=[
                     "authorization",
                     "content-type",
+                    "idempotency-key",
+                    "if-match",
                     "x-amz-content-sha256",
                     "x-amz-date",
                     "x-amz-security-token",
@@ -660,8 +894,10 @@ class QuotaGatewayStack(Stack):
                     f"https://{ui_distribution.distribution_domain_name}"
                 ],
                 expose_headers=[
+                    "etag",
                     "x-quota-limit-usd",
                     "x-quota-window",
+                    "x-request-id",
                 ],
                 max_age=3600,
             )
@@ -714,6 +950,8 @@ class QuotaGatewayStack(Stack):
                     "userPoolId": user_pool.user_pool_id,
                     "userPoolClientId": user_pool_client.user_pool_client_id,
                     "identityPoolId": admin_identity_pool.identity_pool_id,
+                    "cognitoDomain": cognito_domain_url,
+                    "cognitoIssuer": jwt_issuer,
                 }
             )
             ui_config_writer = cr.AwsCustomResource(
@@ -827,12 +1065,16 @@ class QuotaGatewayStack(Stack):
                 "METRICS_NAMESPACE": METRICS_NAMESPACE,
                 "MODEL_PRICES_JSON": model_prices_json,
                 "MODEL_FALLBACK_PRICE_JSON": fallback_price_json,
+                "PRICES_PARAMETER_NAME": (
+                    model_prices_parameter.parameter_name
+                ),
                 "BEDROCK_USER_ROLE_NAME": bedrock_user_role.role_name,
             },
         )
         users_table.grant_read_write_data(usage_processor_fn)
         usage_table.grant_read_write_data(usage_processor_fn)
         alert_topic.grant_publish(usage_processor_fn)
+        model_prices_parameter.grant_read(usage_processor_fn)
 
         # CloudWatch Logs subscriptions are at-least-once. The processor uses
         # the Bedrock requestId as a DynamoDB idempotency key and updates the
@@ -1165,6 +1407,28 @@ class QuotaGatewayStack(Stack):
             operations_alarms["revocation_iterator_age"] = (
                 revocation_iterator_age_alarm
             )
+
+        # A fallback-priced request means an invocation was metered with the
+        # synthetic conservative rate instead of a resolved model price.
+        # That is an operational event (missing snapshot/profile mapping),
+        # never silent tarification: see the 2026-09-01 Opus incident.
+        pricing_fallback_alarm = cw.Alarm(
+            self,
+            "PricingFallbackAlarm",
+            metric=cw.Metric(
+                namespace=METRICS_NAMESPACE,
+                metric_name="FallbackPricedRequests",
+                statistic="Sum",
+                period=Duration.minutes(5),
+            ),
+            threshold=1,
+            evaluation_periods=1,
+            treat_missing_data=cw.TreatMissingData.NOT_BREACHING,
+        )
+        pricing_fallback_alarm.add_alarm_action(
+            cw_actions.SnsAction(alert_topic)
+        )
+        operations_alarms["pricing_fallback"] = pricing_fallback_alarm
 
         broker_api_fn.add_environment(
             "OPERATIONS_ALARM_NAMES_JSON",

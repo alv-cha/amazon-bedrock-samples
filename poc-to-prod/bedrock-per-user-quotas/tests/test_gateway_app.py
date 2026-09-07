@@ -817,6 +817,7 @@ def test_admin_requires_authorization_and_valid_payloads(client):
         {"daily_usd": -1},
         {"daily_input_tokens": 1.5},
         {"daily_output_tokens": False},
+        {"daily_usd": 2, "reason": 123},
     ):
         assert api.put(
             "/admin/users/alice/limits", json=payload, headers=ADMIN
@@ -852,3 +853,865 @@ def test_admin_jwt_group_is_supported(client, monkeypatch):
         "/admin/summary",
         headers={"Authorization": f"Bearer {rejected}"},
     ).status_code == 403
+
+
+def test_duplicate_admin_create_preserves_existing_user(client):
+    api, store, _ = client
+    store.put_user("alice", "Original", 7, 700, 70)
+    store.set_user_status("alice", "blocked", "auto: existing state")
+    before = store.get_user("alice")
+
+    response = api.post(
+        "/admin/users",
+        json={
+            "user_id": "alice",
+            "name": "Replacement",
+            "daily_usd": 1,
+            "daily_input_tokens": 1,
+            "daily_output_tokens": 1,
+        },
+        headers={**ADMIN, "Idempotency-Key": "duplicate-create"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["type"] == "user_already_exists"
+    assert store.get_user("alice") == before
+
+
+def test_legacy_user_reads_as_version_zero_and_upgrades_on_first_mutation(client):
+    api, store, _ = client
+    store._users.put_item(  # noqa: SLF001 - seed an authentic legacy row
+        Item={
+            "user_id": "legacy",
+            "name": "Legacy",
+            "status": "active",
+            "status_reason": "",
+            "daily_usd_micro": MICRO,
+            "daily_input_tokens": 100,
+            "daily_output_tokens": 50,
+        }
+    )
+
+    detail = api.get("/admin/users/legacy", headers=ADMIN)
+    assert detail.status_code == 200
+    assert detail.headers["etag"] == '"0"'
+    assert detail.json()["user"]["limits"] == {
+        "daily_usd": 1.0,
+        "daily_input_tokens": 100,
+        "daily_output_tokens": 50,
+    }
+    assert detail.json()["user"]["version"] == 0
+    assert detail.json()["user"]["created_at"] is None
+    assert detail.json()["user"]["updated_at"] is None
+    assert detail.json()["user"]["status_origin"] == "legacy"
+
+    updated = api.put(
+        "/admin/users/legacy/limits",
+        json={"daily_usd": 2},
+        headers={**ADMIN, "Idempotency-Key": "legacy-upgrade"},
+    )
+    assert updated.status_code == 200
+    assert updated.headers["etag"] == '"1"'
+    assert updated.json()["user"]["version"] == 1
+    assert updated.json()["user"]["created_at"] is None
+    assert updated.json()["user"]["updated_at"]
+    assert updated.json()["user"]["status_origin"] == "legacy"
+
+
+def test_admin_mutations_enforce_version_and_durable_idempotency(client):
+    api, store, _ = client
+    created = api.post(
+        "/admin/users",
+        json={"user_id": "alice", "daily_usd": 1},
+        headers={**ADMIN, "Idempotency-Key": "create-alice"},
+    )
+    assert created.status_code == 200
+    assert created.headers["etag"] == '"1"'
+    create_replay = api.post(
+        "/admin/users",
+        json={"user_id": "alice", "daily_usd": 1},
+        headers={**ADMIN, "Idempotency-Key": "create-alice"},
+    )
+    assert create_replay.status_code == 200
+    assert create_replay.json() == created.json()
+    create_mismatch = api.post(
+        "/admin/users",
+        json={"user_id": "alice", "daily_usd": 9},
+        headers={**ADMIN, "Idempotency-Key": "create-alice"},
+    )
+    assert create_mismatch.status_code == 409
+    assert create_mismatch.json()["error"]["type"] == (
+        "idempotency_conflict"
+    )
+
+    request_headers = {
+        **ADMIN,
+        "If-Match": '"1"',
+        "Idempotency-Key": "limits-alice",
+    }
+    first = api.put(
+        "/admin/users/alice/limits",
+        json={"daily_usd": 2, "reason": "  Quarterly increase  "},
+        headers=request_headers,
+    )
+    replay = api.put(
+        "/admin/users/alice/limits",
+        json={"daily_usd": 2, "reason": "Quarterly increase"},
+        headers=request_headers,
+    )
+    assert first.status_code == replay.status_code == 200
+    assert replay.json() == first.json()
+    assert replay.headers["etag"] == first.headers["etag"] == '"2"'
+    assert store.get_user("alice").version == 2
+    events, _ = store.list_admin_audit_page(
+        user_id="alice", limit=10
+    )
+    assert events[0]["reason"] == "Quarterly increase"
+
+    mismatch = api.put(
+        "/admin/users/alice/limits",
+        json={"daily_usd": 2, "reason": "Different justification"},
+        headers=request_headers,
+    )
+    assert mismatch.status_code == 409
+    assert mismatch.json()["error"]["type"] == "idempotency_conflict"
+
+    stale = api.put(
+        "/admin/users/alice/limits",
+        json={"daily_usd": 4},
+        headers={
+            **ADMIN,
+            "If-Match": '"1"',
+            "Idempotency-Key": "stale-limits",
+        },
+    )
+    assert stale.status_code == 409
+    assert stale.headers["etag"] == '"2"'
+    assert stale.json()["error"]["type"] == "version_conflict"
+    assert stale.json()["error"]["details"]["current_user"]["version"] == 2
+    assert store.get_user("alice").daily_usd_micro == 2 * MICRO
+
+
+@pytest.mark.parametrize(
+    "reason_payload",
+    ({}, {"reason": "   "}),
+    ids=("omitted", "blank"),
+)
+def test_limit_reason_is_optional_and_uses_legacy_audit_fallback(
+    client, reason_payload
+):
+    api, store, _ = client
+    store.put_user("legacy", "Legacy", 1, 100, 50)
+
+    response = api.put(
+        "/admin/users/legacy/limits",
+        json={"daily_output_tokens": 75, **reason_payload},
+        headers={
+            **ADMIN,
+            "If-Match": '"1"',
+            "Idempotency-Key": (
+                f"legacy-limit-reason-{len(reason_payload)}"
+            ),
+        },
+    )
+
+    assert response.status_code == 200
+    assert set(response.json()) == {"user_id", "updated", "limits", "user"}
+    events, _ = store.list_admin_audit_page(
+        user_id="legacy", limit=10
+    )
+    assert events[0]["reason"] == (
+        "legacy: reason omitted by compatible admin client"
+    )
+
+
+def test_status_transaction_updates_user_revocation_audit_and_rolls_back_conflict(
+    client,
+):
+    api, store, _ = client
+    created = api.post(
+        "/admin/users",
+        json={"user_id": "alice"},
+        headers={**ADMIN, "Idempotency-Key": "status-create"},
+    )
+    assert created.status_code == 200
+
+    blocked = api.put(
+        "/admin/users/alice/status",
+        json={"status": "blocked", "reason": "operator request"},
+        headers={
+            **ADMIN,
+            "If-Match": '"1"',
+            "Idempotency-Key": "status-block",
+        },
+    )
+    assert blocked.status_code == 200
+    assert blocked.json()["user"]["version"] == 2
+    assert blocked.json()["user"]["status_origin"] == "admin"
+    revocation = store._users.get_item(  # noqa: SLF001
+        Key={"user_id": "REVOCATION#alice"}
+    )["Item"]
+    assert revocation["desired_status"] == "blocked"
+    events, _ = store.list_admin_audit_page(
+        user_id="alice", limit=10
+    )
+    assert [event["event_type"] for event in events] == [
+        "user.status.updated",
+        "user.created",
+    ]
+
+    before_revocation = dict(revocation)
+    before_events = list(events)
+    stale = api.put(
+        "/admin/users/alice/status",
+        json={"status": "active", "reason": "stale request"},
+        headers={
+            **ADMIN,
+            "If-Match": '"1"',
+            "Idempotency-Key": "status-stale",
+        },
+    )
+    assert stale.status_code == 409
+    assert store._users.get_item(  # noqa: SLF001
+        Key={"user_id": "REVOCATION#alice"}
+    )["Item"] == before_revocation
+    assert store.list_admin_audit_page(
+        user_id="alice", limit=10
+    )[0] == before_events
+
+
+@pytest.mark.parametrize(
+    "reason_payload",
+    ({}, {"reason": "   "}),
+    ids=("omitted", "blank"),
+)
+def test_status_reason_fallback_is_normalized_before_store_and_audit(
+    client, reason_payload
+):
+    api, store, _ = client
+    store.put_user("legacy", "Legacy", 1, 100, 50)
+
+    response = api.put(
+        "/admin/user/status",
+        params={"user_id": "legacy"},
+        json={"status": "blocked", **reason_payload},
+        headers={
+            **ADMIN,
+            "If-Match": '"1"',
+            "Idempotency-Key": (
+                f"legacy-status-reason-{len(reason_payload)}"
+            ),
+        },
+    )
+
+    fallback = "legacy: reason omitted by compatible admin client"
+    assert response.status_code == 200
+    assert response.json()["reason"] == fallback
+    assert response.json()["user"]["status_reason"] == fallback
+    assert store.get_user("legacy").status_reason == fallback
+    events, _ = store.list_admin_audit_page(user_id="legacy", limit=10)
+    assert events[0]["reason"] == fallback
+
+
+def test_status_reason_hash_is_canonical_for_trimmed_and_fallback_replays(
+    client,
+):
+    api, store, _ = client
+    for user_id in ("trimmed", "fallback"):
+        store.put_user(user_id, user_id.title(), 1, 100, 50)
+
+    trimmed_headers = {
+        **ADMIN,
+        "If-Match": '"1"',
+        "Idempotency-Key": "status-trimmed-replay",
+    }
+    padded = api.put(
+        "/admin/user/status",
+        params={"user_id": "trimmed"},
+        json={"status": "blocked", "reason": "  Policy review  "},
+        headers=trimmed_headers,
+    )
+    trimmed = api.put(
+        "/admin/user/status",
+        params={"user_id": "trimmed"},
+        json={"status": "blocked", "reason": "Policy review"},
+        headers=trimmed_headers,
+    )
+
+    assert padded.status_code == trimmed.status_code == 200
+    assert padded.json() == trimmed.json()
+    assert padded.json()["reason"] == "Policy review"
+    assert padded.headers["etag"] == trimmed.headers["etag"] == '"2"'
+    assert store.get_user("trimmed").version == 2
+    trimmed_events, _ = store.list_admin_audit_page(
+        user_id="trimmed", limit=10
+    )
+    assert [event["event_type"] for event in trimmed_events] == [
+        "user.status.updated"
+    ]
+    assert trimmed_events[0]["reason"] == "Policy review"
+
+    fallback_headers = {
+        **ADMIN,
+        "If-Match": '"1"',
+        "Idempotency-Key": "status-fallback-replay",
+    }
+    omitted = api.put(
+        "/admin/user/status",
+        params={"user_id": "fallback"},
+        json={"status": "blocked"},
+        headers=fallback_headers,
+    )
+    blank = api.put(
+        "/admin/user/status",
+        params={"user_id": "fallback"},
+        json={"status": "blocked", "reason": "  "},
+        headers=fallback_headers,
+    )
+
+    assert omitted.status_code == blank.status_code == 200
+    assert omitted.json() == blank.json()
+    assert store.get_user("fallback").version == 2
+    fallback_events, _ = store.list_admin_audit_page(
+        user_id="fallback", limit=10
+    )
+    assert [event["event_type"] for event in fallback_events] == [
+        "user.status.updated"
+    ]
+
+
+def test_canonical_admin_routes_disambiguate_path_like_identities(client):
+    api, store, _ = client
+    user_ids = ("team", "team/audit", "team/usage", "team/usage-history")
+    today = datetime.now(timezone.utc).date().isoformat()
+    for index, user_id in enumerate(user_ids, start=1):
+        created = api.post(
+            "/admin/users",
+            json={"user_id": user_id, "name": f"Identity {user_id}"},
+            headers={
+                **ADMIN,
+                "Idempotency-Key": f"canonical-create-{index}",
+            },
+        )
+        assert created.status_code == 200
+        store._usage.put_item(  # noqa: SLF001
+            Item={
+                "user_id": user_id,
+                "window": today,
+                "cost_micro": index * MICRO,
+                "input_tokens": index * 10,
+                "output_tokens": index * 5,
+                "requests": index,
+            }
+        )
+
+    for index, user_id in enumerate(user_ids, start=1):
+        detail = api.get(
+            "/admin/user", params={"user_id": user_id}, headers=ADMIN
+        )
+        assert detail.status_code == 200
+        assert detail.json()["user"]["user_id"] == user_id
+        assert detail.json()["user"]["name"] == f"Identity {user_id}"
+
+        usage = api.get(
+            "/admin/user/usage",
+            params={"user_id": user_id, "window": today},
+            headers=ADMIN,
+        )
+        assert usage.status_code == 200
+        assert usage.json()["user_id"] == user_id
+        assert usage.json()["requests"] == index
+
+        history = api.get(
+            "/admin/user/usage-history",
+            params={"user_id": user_id, "start": today, "end": today},
+            headers=ADMIN,
+        )
+        assert history.status_code == 200
+        assert history.json()["user_id"] == user_id
+        assert history.json()["usage"][0]["user_id"] == user_id
+
+        audit = api.get(
+            "/admin/user/audit",
+            params={"user_id": user_id},
+            headers=ADMIN,
+        )
+        assert audit.status_code == 200
+        assert audit.json()["user_id"] == user_id
+        assert {event["user_id"] for event in audit.json()["events"]} == {
+            user_id
+        }
+
+        limits = api.put(
+            "/admin/user/limits",
+            params={"user_id": user_id},
+            json={"daily_usd": index + 10, "reason": "route regression"},
+            headers={
+                **ADMIN,
+                "If-Match": detail.headers["etag"],
+                "Idempotency-Key": f"canonical-limits-{index}",
+            },
+        )
+        assert limits.status_code == 200
+        assert limits.json()["user_id"] == user_id
+        assert limits.json()["user"]["version"] == 2
+
+        status = api.put(
+            "/admin/user/status",
+            params={"user_id": user_id},
+            json={"status": "blocked", "reason": "route regression"},
+            headers={
+                **ADMIN,
+                "If-Match": limits.headers["etag"],
+                "Idempotency-Key": f"canonical-status-{index}",
+            },
+        )
+        assert status.status_code == 200
+        assert status.json()["user_id"] == user_id
+        assert status.json()["user"]["version"] == 3
+
+    for suffix in ("audit", "usage", "usage-history"):
+        legacy = api.get(f"/admin/users/team/{suffix}", headers=ADMIN)
+        assert legacy.status_code == 200
+        assert legacy.json()["user"]["user_id"] == f"team/{suffix}"
+
+
+def test_canonical_mutation_hash_binds_the_exact_query_identity(client):
+    api, store, _ = client
+    for user_id in ("team", "team/audit"):
+        store.put_user(user_id, user_id, 1, 100, 50)
+    headers = {
+        **ADMIN,
+        "If-Match": '"1"',
+        "Idempotency-Key": "canonical-identity-bound",
+    }
+
+    first = api.put(
+        "/admin/user/limits",
+        params={"user_id": "team"},
+        json={"daily_usd": 2, "reason": "identity binding"},
+        headers=headers,
+    )
+    conflict = api.put(
+        "/admin/user/limits",
+        params={"user_id": "team/audit"},
+        json={"daily_usd": 2, "reason": "identity binding"},
+        headers=headers,
+    )
+
+    assert first.status_code == 200
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["type"] == "idempotency_conflict"
+    assert store.get_user("team/audit").version == 1
+
+
+@pytest.mark.parametrize(
+    ("method", "route"),
+    (
+        ("get", "/admin/user"),
+        ("get", "/admin/user/usage"),
+        ("get", "/admin/user/usage-history"),
+        ("get", "/admin/user/audit"),
+        ("put", "/admin/user/limits"),
+        ("put", "/admin/user/status"),
+    ),
+)
+def test_canonical_user_id_must_be_valid_and_appear_once(
+    client, method, route
+):
+    api, _, _ = client
+
+    missing = api.request(method, route, headers=ADMIN)
+    duplicate = api.request(
+        method,
+        f"{route}?user_id=team&user_id=team%2Faudit",
+        headers=ADMIN,
+    )
+    reserved = api.request(
+        method,
+        route,
+        params={"user_id": "CONFIG#internal"},
+        headers=ADMIN,
+    )
+
+    for response in (missing, duplicate):
+        assert response.status_code == 400
+        assert response.json() == {
+            "error": {
+                "message": "user_id must be provided exactly once.",
+                "type": "invalid_request_error",
+                "code": "invalid_request_error",
+            }
+        }
+    assert reserved.status_code == 400
+    assert reserved.json() == {
+        "error": {
+            "message": "user identity uses a reserved internal prefix",
+            "type": "invalid_request_error",
+            "code": "invalid_request_error",
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    ("method", "route"),
+    (
+        ("get", "/admin/users/CONFIG%23internal"),
+        ("get", "/admin/users/CONFIG%23internal/usage"),
+        ("get", "/admin/users/CONFIG%23internal/usage-history"),
+        ("get", "/admin/users/CONFIG%23internal/audit"),
+        ("put", "/admin/users/CONFIG%23internal/limits"),
+        ("put", "/admin/users/CONFIG%23internal/status"),
+    ),
+)
+def test_legacy_user_routes_share_reserved_identity_validation(
+    client, method, route
+):
+    api, _, _ = client
+
+    response = api.request(method, route, headers=ADMIN)
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": {
+            "message": "user identity uses a reserved internal prefix",
+            "type": "invalid_request_error",
+            "code": "invalid_request_error",
+        }
+    }
+
+
+def test_jwt_admin_audit_actor_uses_subject_with_tenant_quota_identity(
+    client, monkeypatch
+):
+    import app.auth as auth_module
+    from app.config import Settings
+
+    api, store, broker = client
+    monkeypatch.setenv("JWT_USER_CLAIM", "tenant_id")
+    monkeypatch.setenv("ADMIN_JWT_CLAIM", "groups")
+    monkeypatch.setenv("ADMIN_JWT_VALUE", "quota-admins")
+    fresh = Settings()
+    monkeypatch.setattr(gateway, "settings", fresh)
+    monkeypatch.setattr(auth_module, "settings", fresh)
+    token = make_jwt(
+        "human-admin",
+        tenant_id="tenant-acme",
+        groups=["quota-admins"],
+    )
+
+    vended = _vend(api, token)
+    assert vended.status_code == 200
+    assert vended.json()["user_id"] == "tenant-acme"
+    assert broker.users == ["tenant-acme"]
+
+    detail = api.get(
+        "/admin/users/tenant-acme",
+        headers={"X-Quota-User-Token": token},
+    )
+    updated = api.put(
+        "/admin/users/tenant-acme/limits",
+        json={"daily_usd": 2, "reason": "Tenant quota review"},
+        headers={
+            "X-Quota-User-Token": token,
+            "If-Match": detail.headers["etag"],
+            "Idempotency-Key": "tenant-limit-review",
+        },
+    )
+
+    assert updated.status_code == 200
+    events, _ = store.list_admin_audit_page(
+        user_id="tenant-acme", limit=10
+    )
+    assert events[0]["actor"] == "human-admin"
+    assert events[0]["auth_method"] == "jwt"
+
+
+def test_admin_audit_attributes_verified_actor_without_credentials(
+    client, monkeypatch
+):
+    api, store, _ = client
+    _enable_admin_jwt(monkeypatch)
+    token = make_jwt("admin-subject", groups=["quota-admins"])
+    response = api.post(
+        "/admin/users",
+        json={"user_id": "jwt-user"},
+        headers={
+            "X-Quota-User-Token": token,
+            "Idempotency-Key": "jwt-create",
+        },
+    )
+    assert response.status_code == 200
+    events = api.get(
+        "/admin/users/jwt-user/audit",
+        headers={"X-Quota-User-Token": token},
+    ).json()["events"]
+    assert events[0]["actor"] == "admin-subject"
+    assert events[0]["auth_method"] == "jwt"
+
+    raw_audit = json.dumps(
+        list(store._admin_audit.items.values()),  # noqa: SLF001
+        default=str,
+    )
+    assert token not in raw_audit
+    assert "admin-secret" not in raw_audit
+
+    shared = api.post(
+        "/admin/users",
+        json={"user_id": "shared-user"},
+        headers={**ADMIN, "Idempotency-Key": "shared-create"},
+    )
+    assert shared.status_code == 200
+    shared_events = api.get(
+        "/admin/users/shared-user/audit", headers=ADMIN
+    ).json()["events"]
+    assert shared_events[0]["actor"] == "admin-shared-key"
+    assert shared_events[0]["auth_method"] == "shared-key"
+
+
+def test_detail_usage_history_audit_pagination_and_user_filters(client):
+    api, store, _ = client
+    for user_id, name in (("alice", "Alice Smith"), ("bob", "Bob Jones")):
+        assert api.post(
+            "/admin/users",
+            json={"user_id": user_id, "name": name},
+            headers={**ADMIN, "Idempotency-Key": f"create-{user_id}"},
+        ).status_code == 200
+    assert api.put(
+        "/admin/users/bob/status",
+        json={"status": "blocked", "reason": "test"},
+        headers={
+            **ADMIN,
+            "If-Match": '"1"',
+            "Idempotency-Key": "block-bob",
+        },
+    ).status_code == 200
+
+    today = datetime.now(timezone.utc).date()
+    for offset, requests in ((0, 3), (1, 2), (2, 1)):
+        window = (today - timedelta(days=offset)).isoformat()
+        store._usage.put_item(  # noqa: SLF001
+            Item={
+                "user_id": "alice",
+                "window": window,
+                "cost_micro": requests * MICRO,
+                "input_tokens": requests * 10,
+                "output_tokens": requests * 5,
+                "requests": requests,
+            }
+        )
+
+    detail = api.get("/admin/users/alice", headers=ADMIN)
+    assert detail.status_code == 200
+    assert detail.headers["etag"] == '"1"'
+    assert detail.json()["user"]["name"] == "Alice Smith"
+
+    first_history = api.get(
+        "/admin/users/alice/usage-history?limit=2", headers=ADMIN
+    ).json()
+    assert [row["requests"] for row in first_history["usage"]] == [3, 2]
+    assert first_history["next_cursor"]
+    second_history = api.get(
+        "/admin/users/alice/usage-history",
+        params={"limit": 2, "cursor": first_history["next_cursor"]},
+        headers=ADMIN,
+    ).json()
+    assert [row["requests"] for row in second_history["usage"]] == [1]
+
+    oldest_invalid = (today - timedelta(days=366)).isoformat()
+    invalid = api.get(
+        "/admin/users/alice/usage-history",
+        params={"start": oldest_invalid},
+        headers=ADMIN,
+    )
+    assert invalid.status_code == 400
+    assert invalid.json()["error"]["type"] == "usage_range_outside_retention"
+
+    first_audit = api.get(
+        "/admin/audit", params={"user_id": "bob", "limit": 1}, headers=ADMIN
+    ).json()
+    assert first_audit["events"][0]["event_type"] == "user.status.updated"
+    assert first_audit["next_cursor"]
+    second_audit = api.get(
+        "/admin/audit",
+        params={
+            "user_id": "bob",
+            "limit": 1,
+            "cursor": first_audit["next_cursor"],
+        },
+        headers=ADMIN,
+    ).json()
+    assert second_audit["events"][0]["event_type"] == "user.created"
+
+    blocked = api.get(
+        "/admin/users", params={"status": "blocked"}, headers=ADMIN
+    ).json()["users"]
+    assert [user["user_id"] for user in blocked] == ["bob"]
+    searched = api.get(
+        "/admin/users", params={"query": "smith"}, headers=ADMIN
+    ).json()["users"]
+    assert [user["user_id"] for user in searched] == ["alice"]
+
+
+def test_user_listing_skips_sentinel_rows_without_returning_an_empty_page(client):
+    api, store, _ = client
+    store._users.put_item(  # noqa: SLF001
+        Item={"user_id": "CONFIG#FIRST", "state": "internal"}
+    )
+    store.put_user("z-user", "Zed", 1, 10, 10)
+
+    page = api.get("/admin/users?limit=1", headers=ADMIN).json()
+
+    assert [user["user_id"] for user in page["users"]] == ["z-user"]
+
+
+def test_admin_principal_is_derived_from_one_verified_jwt(client, monkeypatch):
+    api, store, _ = client
+    monkeypatch.setattr(
+        gateway,
+        "settings",
+        replace(
+            gateway.settings,
+            admin_jwt_claim="groups",
+            admin_jwt_value="quota-admins",
+        ),
+    )
+
+    class CountingVerifier:
+        def __init__(self):
+            self.calls = 0
+
+        def verify(self, token):
+            self.calls += 1
+            assert token == "verified-admin-token"
+            return gateway.Identity(
+                user_id="verified-admin",
+                claims={"groups": ["quota-admins"]},
+            )
+
+    counting = CountingVerifier()
+    monkeypatch.setattr(gateway, "_verifier", counting)
+
+    response = api.post(
+        "/admin/users",
+        json={"user_id": "single-verification"},
+        headers={
+            "X-Quota-User-Token": "verified-admin-token",
+            "Idempotency-Key": "single-verification",
+        },
+    )
+
+    assert response.status_code == 200
+    assert counting.calls == 1
+    events, _ = store.list_admin_audit_page(
+        user_id="single-verification", limit=10
+    )
+    assert events[0]["actor"] == "verified-admin"
+
+
+def test_path_like_detail_identity_wins_over_subresource_suffix(client):
+    api, _, _ = client
+    for suffix in ("audit", "usage", "usage-history"):
+        user_id = f"team/{suffix}"
+        assert api.post(
+            "/admin/users",
+            json={"user_id": user_id, "name": f"Identity {suffix}"},
+            headers={
+                **ADMIN,
+                "Idempotency-Key": f"create-suffix-{suffix}",
+            },
+        ).status_code == 200
+
+        detail = api.get(f"/admin/users/{user_id}", headers=ADMIN)
+
+        assert detail.status_code == 200
+        assert detail.json()["user"]["user_id"] == user_id
+        assert detail.json()["user"]["name"] == f"Identity {suffix}"
+
+
+def test_cursors_are_schema_checked_and_bound_to_the_original_query(client):
+    api, store, _ = client
+    for user_id in ("alice", "bob"):
+        assert api.post(
+            "/admin/users",
+            json={"user_id": user_id},
+            headers={**ADMIN, "Idempotency-Key": f"cursor-{user_id}"},
+        ).status_code == 200
+    first_page = api.get("/admin/users?limit=1", headers=ADMIN).json()
+    cursor = first_page["next_cursor"]
+    assert cursor
+
+    malformed = api.get(
+        "/admin/users",
+        params={"cursor": json.dumps({"user_id": "alice"})},
+        headers=ADMIN,
+    )
+    rebound = api.get(
+        "/admin/users",
+        params={"cursor": cursor, "status": "blocked"},
+        headers=ADMIN,
+    )
+    assert malformed.status_code == 400
+    assert rebound.status_code == 400
+
+    today = datetime.now(timezone.utc).date()
+    for user_id in ("alice", "bob"):
+        for offset in (0, 1):
+            store._usage.put_item(  # noqa: SLF001
+                Item={
+                    "user_id": user_id,
+                    "window": (today - timedelta(days=offset)).isoformat(),
+                    "requests": 1,
+                }
+            )
+    history = api.get(
+        "/admin/users/alice/usage-history?limit=1", headers=ADMIN
+    ).json()
+    reused = api.get(
+        "/admin/users/bob/usage-history",
+        params={"limit": 1, "cursor": history["next_cursor"]},
+        headers=ADMIN,
+    )
+    assert reused.status_code == 400
+
+
+def test_non_conditional_transaction_cancellation_is_retryable_not_version_conflict(
+    client, monkeypatch
+):
+    api, store, _ = client
+    store.put_user("alice", "Alice", 1, 100, 50)
+
+    class CanceledClient:
+        def transact_write_items(self, **kwargs):
+            raise ClientError(
+                {
+                    "Error": {
+                        "Code": "TransactionCanceledException",
+                        "Message": "transaction conflict",
+                    },
+                    "CancellationReasons": [
+                        {"Code": "TransactionConflict"},
+                        {"Code": "None"},
+                        {"Code": "None"},
+                    ],
+                },
+                "TransactWriteItems",
+            )
+
+    monkeypatch.setattr(store, "_client", CanceledClient())
+
+    response = api.put(
+        "/admin/users/alice/limits",
+        json={"daily_usd": 2},
+        headers={
+            **ADMIN,
+            "If-Match": '"1"',
+            "Idempotency-Key": "service-cancel",
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["type"] == "transaction_unavailable"
+    assert response.headers["retry-after"] == "1"
+    assert store.get_user("alice").version == 1
+    assert store.list_admin_audit_page(user_id="alice", limit=10)[0] == []

@@ -40,7 +40,9 @@ _DEFAULT_PRICES = {
     "openai.gpt-oss-120b-1:0": (0.15, 0.60),
     "openai.gpt-oss-20b": (0.07, 0.30),
     "openai.gpt-oss-20b-1:0": (0.07, 0.30),
-    "anthropic.claude-opus-4-7": (15.00, 75.00),
+    "anthropic.claude-opus-4-7": (5.00, 25.00),
+    "global.anthropic.claude-opus-4-7": (5.00, 25.00),
+    "us.anthropic.claude-opus-4-7": (5.50, 27.50),
 }
 _DEFAULT_FALLBACK_PRICE = (15.00, 75.00)
 
@@ -62,17 +64,20 @@ class InvocationUsage:
 _dynamodb_resource = None
 _dynamodb_client = None
 _sns_client = None
+_ssm_client = None
 
 
 def _resources():
-    global _dynamodb_resource, _dynamodb_client, _sns_client
+    global _dynamodb_resource, _dynamodb_client, _sns_client, _ssm_client
     if _dynamodb_resource is None:
         _dynamodb_resource = boto3.resource("dynamodb")
     if _dynamodb_client is None:
         _dynamodb_client = boto3.client("dynamodb")
     if _sns_client is None:
         _sns_client = boto3.client("sns")
-    return _dynamodb_resource, _dynamodb_client, _sns_client
+    if _ssm_client is None:
+        _ssm_client = boto3.client("ssm")
+    return _dynamodb_resource, _dynamodb_client, _sns_client, _ssm_client
 
 
 def _decode_subscription(event: dict) -> list[dict]:
@@ -174,13 +179,92 @@ def _fallback_price() -> tuple[float, float]:
     )
 
 
-def _cost_micro(
+# Refreshed prices live in an SSM parameter written by the scheduled price
+# resolver. The last good parameter value is kept across failed refreshes,
+# so the deployment-time env snapshot is only used before the first
+# successful read: a Parameter Store outage can never stop metering.
+_PRICE_CACHE_TTL_SECONDS = 900
+_PRICE_RETRY_SECONDS = 60
+_price_cache: dict[str, Any] = {"next_attempt_at": 0.0, "value": None}
+
+
+def _parameter_prices(
+    ssm, now_epoch: float
+) -> tuple[dict[str, tuple[float, float]], tuple[float, float]] | None:
+    parameter_name = os.environ.get("PRICES_PARAMETER_NAME")
+    if not parameter_name or ssm is None:
+        return None
+    cache = _price_cache
+    if now_epoch >= cache["next_attempt_at"]:
+        try:
+            value = json.loads(
+                ssm.get_parameter(Name=parameter_name)["Parameter"]["Value"]
+            )
+            models = {
+                model_id: (
+                    float(price["input_per_mtok"]),
+                    float(price["output_per_mtok"]),
+                )
+                for model_id, price in value["models"].items()
+            }
+            fallback = (
+                float(value["fallback"]["input_per_mtok"]),
+                float(value["fallback"]["output_per_mtok"]),
+            )
+            cache["value"] = (models, fallback)
+            cache["next_attempt_at"] = now_epoch + _PRICE_CACHE_TTL_SECONDS
+        except Exception as exc:  # noqa: BLE001 - availability over freshness
+            cache["next_attempt_at"] = now_epoch + _PRICE_RETRY_SECONDS
+            print(
+                json.dumps(
+                    {
+                        "level": "warning",
+                        "message": (
+                            "Model price parameter unavailable; using the "
+                            "last good value"
+                            if cache["value"] is not None
+                            else "Model price parameter unavailable; using "
+                            "the deployment snapshot"
+                        ),
+                        "parameter": parameter_name,
+                        "error": type(exc).__name__,
+                    }
+                )
+            )
+    return cache["value"]
+
+
+# Cross-Region/geographic inference profiles log profile IDs such as
+# "us.anthropic....". The Pricing API catalogs base model names, so an
+# unmatched profile ID resolves to its base model before the conservative
+# fallback. An explicit profile entry (for example a geographic uplift)
+# always wins over this derivation.
+_PROFILE_PREFIXES = frozenset(
+    {"us", "eu", "apac", "jp", "au", "ca", "sa", "global", "us-gov"}
+)
+
+
+def _price_for(
     prices: dict[str, tuple[float, float]],
+    fallback: tuple[float, float],
     model_id: str,
-    input_tokens: int,
-    output_tokens: int,
+) -> tuple[tuple[float, float], str]:
+    """Return ((input_rate, output_rate), price_source) for one model ID."""
+    exact = prices.get(model_id)
+    if exact is not None:
+        return exact, "snapshot"
+    prefix, separator, base_model = model_id.partition(".")
+    if separator and prefix in _PROFILE_PREFIXES:
+        base = prices.get(base_model)
+        if base is not None:
+            return base, "base-model"
+    return fallback, "fallback"
+
+
+def _tokens_cost_micro(
+    rates: tuple[float, float], input_tokens: int, output_tokens: int
 ) -> int:
-    input_rate, output_rate = prices.get(model_id, _fallback_price())
+    input_rate, output_rate = rates
     usd = (
         input_tokens * input_rate + output_tokens * output_rate
     ) / 1_000_000
@@ -300,7 +384,13 @@ def _limit_ratio(usage: dict, user: dict) -> float:
 
 
 def _evaluate_quota(
-    users_table, usage_table, sns, user_id: str, window: str
+    users_table,
+    usage_table,
+    sns,
+    user_id: str,
+    window: str,
+    *,
+    _attempt: int = 0,
 ) -> str:
     """Block or warn from the just-updated current UTC window."""
     if window != datetime.now(timezone.utc).strftime("%Y-%m-%d"):
@@ -314,25 +404,75 @@ def _evaluate_quota(
     ratio = _limit_ratio(current, user)
     status = str(user.get("status", "active"))
     reason = str(user.get("status_reason", ""))
+    origin = str(user.get("status_origin", "legacy"))
+    automatic_owned = origin == "automatic" or (
+        origin == "legacy" and reason.startswith("auto:")
+    )
 
     if ratio >= 1:
-        if status == "blocked" and not reason.startswith("auto:"):
+        if status == "blocked" and not automatic_owned:
             return "manually-blocked"
         auto_reason = f"auto: quota exhausted in {window}"
         if status != "blocked" or reason != auto_reason:
             changed_at = datetime.now(timezone.utc).isoformat()
-            users_table.update_item(
-                Key={"user_id": user_id},
-                UpdateExpression=(
-                    "SET #s = :s, status_reason = :r, status_changed_at = :t"
-                ),
-                ExpressionAttributeNames={"#s": "status"},
-                ExpressionAttributeValues={
-                    ":s": "blocked",
-                    ":r": auto_reason,
-                    ":t": changed_at,
-                },
+            observed_version = int(user.get("version", 0))
+            values = {
+                ":s": "blocked",
+                ":r": auto_reason,
+                ":t": changed_at,
+                ":origin": "automatic",
+                ":zero": 0,
+                ":one": 1,
+                ":observed_version": observed_version,
+                ":observed_status": status,
+                ":observed_reason": reason,
+            }
+            version_condition = (
+                "(attribute_not_exists(#version) OR "
+                "#version = :observed_version)"
+                if observed_version == 0
+                else "#version = :observed_version"
             )
+            reason_condition = (
+                "(attribute_not_exists(status_reason) OR "
+                "status_reason = :observed_reason)"
+                if reason == ""
+                else "status_reason = :observed_reason"
+            )
+            try:
+                users_table.update_item(
+                    Key={"user_id": user_id},
+                    UpdateExpression=(
+                        "SET #s = :s, status_reason = :r, "
+                        "status_changed_at = :t, updated_at = :t, "
+                        "status_origin = :origin, "
+                        "#version = if_not_exists(#version, :zero) + :one"
+                    ),
+                    ConditionExpression=(
+                        f"{version_condition} AND #s = :observed_status AND "
+                        f"{reason_condition}"
+                    ),
+                    ExpressionAttributeNames={
+                        "#s": "status",
+                        "#version": "version",
+                    },
+                    ExpressionAttributeValues=values,
+                )
+            except ClientError as exc:
+                if exc.response.get("Error", {}).get("Code") != (
+                    "ConditionalCheckFailedException"
+                ):
+                    raise
+                if _attempt < 2:
+                    return _evaluate_quota(
+                        users_table,
+                        usage_table,
+                        sns,
+                        user_id,
+                        window,
+                        _attempt=_attempt + 1,
+                    )
+                return "concurrent-change"
             refreshed_user = users_table.get_item(
                 Key={"user_id": user_id}, ConsistentRead=True
             ).get("Item", {})
@@ -380,7 +520,10 @@ def _evaluate_quota(
 
 
 def _emit_emf(
-    user_id: str, usage: InvocationUsage, cost_micro: int, used_fallback: bool
+    user_id: str,
+    usage: InvocationUsage,
+    cost_micro: int,
+    price_source: str,
 ) -> None:
     processed_at = datetime.now(timezone.utc)
     detection_lag_ms = max(
@@ -403,6 +546,10 @@ def _emit_emf(
                             "Name": "DetectionLagMilliseconds",
                             "Unit": "Milliseconds",
                         },
+                        {
+                            "Name": "FallbackPricedRequests",
+                            "Unit": "Count",
+                        },
                     ],
                 }
             ],
@@ -410,7 +557,7 @@ def _emit_emf(
         "UserId": user_id,
         "Model": usage.model_id,
         "RequestId": usage.request_id,
-        "PriceSource": "fallback" if used_fallback else "snapshot",
+        "PriceSource": price_source,
         "InvocationOccurredAt": usage.occurred_at.isoformat(),
         "ProcessedAt": processed_at.isoformat(),
         "DetectionLagMilliseconds": detection_lag_ms,
@@ -418,6 +565,9 @@ def _emit_emf(
         "InputTokens": usage.input_tokens,
         "OutputTokens": usage.output_tokens,
         "EstimatedCostUSD": round(cost_micro / MICRO, 8),
+        # A non-zero sum means an invocation was priced with the synthetic
+        # conservative rate instead of a resolved model price; alarmable.
+        "FallbackPricedRequests": 1 if price_source == "fallback" else 0,
     }
     print(json.dumps(record))
 
@@ -429,18 +579,27 @@ def handler(
     dynamodb=None,
     dynamodb_client=None,
     sns=None,
+    ssm=None,
 ) -> dict:
-    if dynamodb is None or dynamodb_client is None or sns is None:
-        resource, default_client, sns_client = _resources()
+    needs_ssm = ssm is None and bool(os.environ.get("PRICES_PARAMETER_NAME"))
+    if dynamodb is None or dynamodb_client is None or sns is None or needs_ssm:
+        resource, default_client, sns_client, ssm_client = _resources()
         dynamodb = dynamodb or resource
         dynamodb_client = dynamodb_client or default_client
         sns = sns or sns_client
+        ssm = ssm or ssm_client
     client = dynamodb_client
     users_table = dynamodb.Table(os.environ["USERS_TABLE"])
     usage_table = dynamodb.Table(os.environ["USAGE_TABLE"])
     usage_table_name = os.environ["USAGE_TABLE"]
     expected_role = os.environ["BEDROCK_USER_ROLE_NAME"]
-    prices = _prices()
+    refreshed = _parameter_prices(
+        ssm, datetime.now(timezone.utc).timestamp()
+    )
+    if refreshed is not None:
+        prices, fallback = refreshed
+    else:
+        prices, fallback = _prices(), _fallback_price()
 
     result = {
         "processed": 0,
@@ -462,8 +621,9 @@ def handler(
             unresolved.add(usage.session_name)
             continue
         user_id = str(mapping["maps_to"])
-        cost_micro = _cost_micro(
-            prices, usage.model_id, usage.input_tokens, usage.output_tokens
+        rates, price_source = _price_for(prices, fallback, usage.model_id)
+        cost_micro = _tokens_cost_micro(
+            rates, usage.input_tokens, usage.output_tokens
         )
         if not _apply_usage(
             client, usage_table_name, user_id, usage, cost_micro
@@ -475,7 +635,7 @@ def handler(
             user_id,
             usage,
             cost_micro,
-            used_fallback=usage.model_id not in prices,
+            price_source=price_source,
         )
         _evaluate_quota(
             users_table, usage_table, sns, user_id, usage.window

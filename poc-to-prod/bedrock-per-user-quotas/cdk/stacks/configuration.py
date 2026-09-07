@@ -463,6 +463,21 @@ def _model_pricing(raw: Any, base_dir: Path) -> ModelPricingConfig:
         if model_id in model_ids:
             raise ValueError(f"Duplicate model price mapping for {model_id}")
         model_ids.add(model_id)
+        if not isinstance(price, dict):
+            raise ValueError(
+                f"price_overrides.{model_id} must be an object"
+            )
+        # A hand-pinned price bypasses the Pricing API, so it must document
+        # why the catalog cannot price this model (for example the catalog
+        # has no entry for an inference-profile ID). The reason is deploy
+        # metadata only; the resolved snapshot carries just the two rates.
+        price = dict(price)
+        reason = price.pop("reason", None)
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(
+                f"price_overrides.{model_id} must include a non-empty "
+                "'reason' explaining why the Pricing API cannot price it"
+            )
         price_overrides[model_id] = _price(
             f"price_overrides.{model_id}", price
         )

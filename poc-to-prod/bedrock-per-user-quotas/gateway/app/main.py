@@ -8,10 +8,12 @@ provides administrative quota management.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import secrets
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
@@ -20,6 +22,7 @@ from fastapi.responses import JSONResponse
 
 from . import emf
 from .auth import (
+    AdminPrincipal,
     Identity,
     JwtError,
     JwtVerifier,
@@ -30,12 +33,15 @@ from .broker import BrokerError, CredentialBroker
 from .config import settings
 from .quota import (
     MICRO,
+    IdempotencyConflict,
     LeaseExpired,
     LeaseNotRefreshable,
     LeaseRateLimited,
     LeaseReservation,
     QuotaStore,
+    UserAlreadyExists,
     UserRecord,
+    VersionConflict,
     validate_user_id,
 )
 
@@ -124,16 +130,18 @@ def _error(
     message: str,
     error_type: str,
     headers: dict | None = None,
+    details: dict | None = None,
 ) -> JSONResponse:
+    error = {
+        "message": message,
+        "type": error_type,
+        "code": error_type,
+    }
+    if details is not None:
+        error["details"] = details
     return JSONResponse(
         status_code=status,
-        content={
-            "error": {
-                "message": message,
-                "type": error_type,
-                "code": error_type,
-            }
-        },
+        content={"error": error},
         headers=headers or {},
     )
 
@@ -275,18 +283,42 @@ async def vend_credentials(request: Request) -> Response:
             "quota_blocked",
             headers=_quota_headers(user),
         )
-    if store().is_over_budget(user):
-        store().set_user_status(
+    for _ in range(3):
+        if not user.active or not store().is_over_budget(user):
+            break
+        changed = store().set_user_status(
             user.user_id,
             "blocked",
             "auto: quota exhausted at credential vend",
+            expected_version=user.version,
+            expected_status=user.status,
+            expected_reason=user.status_reason,
         )
-        emf.record_throttle(user.user_id, "-", "over-budget-at-vend")
+        latest = store().get_user(user.user_id)
+        if latest is None:
+            return _error(401, "User is no longer provisioned.", "authentication_error")
+        user = latest
+        if changed:
+            emf.record_throttle(user.user_id, "-", "over-budget-at-vend")
+            return _error(
+                429,
+                "Daily quota exhausted; credentials not issued.",
+                "quota_exceeded",
+                headers=_quota_headers(user),
+            )
+    if not user.active:
         return _error(
-            429,
-            "Daily quota exhausted; credentials not issued.",
-            "quota_exceeded",
+            403,
+            f"User '{user.user_id}' is {user.status}.",
+            "quota_blocked",
             headers=_quota_headers(user),
+        )
+    if store().is_over_budget(user):
+        return _error(
+            503,
+            "Quota state changed concurrently; retry credential vending.",
+            "quota_state_conflict",
+            headers={"Retry-After": "1"},
         )
 
     reservation, lease_error = _reserve_permission_lease(
@@ -381,21 +413,29 @@ async def healthz() -> dict:
     }
 
 
-def _jwt_grants_admin(token: str) -> bool:
+def _jwt_admin_principal(token: str) -> AdminPrincipal | None:
+    """Verify one admin JWT once and derive a safe server-side actor."""
     claim = settings.admin_jwt_claim
     if not claim:
-        return False
+        return None
     try:
         identity = verifier().verify(token)
     except JwtError:
-        return False
+        return None
     value = identity.claims.get(claim)
     required = settings.admin_jwt_value
-    if isinstance(value, str):
-        return value == required
-    if isinstance(value, (list, tuple)):
-        return required in value
-    return False
+    granted = value == required if isinstance(value, str) else (
+        required in value if isinstance(value, (list, tuple)) else False
+    )
+    if not granted:
+        return None
+    subject = identity.claims.get("sub")
+    actor = (
+        subject
+        if isinstance(subject, str) and subject.strip()
+        else identity.user_id
+    )
+    return AdminPrincipal(actor=actor, auth_method="jwt")
 
 
 def _require_admin(request: Request) -> JSONResponse | None:
@@ -405,12 +445,23 @@ def _require_admin(request: Request) -> JSONResponse | None:
         if authorization and authorization.lower().startswith("bearer "):
             provided = extract_bearer(authorization)
     expected = admin_key()
-    if expected and provided and provided == expected:
-        return None
-    token = extract_user_token(request.headers)
-    if token and _jwt_grants_admin(token):
-        return None
-    return _error(403, "Admin authorization required.", "forbidden")
+    principal = None
+    if (
+        expected
+        and provided
+        and secrets.compare_digest(provided, expected)
+    ):
+        principal = AdminPrincipal(
+            actor="admin-shared-key", auth_method="shared-key"
+        )
+    if principal is None:
+        token = extract_user_token(request.headers)
+        if token:
+            principal = _jwt_admin_principal(token)
+    if principal is None:
+        return _error(403, "Admin authorization required.", "forbidden")
+    request.state.admin_principal = principal
+    return None
 
 
 def _require_emergency_admin(
@@ -458,6 +509,114 @@ def _limits_json(user: UserRecord) -> dict:
     }
 
 
+def _user_json(user: UserRecord) -> dict:
+    return {
+        "user_id": user.user_id,
+        "name": user.name,
+        "status": user.status,
+        "status_reason": user.status_reason,
+        "status_origin": user.status_origin,
+        "version": user.version,
+        "created_at": user.created_at,
+        "updated_at": user.updated_at,
+        "limits": _limits_json(user),
+    }
+
+
+def _etag(user: UserRecord) -> str:
+    return f'"{user.version}"'
+
+
+def _idempotency_key(request: Request) -> tuple[str | None, JSONResponse | None]:
+    key = request.headers.get("idempotency-key")
+    if key is None:
+        return str(uuid.uuid4()), None
+    key = key.strip()
+    if not key or len(key) > 256:
+        return None, _error(
+            400,
+            "Idempotency-Key must contain 1 to 256 characters.",
+            "invalid_request_error",
+        )
+    return key, None
+
+
+def _request_hash(
+    request: Request, body: dict, principal: AdminPrincipal
+) -> str:
+    request_shape = {
+        "method": request.method,
+        "path": request.url.path,
+        "body": body,
+        "if_match": request.headers.get("if-match"),
+        "actor": principal.actor,
+        "auth_method": principal.auth_method,
+    }
+    query = sorted(request.query_params.multi_items())
+    if query:
+        request_shape["query"] = query
+    canonical = json.dumps(
+        request_shape,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _expected_version(
+    request: Request, observed: UserRecord
+) -> tuple[int | None, JSONResponse | None]:
+    raw = request.headers.get("if-match")
+    if raw is None:
+        return observed.version, None
+    value = raw.strip()
+    if value.startswith("W/"):
+        value = value[2:].strip()
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        value = value[1:-1]
+    try:
+        version = int(value)
+    except (TypeError, ValueError):
+        version = -1
+    if version < 0:
+        return None, _error(
+            400,
+            "If-Match must contain a non-negative user version.",
+            "invalid_request_error",
+        )
+    return version, None
+
+
+def _mutation_response(
+    payload: dict, user: UserRecord, request_id: str
+) -> JSONResponse:
+    return JSONResponse(
+        {**payload, "user": _user_json(user)},
+        headers={"ETag": _etag(user), "X-Request-Id": request_id},
+    )
+
+
+def _version_conflict(error: VersionConflict) -> JSONResponse:
+    current = error.current_user
+    return _error(
+        409,
+        "The user configuration changed; refresh and retry.",
+        "version_conflict",
+        headers={"ETag": _etag(current)},
+        details={"current_user": _user_json(current)},
+    )
+
+
+def _transaction_unavailable() -> JSONResponse:
+    return _error(
+        503,
+        "The admin mutation could not be committed; retry the request.",
+        "transaction_unavailable",
+        headers={"Retry-After": "1"},
+    )
+
+
 def _parse_limits(
     body: dict, *, with_defaults: bool
 ) -> tuple[dict, str]:
@@ -494,6 +653,7 @@ def _parse_limits(
 async def create_user(request: Request) -> Response:
     if (denied := _require_admin(request)) is not None:
         return denied
+    principal: AdminPrincipal = request.state.admin_principal
     body, error = await _admin_json_object(request)
     if error is not None:
         return error
@@ -518,21 +678,55 @@ async def create_user(request: Request) -> Response:
     limits, limit_error = _parse_limits(body, with_defaults=True)
     if limit_error:
         return _error(400, limit_error, "invalid_request_error")
-    store().put_user(user_id=user_id, name=name.strip(), **limits)
-    user = store().get_user(user_id)
-    assert user is not None
-    return JSONResponse(
+    request_id, key_error = _idempotency_key(request)
+    if key_error is not None:
+        return key_error
+    assert request_id is not None
+    try:
+        result = store().create_admin_user(
+            user_id=user_id,
+            name=name.strip(),
+            **limits,
+            actor=principal.actor,
+            auth_method=principal.auth_method,
+            idempotency_key=request_id,
+            request_hash=_request_hash(request, body, principal),
+        )
+    except IdempotencyConflict:
+        return _error(
+            409,
+            "Idempotency-Key was already used for a different request.",
+            "idempotency_conflict",
+        )
+    except UserAlreadyExists as exc:
+        return _error(
+            409,
+            f"User '{user_id}' already exists.",
+            "user_already_exists",
+            headers={"ETag": _etag(exc.current_user)},
+            details={"current_user": _user_json(exc.current_user)},
+        )
+    except ClientError:
+        return _transaction_unavailable()
+    user = result.user
+    return _mutation_response(
         {
             "user_id": user_id,
             "provisioned": True,
             "limits": _limits_json(user),
-        }
+        },
+        user,
+        request_id,
     )
 
 
 @app.get("/admin/users")
 async def list_users(
-    request: Request, limit: int = 50, cursor: str | None = None
+    request: Request,
+    limit: int = 50,
+    cursor: str | None = None,
+    status: str | None = None,
+    query: str | None = None,
 ) -> Response:
     if (denied := _require_admin(request)) is not None:
         return denied
@@ -540,23 +734,22 @@ async def list_users(
         return _error(
             400, "limit must be between 1 and 1000.", "invalid_request_error"
         )
+    if status is not None and status not in {"active", "blocked"}:
+        return _error(
+            400,
+            "status must be 'active' or 'blocked'.",
+            "invalid_request_error",
+        )
     try:
         users, next_cursor = store().list_users_page(
-            limit=limit, cursor=cursor
+            limit=limit, cursor=cursor, status=status, query=query
         )
     except ValueError:
         return _error(400, "Invalid cursor.", "invalid_request_error")
     return JSONResponse(
         {
             "users": [
-                {
-                    "user_id": user.user_id,
-                    "name": user.name,
-                    "status": user.status,
-                    "status_reason": user.status_reason,
-                    "limits": _limits_json(user),
-                    "today": store().get_window_usage(user.user_id),
-                }
+                {**_user_json(user), "today": store().get_window_usage(user.user_id)}
                 for user in users
             ],
             "next_cursor": next_cursor,
@@ -802,6 +995,33 @@ def _read_operations_cloudwatch(
         }
 
 
+@app.get("/admin/audit")
+async def admin_audit(
+    request: Request,
+    user_id: str | None = None,
+    limit: int = 50,
+    cursor: str | None = None,
+) -> Response:
+    if (denied := _require_admin(request)) is not None:
+        return denied
+    if limit < 1 or limit > 100:
+        return _error(
+            400, "limit must be between 1 and 100.", "invalid_request_error"
+        )
+    if user_id is not None:
+        try:
+            validate_user_id(user_id)
+        except ValueError as exc:
+            return _error(400, str(exc), "invalid_request_error")
+    try:
+        events, next_cursor = store().list_admin_audit_page(
+            user_id=user_id, limit=limit, cursor=cursor
+        )
+    except ValueError:
+        return _error(400, "Invalid cursor.", "invalid_request_error")
+    return JSONResponse({"events": events, "next_cursor": next_cursor})
+
+
 @app.get("/admin/operations")
 async def admin_operations(request: Request) -> Response:
     if (denied := _require_admin(request)) is not None:
@@ -1022,24 +1242,287 @@ async def admin_summary(request: Request) -> Response:
     )
 
 
+def _suffix_detail_collision(
+    user_id: str, suffix: str
+) -> JSONResponse | None:
+    """Prefer an exact configured path-like identity over a subresource.
+
+    Starlette's path converter makes ``team/audit`` match both the detail
+    identity and the ``team`` audit subresource. Existing configured identity
+    wins, preventing the route from returning another user's data.
+    """
+    exact = store().get_user(f"{user_id}/{suffix}")
+    if exact is None:
+        return None
+    return JSONResponse(
+        {"user": _user_json(exact)}, headers={"ETag": _etag(exact)}
+    )
+
+
+def _usage_history_range(
+    start: str | None, end: str | None
+) -> tuple[tuple[str, str] | None, JSONResponse | None]:
+    today = datetime.now(timezone.utc).date()
+    oldest = today - timedelta(days=settings.usage_retention_days)
+
+    def parse(value: str | None, default: date) -> date:
+        return default if value is None else date.fromisoformat(value)
+
+    try:
+        start_date = parse(start, oldest)
+        end_date = parse(end, today)
+    except (TypeError, ValueError):
+        return None, _error(
+            400,
+            "start and end must be ISO dates (YYYY-MM-DD).",
+            "invalid_date_range",
+        )
+    if start_date > end_date:
+        return None, _error(
+            400, "start must not be after end.", "invalid_date_range"
+        )
+    if start_date < oldest or end_date > today:
+        return None, _error(
+            400,
+            "Requested usage range is outside configured retention.",
+            "usage_range_outside_retention",
+            details={
+                "oldest_available_date": oldest.isoformat(),
+                "latest_available_date": today.isoformat(),
+            },
+        )
+    return (start_date.isoformat(), end_date.isoformat()), None
+
+
+LEGACY_ADMIN_REASON = "legacy: reason omitted by compatible admin client"
+
+
+def _user_id_error(user_id: str) -> JSONResponse | None:
+    try:
+        validate_user_id(user_id)
+    except ValueError as exc:
+        return _error(400, str(exc), "invalid_request_error")
+    return None
+
+
+def _canonical_user_id_error(
+    request: Request, user_id: str | None
+) -> JSONResponse | None:
+    values = request.query_params.getlist("user_id")
+    if user_id is None or len(values) != 1 or values[0] != user_id:
+        return _error(
+            400,
+            "user_id must be provided exactly once.",
+            "invalid_request_error",
+        )
+    return _user_id_error(user_id)
+
+
+def _admin_reason(body: dict) -> tuple[str | None, JSONResponse | None]:
+    reason = body.get("reason", LEGACY_ADMIN_REASON)
+    if not isinstance(reason, str):
+        return None, _error(
+            400, "reason must be a string.", "invalid_request_error"
+        )
+    return reason.strip() or LEGACY_ADMIN_REASON, None
+
+
+def _user_usage_history_response(
+    user_id: str,
+    start: str | None,
+    end: str | None,
+    limit: int,
+    cursor: str | None,
+) -> Response:
+    if limit < 1 or limit > 100:
+        return _error(
+            400, "limit must be between 1 and 100.", "invalid_request_error"
+        )
+    user = store().get_user(user_id)
+    if user is None:
+        return _error(404, f"User '{user_id}' was not found.", "not_found")
+    date_range, range_error = _usage_history_range(start, end)
+    if range_error is not None:
+        return range_error
+    assert date_range is not None
+    try:
+        history, next_cursor = store().get_usage_history_page(
+            user_id,
+            start=date_range[0],
+            end=date_range[1],
+            limit=limit,
+            cursor=cursor,
+        )
+    except ValueError:
+        return _error(400, "Invalid cursor.", "invalid_request_error")
+    return JSONResponse(
+        {
+            "user_id": user_id,
+            "start": date_range[0],
+            "end": date_range[1],
+            "usage": history,
+            "next_cursor": next_cursor,
+        }
+    )
+
+
+@app.get("/admin/user/usage-history")
+async def canonical_user_usage_history(
+    request: Request,
+    user_id: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    limit: int = 50,
+    cursor: str | None = None,
+) -> Response:
+    if (denied := _require_admin(request)) is not None:
+        return denied
+    if (invalid := _canonical_user_id_error(request, user_id)) is not None:
+        return invalid
+    assert user_id is not None
+    return _user_usage_history_response(user_id, start, end, limit, cursor)
+
+
+@app.get("/admin/users/{user_id:path}/usage-history")
+async def user_usage_history(
+    user_id: str,
+    request: Request,
+    start: str | None = None,
+    end: str | None = None,
+    limit: int = 50,
+    cursor: str | None = None,
+) -> Response:
+    if (denied := _require_admin(request)) is not None:
+        return denied
+    if (invalid := _user_id_error(user_id)) is not None:
+        return invalid
+    if (
+        collision := _suffix_detail_collision(user_id, "usage-history")
+    ) is not None:
+        return collision
+    return _user_usage_history_response(user_id, start, end, limit, cursor)
+
+
+def _user_admin_audit_response(
+    user_id: str, limit: int, cursor: str | None
+) -> Response:
+    if limit < 1 or limit > 100:
+        return _error(
+            400, "limit must be between 1 and 100.", "invalid_request_error"
+        )
+    if store().get_user(user_id) is None:
+        return _error(404, f"User '{user_id}' was not found.", "not_found")
+    try:
+        events, next_cursor = store().list_admin_audit_page(
+            user_id=user_id, limit=limit, cursor=cursor
+        )
+    except ValueError:
+        return _error(400, "Invalid cursor.", "invalid_request_error")
+    return JSONResponse(
+        {"user_id": user_id, "events": events, "next_cursor": next_cursor}
+    )
+
+
+@app.get("/admin/user/audit")
+async def canonical_user_admin_audit(
+    request: Request,
+    user_id: str | None = None,
+    limit: int = 50,
+    cursor: str | None = None,
+) -> Response:
+    if (denied := _require_admin(request)) is not None:
+        return denied
+    if (invalid := _canonical_user_id_error(request, user_id)) is not None:
+        return invalid
+    assert user_id is not None
+    return _user_admin_audit_response(user_id, limit, cursor)
+
+
+@app.get("/admin/users/{user_id:path}/audit")
+async def user_admin_audit(
+    user_id: str,
+    request: Request,
+    limit: int = 50,
+    cursor: str | None = None,
+) -> Response:
+    if (denied := _require_admin(request)) is not None:
+        return denied
+    if (invalid := _user_id_error(user_id)) is not None:
+        return invalid
+    if (
+        collision := _suffix_detail_collision(user_id, "audit")
+    ) is not None:
+        return collision
+    return _user_admin_audit_response(user_id, limit, cursor)
+
+
+def _user_usage_response(user_id: str, window: str | None) -> Response:
+    return JSONResponse(store().get_window_usage(user_id, window))
+
+
+@app.get("/admin/user/usage")
+async def canonical_user_usage(
+    request: Request, user_id: str | None = None, window: str | None = None
+) -> Response:
+    if (denied := _require_admin(request)) is not None:
+        return denied
+    if (invalid := _canonical_user_id_error(request, user_id)) is not None:
+        return invalid
+    assert user_id is not None
+    return _user_usage_response(user_id, window)
+
+
 @app.get("/admin/users/{user_id:path}/usage")
 async def user_usage(
     user_id: str, request: Request, window: str | None = None
 ) -> Response:
     if (denied := _require_admin(request)) is not None:
         return denied
-    return JSONResponse(store().get_window_usage(user_id, window))
+    if (invalid := _user_id_error(user_id)) is not None:
+        return invalid
+    if (collision := _suffix_detail_collision(user_id, "usage")) is not None:
+        return collision
+    return _user_usage_response(user_id, window)
 
 
-@app.put("/admin/users/{user_id:path}/limits")
-async def set_limits(user_id: str, request: Request) -> Response:
+def _user_detail_response(user_id: str) -> Response:
+    user = store().get_user(user_id)
+    if user is None:
+        return _error(404, f"User '{user_id}' was not found.", "not_found")
+    return JSONResponse(
+        {"user": _user_json(user)}, headers={"ETag": _etag(user)}
+    )
+
+
+@app.get("/admin/user")
+async def canonical_user_detail(
+    request: Request, user_id: str | None = None
+) -> Response:
     if (denied := _require_admin(request)) is not None:
         return denied
+    if (invalid := _canonical_user_id_error(request, user_id)) is not None:
+        return invalid
+    assert user_id is not None
+    return _user_detail_response(user_id)
+
+
+@app.get("/admin/users/{user_id:path}")
+async def get_user_detail(user_id: str, request: Request) -> Response:
+    if (denied := _require_admin(request)) is not None:
+        return denied
+    if (invalid := _user_id_error(user_id)) is not None:
+        return invalid
+    return _user_detail_response(user_id)
+
+
+async def _set_limits_response(user_id: str, request: Request) -> Response:
+    principal: AdminPrincipal = request.state.admin_principal
     body, error = await _admin_json_object(request)
     if error is not None:
         return error
     assert body is not None
-    if store().get_user(user_id) is None:
+    current = store().get_user(user_id)
+    if current is None:
         return _error(404, f"User '{user_id}' was not found.", "not_found")
     limits, limit_error = _parse_limits(body, with_defaults=False)
     if limit_error:
@@ -1050,27 +1533,86 @@ async def set_limits(user_id: str, request: Request) -> Response:
             "At least one daily quota is required.",
             "invalid_request_error",
         )
-    store().set_user_limits(user_id, **limits)
-    user = store().get_user(user_id)
-    assert user is not None
-    return JSONResponse(
+    reason, reason_error = _admin_reason(body)
+    if reason_error is not None:
+        return reason_error
+    assert reason is not None
+    canonical_body = (
+        {**body, "reason": reason} if "reason" in body else body
+    )
+    expected, match_error = _expected_version(request, current)
+    if match_error is not None:
+        return match_error
+    request_id, key_error = _idempotency_key(request)
+    if key_error is not None:
+        return key_error
+    assert expected is not None and request_id is not None
+    try:
+        result = store().update_admin_limits(
+            user_id,
+            limits,
+            reason=reason,
+            expected_version=expected,
+            actor=principal.actor,
+            auth_method=principal.auth_method,
+            idempotency_key=request_id,
+            request_hash=_request_hash(
+                request, canonical_body, principal
+            ),
+        )
+    except IdempotencyConflict:
+        return _error(
+            409,
+            "Idempotency-Key was already used for a different request.",
+            "idempotency_conflict",
+        )
+    except VersionConflict as exc:
+        return _version_conflict(exc)
+    except KeyError:
+        return _error(404, f"User '{user_id}' was not found.", "not_found")
+    except ClientError:
+        return _transaction_unavailable()
+    user = result.user
+    return _mutation_response(
         {
             "user_id": user_id,
             "updated": True,
             "limits": _limits_json(user),
-        }
+        },
+        user,
+        request_id,
     )
 
 
-@app.put("/admin/users/{user_id:path}/status")
-async def set_status(user_id: str, request: Request) -> Response:
+@app.put("/admin/user/limits")
+async def canonical_set_limits(
+    request: Request, user_id: str | None = None
+) -> Response:
     if (denied := _require_admin(request)) is not None:
         return denied
+    if (invalid := _canonical_user_id_error(request, user_id)) is not None:
+        return invalid
+    assert user_id is not None
+    return await _set_limits_response(user_id, request)
+
+
+@app.put("/admin/users/{user_id:path}/limits")
+async def set_limits(user_id: str, request: Request) -> Response:
+    if (denied := _require_admin(request)) is not None:
+        return denied
+    if (invalid := _user_id_error(user_id)) is not None:
+        return invalid
+    return await _set_limits_response(user_id, request)
+
+
+async def _set_status_response(user_id: str, request: Request) -> Response:
+    principal: AdminPrincipal = request.state.admin_principal
     body, error = await _admin_json_object(request)
     if error is not None:
         return error
     assert body is not None
-    if store().get_user(user_id) is None:
+    current = store().get_user(user_id)
+    if current is None:
         return _error(404, f"User '{user_id}' was not found.", "not_found")
     status = body.get("status")
     if status not in {"active", "blocked"}:
@@ -1079,12 +1621,65 @@ async def set_status(user_id: str, request: Request) -> Response:
             "status must be 'active' or 'blocked'.",
             "invalid_request_error",
         )
-    reason = body.get("reason", "admin API")
-    if not isinstance(reason, str):
-        return _error(
-            400, "reason must be a string.", "invalid_request_error"
+    reason, reason_error = _admin_reason(body)
+    if reason_error is not None:
+        return reason_error
+    assert reason is not None
+    canonical_body = {**body, "reason": reason}
+    expected, match_error = _expected_version(request, current)
+    if match_error is not None:
+        return match_error
+    request_id, key_error = _idempotency_key(request)
+    if key_error is not None:
+        return key_error
+    assert expected is not None and request_id is not None
+    try:
+        result = store().update_admin_status(
+            user_id,
+            status,
+            reason,
+            expected_version=expected,
+            actor=principal.actor,
+            auth_method=principal.auth_method,
+            idempotency_key=request_id,
+            request_hash=_request_hash(request, canonical_body, principal),
         )
-    store().set_user_status(user_id, status, reason)
-    return JSONResponse(
-        {"user_id": user_id, "status": status, "reason": reason}
+    except IdempotencyConflict:
+        return _error(
+            409,
+            "Idempotency-Key was already used for a different request.",
+            "idempotency_conflict",
+        )
+    except VersionConflict as exc:
+        return _version_conflict(exc)
+    except KeyError:
+        return _error(404, f"User '{user_id}' was not found.", "not_found")
+    except ClientError:
+        return _transaction_unavailable()
+    user = result.user
+    return _mutation_response(
+        {"user_id": user_id, "status": status, "reason": reason},
+        user,
+        request_id,
     )
+
+
+@app.put("/admin/user/status")
+async def canonical_set_status(
+    request: Request, user_id: str | None = None
+) -> Response:
+    if (denied := _require_admin(request)) is not None:
+        return denied
+    if (invalid := _canonical_user_id_error(request, user_id)) is not None:
+        return invalid
+    assert user_id is not None
+    return await _set_status_response(user_id, request)
+
+
+@app.put("/admin/users/{user_id:path}/status")
+async def set_status(user_id: str, request: Request) -> Response:
+    if (denied := _require_admin(request)) is not None:
+        return denied
+    if (invalid := _user_id_error(user_id)) is not None:
+        return invalid
+    return await _set_status_response(user_id, request)

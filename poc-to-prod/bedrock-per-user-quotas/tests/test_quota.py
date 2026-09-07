@@ -272,3 +272,138 @@ def test_user_pagination_excludes_session_rows(fake_dynamodb):
         if not cursor:
             break
     assert seen == {"u0", "u1", "u2"}
+
+
+def test_concurrent_admin_create_wins_over_auto_provision(fake_dynamodb):
+    store = QuotaStore(dynamodb=fake_dynamodb)
+    table = fake_dynamodb.Table("users-test")
+    original_put = table.put_item
+    raced = False
+
+    def put_with_admin_winner(**kwargs):
+        nonlocal raced
+        item = kwargs["Item"]
+        if item.get("user_id") == "race" and not raced:
+            raced = True
+            original_put(
+                Item={
+                    "user_id": "race",
+                    "name": "Admin Winner",
+                    "status": "blocked",
+                    "status_reason": "created concurrently",
+                    "daily_usd_micro": 9 * MICRO,
+                    "daily_input_tokens": 900,
+                    "daily_output_tokens": 90,
+                    "version": 1,
+                    "created_at": "2030-01-01T00:00:00+00:00",
+                    "updated_at": "2030-01-01T00:00:00+00:00",
+                    "status_origin": "admin",
+                }
+            )
+        return original_put(**kwargs)
+
+    table.put_item = put_with_admin_winner
+
+    winner = store.get_or_provision_user("race", name="Auto Default")
+
+    assert winner.name == "Admin Winner"
+    assert winner.status == "blocked"
+    assert winner.daily_usd_micro == 9 * MICRO
+    assert winner.status_origin == "admin"
+
+
+def test_automatic_status_upgrades_legacy_version_but_bookkeeping_does_not(
+    fake_dynamodb,
+):
+    store = QuotaStore(dynamodb=fake_dynamodb)
+    store._users.put_item(  # noqa: SLF001
+        Item={
+            "user_id": "legacy",
+            "name": "Legacy",
+            "status": "active",
+            "daily_usd_micro": MICRO,
+            "daily_input_tokens": 100,
+            "daily_output_tokens": 50,
+        }
+    )
+
+    store.record_session("legacy-session", "legacy")
+    assert store.get_user("legacy").version == 0
+
+    store.set_user_status("legacy", "blocked", "auto: quota exhausted")
+    updated = store.get_user("legacy")
+    assert updated.version == 1
+    assert updated.status_origin == "automatic"
+    assert updated.updated_at
+
+    store.record_session("legacy-session-2", "legacy")
+    assert store.get_user("legacy").version == 1
+
+
+def test_stale_automatic_refresh_cannot_override_newer_admin_status(
+    fake_dynamodb,
+):
+    store = QuotaStore(dynamodb=fake_dynamodb)
+    store.put_user("alice", "Alice", 1, 100, 50)
+    store.set_user_status("alice", "blocked", "auto: old automatic block")
+    stale_automatic = store.get_user("alice")
+    assert stale_automatic.status_origin == "automatic"
+
+    store.update_admin_status(
+        "alice",
+        "blocked",
+        "auto: operator-authored reason",
+        expected_version=stale_automatic.version,
+        actor="admin-shared-key",
+        auth_method="shared-key",
+        idempotency_key="manual-wins",
+        request_hash="manual-wins-hash",
+    )
+
+    refreshed = store.refresh_auto_status(stale_automatic)
+
+    assert not refreshed.active
+    assert refreshed.status_origin == "admin"
+    assert refreshed.status_reason == "auto: operator-authored reason"
+    assert refreshed.version == stale_automatic.version + 1
+
+
+class _WireShortCircuit(Exception):
+    """Raised by the before-send hook after capturing the signed request."""
+
+
+def test_transaction_client_sends_typed_values_unmodified(monkeypatch):
+    """Transactions must go through a genuine low-level DynamoDB client.
+
+    A boto3 *resource* meta client carries the document-interface transform,
+    which re-serializes TypeSerializer output into nested maps ({"S": ...}
+    becomes {"M": {"S": {"S": ...}}}). DynamoDB then rejects the item key
+    with a schema ValidationError and every admin write surfaces as a 503.
+    The in-memory fake models a low-level client, so only a wire-shape
+    assertion against the real boto3 client can catch this regression.
+    """
+    import json as jsonlib
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "testing")
+
+    store = QuotaStore()  # real boto3 resource + transaction client
+    captured: dict = {}
+
+    def capture(request, **_kwargs):
+        captured["body"] = request.body
+        raise _WireShortCircuit()
+
+    store._client.meta.events.register_first(  # noqa: SLF001
+        "before-send.dynamodb.TransactWriteItems", capture
+    )
+    typed_item = store._serialize({"user_id": "alice", "version": 1})  # noqa: SLF001
+    with pytest.raises(_WireShortCircuit):
+        store._client.transact_write_items(  # noqa: SLF001
+            TransactItems=[{"Put": {"TableName": "probe", "Item": typed_item}}]
+        )
+
+    sent = jsonlib.loads(captured["body"])["TransactItems"][0]["Put"]["Item"]
+    assert sent["user_id"] == {"S": "alice"}
+    assert sent["version"] == {"N": "1"}

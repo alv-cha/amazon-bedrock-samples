@@ -10,7 +10,8 @@ travel in dedicated headers:
 import argparse
 import json
 import os
-from urllib.parse import quote
+import sys
+import uuid
 
 import boto3
 import httpx
@@ -68,7 +69,11 @@ def signed_request(method: str, url: str, *, region: str | None = None,
                    http_client: httpx.Client | None = None,
                    timeout=None,
                    **kwargs) -> httpx.Response:
-    """Send one SigV4-signed gateway request with optional app credentials."""
+    """Send one SigV4-signed gateway request with optional app credentials.
+
+    Pass query values through ``params`` without pre-encoding them. HTTPX
+    builds the final URL once, and that exact URL is then signed and sent.
+    """
     headers = dict(kwargs.pop("headers", {}) or {})
     if user_token:
         headers["X-Quota-User-Token"] = user_token
@@ -101,17 +106,26 @@ def signed_request(method: str, url: str, *, region: str | None = None,
         return send(client)
 
 
-def _admin_request_args(args) -> tuple[str, str, dict]:
+def _admin_request_args(
+    args,
+    *,
+    idempotency_key: str | None = None,
+    if_match: str | None = None,
+) -> tuple[str, str, dict]:
+    """Build one routine or emergency request without performing I/O."""
     base = args.gateway_url.rstrip("/")
     if args.command == "create-user":
         return "POST", f"{base}/admin/users", {
+            "headers": {
+                "Idempotency-Key": idempotency_key or str(uuid.uuid4())
+            },
             "json": {
                 "user_id": args.user_id,
                 "name": args.name or args.user_id,
                 "daily_usd": args.daily_usd,
                 "daily_input_tokens": args.daily_input_tokens,
                 "daily_output_tokens": args.daily_output_tokens,
-            }
+            },
         }
     if args.command == "list-users":
         return "GET", f"{base}/admin/users", {}
@@ -129,7 +143,6 @@ def _admin_request_args(args) -> tuple[str, str, dict]:
             }
         }
 
-    user_id = quote(args.user_id, safe="")
     if args.command == "update-user":
         limits = {
             name: getattr(args, name)
@@ -144,16 +157,115 @@ def _admin_request_args(args) -> tuple[str, str, dict]:
             raise ValueError(
                 "update-user requires at least one daily quota option"
             )
-        return "PUT", f"{base}/admin/users/{user_id}/limits", {"json": limits}
+        if args.reason is not None:
+            limits["reason"] = args.reason
+        if if_match is None:
+            raise ValueError("update-user requires the current user version")
+        return "PUT", f"{base}/admin/user/limits", {
+            "params": {"user_id": args.user_id},
+            "headers": {
+                "Idempotency-Key": idempotency_key or str(uuid.uuid4()),
+                "If-Match": if_match,
+            },
+            "json": limits,
+        }
     if args.command in {"block-user", "unblock-user"}:
+        if if_match is None:
+            raise ValueError(
+                f"{args.command} requires the current user version"
+            )
         status = "blocked" if args.command == "block-user" else "active"
-        return "PUT", f"{base}/admin/users/{user_id}/status", {
-            "json": {"status": status, "reason": args.reason}
+        return "PUT", f"{base}/admin/user/status", {
+            "params": {"user_id": args.user_id},
+            "headers": {
+                "Idempotency-Key": idempotency_key or str(uuid.uuid4()),
+                "If-Match": if_match,
+            },
+            "json": {"status": status, "reason": args.reason},
         }
     if args.command == "get-usage":
-        params = {"window": args.window} if args.window else {}
-        return "GET", f"{base}/admin/users/{user_id}/usage", {"params": params}
+        params = {"user_id": args.user_id}
+        if args.window:
+            params["window"] = args.window
+        return "GET", f"{base}/admin/user/usage", {"params": params}
     raise ValueError(f"Unsupported command: {args.command}")
+
+
+def _response_body(response: httpx.Response) -> dict:
+    try:
+        body = response.json()
+    except ValueError:
+        return {"status_code": response.status_code, "body": response.text}
+    return body if isinstance(body, dict) else {"response": body}
+
+
+def _emit_response(response: httpx.Response) -> None:
+    body = _response_body(response)
+    print(json.dumps(body, indent=2, sort_keys=True))
+    if response.status_code == 409:
+        error = body.get("error", {})
+        code = error.get("code") if isinstance(error, dict) else None
+        guidance = {
+            "user_already_exists": (
+                "The user was not changed. Fetch the existing user and review "
+                "it before deciding whether to update it."
+            ),
+            "version_conflict": (
+                "The user changed after the preflight read. Review the current "
+                "user returned in error.details, then retry intentionally."
+            ),
+            "idempotency_conflict": (
+                "The idempotency key was reused for different content. Do not "
+                "treat this request as successful."
+            ),
+        }.get(code, "Review the conflict response before retrying.")
+        print(f"Conflict ({code or 'unknown'}): {guidance}", file=sys.stderr)
+    response.raise_for_status()
+
+
+def _if_match_from_detail(response: httpx.Response) -> str:
+    """Return the server ETag or the exact canonical integer version."""
+    response.raise_for_status()
+    etag = response.headers.get("ETag")
+    if etag:
+        return etag
+    user = _response_body(response).get("user")
+    version = user.get("version") if isinstance(user, dict) else None
+    if isinstance(version, int) and not isinstance(version, bool) and version >= 0:
+        return str(version)
+    raise RuntimeError("User detail response did not include an ETag or version")
+
+
+def _execute_admin_command(args, session, request_fn=signed_request):
+    """Execute one CLI command, preflighting versioned routine mutations."""
+    is_emergency = args.command in {"emergency-stop", "emergency-recover"}
+    if_match = None
+    if args.command in {"update-user", "block-user", "unblock-user"}:
+        detail = request_fn(
+            "GET",
+            f"{args.gateway_url.rstrip('/')}/admin/user",
+            region=args.region,
+            admin_key=args.admin_key,
+            aws_session=session,
+            params={"user_id": args.user_id},
+        )
+        if detail.status_code >= 400:
+            _emit_response(detail)
+        if_match = _if_match_from_detail(detail)
+
+    method, url, request_kwargs = _admin_request_args(
+        args,
+        if_match=if_match,
+    )
+    return request_fn(
+        method,
+        url,
+        region=args.region,
+        admin_key=(None if is_emergency else args.admin_key),
+        emergency_key=(args.emergency_key if is_emergency else None),
+        aws_session=session,
+        **request_kwargs,
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -206,6 +318,7 @@ def _parser() -> argparse.ArgumentParser:
     update.add_argument("--daily-usd", type=float)
     update.add_argument("--daily-input-tokens", type=int)
     update.add_argument("--daily-output-tokens", type=int)
+    update.add_argument("--reason")
 
     block = commands.add_parser("block-user")
     block.add_argument("user_id")
@@ -234,30 +347,15 @@ def main() -> None:
         )
     if not is_emergency and not args.admin_key:
         parser.error("--admin-key or ADMIN_KEY is required")
-    try:
-        method, url, request_kwargs = _admin_request_args(args)
-    except ValueError as exc:
-        parser.error(str(exc))
-
     session = boto3.Session(
         profile_name=args.profile,
         region_name=args.region,
     )
-    response = signed_request(
-        method,
-        url,
-        region=args.region,
-        admin_key=(None if is_emergency else args.admin_key),
-        emergency_key=(args.emergency_key if is_emergency else None),
-        aws_session=session,
-        **request_kwargs,
-    )
     try:
-        body = response.json()
-    except ValueError:
-        body = {"status_code": response.status_code, "body": response.text}
-    print(json.dumps(body, indent=2, sort_keys=True))
-    response.raise_for_status()
+        response = _execute_admin_command(args, session)
+    except ValueError as exc:
+        parser.error(str(exc))
+    _emit_response(response)
 
 
 if __name__ == "__main__":

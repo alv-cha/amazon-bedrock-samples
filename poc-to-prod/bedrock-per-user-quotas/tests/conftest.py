@@ -6,11 +6,14 @@ GSI-style query by attribute equality). Tests run with no network and no
 AWS credentials.
 """
 
+import copy
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from boto3.dynamodb.types import TypeDeserializer
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "gateway"))
@@ -19,6 +22,7 @@ sys.path.insert(0, str(ROOT / "usage_processor"))
 os.environ.setdefault("AWS_REGION", "us-east-1")
 os.environ.setdefault("USERS_TABLE", "users-test")
 os.environ.setdefault("USAGE_TABLE", "usage-test")
+os.environ.setdefault("ADMIN_AUDIT_TABLE", "admin-audit-test")
 # HS256 dev-mode JWT verification for tests (no IdP / network needed).
 os.environ.setdefault("JWT_SHARED_SECRET", "test-jwt-secret")
 
@@ -36,8 +40,30 @@ class FakeTable:
         return tuple(key[a] for a in self.key_attrs)
 
     # -- API -------------------------------------------------------------
-    def put_item(self, Item: dict):
-        self.items[self._key(Item)] = dict(Item)
+    def put_item(
+        self,
+        Item: dict,
+        ConditionExpression: str | None = None,
+        ExpressionAttributeValues: dict | None = None,
+        ExpressionAttributeNames: dict | None = None,
+    ):
+        key = self._key(Item)
+        current = self.items.get(key, {})
+        values = ExpressionAttributeValues or {}
+        names = ExpressionAttributeNames or {}
+        if ConditionExpression and not self._condition_ok(
+            ConditionExpression, current, values, names
+        ):
+            raise ClientError(
+                {
+                    "Error": {
+                        "Code": "ConditionalCheckFailedException",
+                        "Message": "The conditional request failed",
+                    }
+                },
+                "PutItem",
+            )
+        self.items[key] = dict(Item)
         return {}
 
     def get_item(self, Key: dict, ConsistentRead: bool = False):
@@ -63,16 +89,70 @@ class FakeTable:
             result["LastEvaluatedKey"] = {a: last[a] for a in self.key_attrs}
         return result
 
-    def query(self, IndexName=None, KeyConditionExpression=None,
-              ExpressionAttributeValues=None, Limit=None, **kwargs):
-        # Supports "attr = :v" equality only (what the app uses for its GSI).
-        attr, _, placeholder = KeyConditionExpression.partition("=")
-        attr, placeholder = attr.strip(), placeholder.strip()
-        value = ExpressionAttributeValues[placeholder]
-        matches = [dict(v) for v in self.items.values() if v.get(attr) == value]
-        if Limit:
-            matches = matches[:Limit]
-        return {"Items": matches}
+    def query(
+        self,
+        IndexName=None,
+        KeyConditionExpression=None,
+        ExpressionAttributeValues=None,
+        ExpressionAttributeNames=None,
+        Limit=None,
+        ScanIndexForward=True,
+        ExclusiveStartKey=None,
+        **kwargs,
+    ):
+        import re
+
+        expression = str(KeyConditionExpression)
+        for placeholder, attribute in (ExpressionAttributeNames or {}).items():
+            expression = expression.replace(placeholder, attribute)
+        match = re.fullmatch(
+            r"([A-Za-z0-9_]+)\s*=\s*(:[A-Za-z0-9_]+)"
+            r"(?:\s+AND\s+([A-Za-z0-9_]+)\s+BETWEEN\s+"
+            r"(:[A-Za-z0-9_]+)\s+AND\s+(:[A-Za-z0-9_]+))?",
+            expression,
+        )
+        if not match:
+            raise AssertionError(f"unsupported query in fake: {expression}")
+        partition_attr, partition_value, sort_attr, start_value, end_value = (
+            match.groups()
+        )
+        values = ExpressionAttributeValues or {}
+        matches = [
+            dict(item)
+            for item in self.items.values()
+            if item.get(partition_attr) == values[partition_value]
+            and (
+                sort_attr is None
+                or values[start_value]
+                <= item.get(sort_attr, "")
+                <= values[end_value]
+            )
+        ]
+        order_attr = sort_attr or (
+            "event_key" if IndexName or "event_key" in self.key_attrs
+            else self.key_attrs[-1]
+        )
+        matches.sort(
+            key=lambda item: item.get(order_attr, ""),
+            reverse=not ScanIndexForward,
+        )
+        start = 0
+        if ExclusiveStartKey:
+            exclusive = self._key(ExclusiveStartKey)
+            keys = [self._key(item) for item in matches]
+            start = keys.index(exclusive) + 1 if exclusive in keys else 0
+        page = matches[start : start + Limit] if Limit else matches[start:]
+        result = {"Items": page}
+        if Limit and start + Limit < len(matches):
+            last = page[-1]
+            cursor_attributes = list(self.key_attrs)
+            if IndexName and partition_attr not in cursor_attributes:
+                cursor_attributes.append(partition_attr)
+            result["LastEvaluatedKey"] = {
+                attribute: last[attribute]
+                for attribute in cursor_attributes
+            }
+        return result
 
     def update_item(self, Key: dict, UpdateExpression: str,
                     ExpressionAttributeValues: dict | None = None,
@@ -103,7 +183,9 @@ class FakeTable:
                 "UpdateItem",
             )
 
-        if ConditionExpression and not self._condition_ok(ConditionExpression, item, values):
+        if ConditionExpression and not self._condition_ok(
+            ConditionExpression, item, values, names
+        ):
             raise ClientError(
                 {"Error": {"Code": "ConditionalCheckFailedException",
                            "Message": "The conditional request failed"}},
@@ -117,8 +199,16 @@ class FakeTable:
         return {}
 
     # -- expression evaluation (targeted subset) --------------------------
-    def _condition_ok(self, expr: str, item: dict, values: dict) -> bool:
+    def _condition_ok(
+        self,
+        expr: str,
+        item: dict,
+        values: dict,
+        names: dict | None = None,
+    ) -> bool:
         expr = expr.strip()
+        for placeholder, attribute in (names or {}).items():
+            expr = expr.replace(placeholder, attribute)
 
         def strip_outer(text: str) -> str:
             while text.startswith("(") and text.endswith(")"):
@@ -173,6 +263,9 @@ class FakeTable:
         if expr.startswith("attribute_not_exists(") and expr.endswith(")"):
             attribute = expr[len("attribute_not_exists(") : -1].strip()
             return attribute not in item
+        if expr.startswith("attribute_exists(") and expr.endswith(")"):
+            attribute = expr[len("attribute_exists(") : -1].strip()
+            return attribute in item
 
         import re
 
@@ -231,6 +324,18 @@ class FakeTable:
                 target = names.get(target.strip(), target.strip())
                 rhs = rhs.strip()
                 if rhs.startswith("if_not_exists"):
+                    arithmetic = re.fullmatch(
+                        r"if_not_exists\(([^,]+),\s*(:[A-Za-z0-9_]+)\)"
+                        r"\s*\+\s*(:[A-Za-z0-9_]+)",
+                        rhs,
+                    )
+                    if arithmetic:
+                        source, default, increment = arithmetic.groups()
+                        source = names.get(source.strip(), source.strip())
+                        item[target] = int(item.get(source, values[default])) + int(
+                            values[increment]
+                        )
+                        continue
                     inner = rhs[len("if_not_exists("):rhs.rindex(")")]
                     _attr_name, placeholder = [x.strip() for x in inner.split(",")]
                     if target not in item:
@@ -239,11 +344,80 @@ class FakeTable:
                     item[target] = values[rhs]
 
 
+_DESERIALIZER = TypeDeserializer()
+
+
+def _decode_attribute_map(values: dict | None) -> dict:
+    return {
+        key: _DESERIALIZER.deserialize(value)
+        for key, value in (values or {}).items()
+    }
+
+
+class FakeDynamoClient:
+    """Atomic low-level transaction subset used by production store code."""
+
+    def __init__(self, resource):
+        self.resource = resource
+
+    def transact_write_items(self, TransactItems):  # noqa: N803
+        snapshots = {
+            name: copy.deepcopy(table.items)
+            for name, table in self.resource.tables.items()
+        }
+        try:
+            for action in TransactItems:
+                if "Put" in action:
+                    put = action["Put"]
+                    self.resource.Table(put["TableName"]).put_item(
+                        Item=_decode_attribute_map(put["Item"]),
+                        ConditionExpression=put.get("ConditionExpression"),
+                        ExpressionAttributeValues=_decode_attribute_map(
+                            put.get("ExpressionAttributeValues")
+                        ),
+                        ExpressionAttributeNames=put.get(
+                            "ExpressionAttributeNames"
+                        ),
+                    )
+                    continue
+                if "Update" in action:
+                    update = action["Update"]
+                    self.resource.Table(update["TableName"]).update_item(
+                        Key=_decode_attribute_map(update["Key"]),
+                        UpdateExpression=update["UpdateExpression"],
+                        ConditionExpression=update.get("ConditionExpression"),
+                        ExpressionAttributeValues=_decode_attribute_map(
+                            update.get("ExpressionAttributeValues")
+                        ),
+                        ExpressionAttributeNames=update.get(
+                            "ExpressionAttributeNames"
+                        ),
+                    )
+                    continue
+                raise AssertionError(
+                    f"unsupported transaction action in fake: {action}"
+                )
+        except ClientError as exc:
+            for name, items in snapshots.items():
+                self.resource.tables[name].items = items
+            raise ClientError(
+                {
+                    "Error": {
+                        "Code": "TransactionCanceledException",
+                        "Message": str(exc),
+                    }
+                },
+                "TransactWriteItems",
+            ) from exc
+        return {}
+
+
 class FakeDynamoDB:
     """Stands in for boto3.resource('dynamodb')."""
 
     def __init__(self):
         self.tables: dict[str, FakeTable] = {}
+        self.meta = SimpleNamespace(client=FakeDynamoClient(self))
 
     def add_table(self, name: str, key_attrs: list[str]) -> FakeTable:
         self.tables[name] = FakeTable(name, key_attrs)
@@ -267,6 +441,9 @@ def fake_dynamodb():
     db = FakeDynamoDB()
     db.add_table(os.environ["USERS_TABLE"], ["user_id"])
     db.add_table(os.environ["USAGE_TABLE"], ["user_id", "window"])
+    db.add_table(
+        os.environ["ADMIN_AUDIT_TABLE"], ["subject_id", "event_key"]
+    )
     return db
 
 

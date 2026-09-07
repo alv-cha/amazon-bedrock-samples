@@ -21,6 +21,14 @@ class Settings:
     # --- storage ---
     users_table: str = field(default_factory=lambda: _env("USERS_TABLE", "bedrock-quota-users"))
     usage_table: str = field(default_factory=lambda: _env("USAGE_TABLE", "bedrock-quota-usage"))
+    admin_audit_table: str = field(
+        default_factory=lambda: _env(
+            "ADMIN_AUDIT_TABLE", "bedrock-quota-admin-audit"
+        )
+    )
+    admin_audit_retention_days: int = field(
+        default_factory=lambda: int(_env("ADMIN_AUDIT_RETENTION_DAYS", "365"))
+    )
 
     # --- JWT auth (bring your own IdP) ---
     # Expected token issuer, e.g. https://cognito-idp.us-east-1.amazonaws.com/<pool-id>

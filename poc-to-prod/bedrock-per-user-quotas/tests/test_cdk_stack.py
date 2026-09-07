@@ -76,7 +76,8 @@ def test_invocation_logging_requires_explicit_ownership_choice():
 def test_runtime_only_stack_is_event_driven_and_has_no_mantle_permissions():
     template = _template({"manage_invocation_logging": True})
 
-    template.resource_count_is("AWS::Events::Rule", 1)
+    # Emergency reconciliation (1 minute) and the daily model price refresh.
+    template.resource_count_is("AWS::Events::Rule", 2)
     template.resource_count_is("AWS::Logs::SubscriptionFilter", 1)
     template.resource_count_is("AWS::Lambda::EventSourceMapping", 1)
     template.resource_count_is("AWS::SQS::Queue", 1)
@@ -107,6 +108,22 @@ def test_price_snapshot_is_injected_only_into_usage_processor():
             "RegionCode": "us-east-1",
             "CatalogModels": Match.object_like(
                 {"gpt-oss-120b": Match.any_value()}
+            ),
+            "PinnedPrices": Match.object_like(
+                {
+                    "anthropic.claude-opus-4-7": {
+                        "input_per_mtok": 5.0,
+                        "output_per_mtok": 25.0,
+                    },
+                    "global.anthropic.claude-opus-4-7": {
+                        "input_per_mtok": 5.0,
+                        "output_per_mtok": 25.0,
+                    },
+                    "us.anthropic.claude-opus-4-7": {
+                        "input_per_mtok": 5.5,
+                        "output_per_mtok": 27.5,
+                    },
+                }
             ),
         },
     )
@@ -164,7 +181,7 @@ def test_defaults_are_injected_and_tables_are_destroyable_for_demo():
                 "Enabled": True,
             }
         },
-        2,
+        3,
     )
     for table in template.find_resources("AWS::DynamoDB::Table").values():
         assert table["DeletionPolicy"] == "Delete"
@@ -240,7 +257,8 @@ def test_role_chained_revocation_mode_requires_exactly_one_hour():
         {"StreamSpecification": {"StreamViewType": "NEW_AND_OLD_IMAGES"}},
     )
     template.resource_count_is("AWS::Lambda::EventSourceMapping", 2)
-    template.resource_count_is("AWS::Events::Rule", 2)
+    # Emergency reconcile, revocation reconcile, and daily price refresh.
+    template.resource_count_is("AWS::Events::Rule", 3)
     template.resource_count_is("AWS::SQS::Queue", 2)
 
     template.has_resource_properties(
@@ -586,6 +604,7 @@ def test_model_pricing_accepts_validated_json_and_conservative_fallback():
             "provider.pinned-model": {
                 "input_per_mtok": 7,
                 "output_per_mtok": 21,
+                "reason": "test model absent from the Pricing API catalog",
             }
         },
         "fallback_price": {
@@ -687,3 +706,311 @@ def test_model_config_rejects_duplicate_and_non_positive_prices():
                 "model_config": duplicate,
             }
         )
+
+
+def test_admin_audit_table_gateway_grant_and_safe_ui_cors():
+    template = _template(
+        {
+            "manage_invocation_logging": True,
+            "admin_ui": True,
+            "admin_jwt_claim": "cognito:groups",
+            "admin_jwt_value": "quota-admins",
+        }
+    )
+    tables = template.find_resources("AWS::DynamoDB::Table")
+    audit_logical_id, audit_table = next(
+        (logical_id, resource)
+        for logical_id, resource in tables.items()
+        if resource["Properties"]["KeySchema"][0]["AttributeName"]
+        == "subject_id"
+    )
+    properties = audit_table["Properties"]
+    assert properties["KeySchema"] == [
+        {"AttributeName": "subject_id", "KeyType": "HASH"},
+        {"AttributeName": "event_key", "KeyType": "RANGE"},
+    ]
+    assert properties["TimeToLiveSpecification"] == {
+        "AttributeName": "expires_at",
+        "Enabled": True,
+    }
+    assert properties["GlobalSecondaryIndexes"][0]["IndexName"] == (
+        "scope-event-key-index"
+    )
+    assert properties["GlobalSecondaryIndexes"][0]["KeySchema"] == [
+        {"AttributeName": "scope", "KeyType": "HASH"},
+        {"AttributeName": "event_key", "KeyType": "RANGE"},
+    ]
+
+    broker_env = _environment_with(template, "BEDROCK_USER_ROLE_ARN")
+    processor_env = _environment_with(template, "WARN_THRESHOLD")
+    assert broker_env["ADMIN_AUDIT_TABLE"] == {"Ref": audit_logical_id}
+    assert broker_env["ADMIN_AUDIT_RETENTION_DAYS"] == "365"
+    assert "ADMIN_AUDIT_TABLE" not in processor_env
+
+    policies = json.dumps(template.find_resources("AWS::IAM::Policy"))
+    assert audit_logical_id in policies
+    assert "dynamodb:TransactWriteItems" in policies
+
+    function_url = next(
+        iter(template.find_resources("AWS::Lambda::Url").values())
+    )
+    cors = function_url["Properties"]["Cors"]
+    assert "if-match" in cors["AllowHeaders"]
+    assert "idempotency-key" in cors["AllowHeaders"]
+    assert "etag" in cors["ExposeHeaders"]
+    assert "x-request-id" in cors["ExposeHeaders"]
+    assert cors["AllowOrigins"] != ["*"]
+    assert function_url["Properties"]["AuthType"] == "AWS_IAM"
+
+
+def test_admin_managed_login_reuses_compatible_demo_client():
+    template = _template(
+        {
+            "manage_invocation_logging": True,
+            "admin_ui": True,
+            "admin_jwt_claim": "cognito:groups",
+            "admin_jwt_value": "quota-admins",
+        }
+    )
+    resources = template.to_json()["Resources"]
+
+    # These existing construct paths are compatibility boundaries. Moving the
+    # client out of the User Pool scope would replace it and break JWT_AUDIENCE.
+    assert "DemoUserPool1AB98549" in resources
+    assert "DemoUserPoolDemoAppClientB5870BCA" in resources
+    assert "AdminUiDistribution580370A5" in resources
+    client = resources["DemoUserPoolDemoAppClientB5870BCA"]["Properties"]
+    assert client["GenerateSecret"] is False
+    assert set(client["ExplicitAuthFlows"]) == {
+        "ALLOW_USER_PASSWORD_AUTH",
+        "ALLOW_USER_SRP_AUTH",
+        "ALLOW_REFRESH_TOKEN_AUTH",
+    }
+    assert client["AllowedOAuthFlows"] == ["code"]
+    assert client["AllowedOAuthFlowsUserPoolClient"] is True
+    assert set(client["AllowedOAuthScopes"]) == {"openid", "email", "profile"}
+    assert "implicit" not in json.dumps(client)
+    assert "/auth/callback" in json.dumps(client["CallbackURLs"])
+    assert '"/"' in json.dumps(client["LogoutURLs"])
+    assert "AdminUiDistribution580370A5" in json.dumps(client["CallbackURLs"])
+
+    template.has_resource_properties(
+        "AWS::Cognito::UserPoolDomain",
+        {
+            "ManagedLoginVersion": 2,
+            "UserPoolId": {"Ref": "DemoUserPool1AB98549"},
+        },
+    )
+    template.has_resource_properties(
+        "AWS::Cognito::ManagedLoginBranding",
+        {
+            "ClientId": {"Ref": "DemoUserPoolDemoAppClientB5870BCA"},
+            "UserPoolId": {"Ref": "DemoUserPool1AB98549"},
+            "UseCognitoProvidedValues": True,
+        },
+    )
+
+    broker_env = _environment_with(template, "JWT_AUDIENCE")
+    assert broker_env["JWT_AUDIENCE"] == {
+        "Ref": "DemoUserPoolDemoAppClientB5870BCA"
+    }
+    identity_pool = next(
+        iter(template.find_resources("AWS::Cognito::IdentityPool").values())
+    )
+    providers = identity_pool["Properties"]["CognitoIdentityProviders"]
+    assert len(providers) == 1
+    assert providers[0]["ClientId"] == {
+        "Ref": "DemoUserPoolDemoAppClientB5870BCA"
+    }
+    assert providers[0]["ServerSideTokenCheck"] is True
+    assert "DemoUserPool1AB98549" in json.dumps(providers[0]["ProviderName"])
+
+
+def test_admin_runtime_config_security_headers_and_cors_have_no_secrets_or_cycle():
+    template = _template(
+        {
+            "manage_invocation_logging": True,
+            "admin_ui": True,
+            "admin_jwt_claim": "cognito:groups",
+            "admin_jwt_value": "quota-admins",
+        }
+    )
+    resources = template.to_json()["Resources"]
+    runtime_config = resources["AdminUiRuntimeConfigFB2880AD"]
+    runtime_config_json = json.dumps(runtime_config["Properties"])
+    assert "cognitoDomain" in runtime_config_json
+    assert "amazoncognito.com" in runtime_config_json
+    assert "cognitoIssuer" in runtime_config_json
+    assert "AdminKey" not in runtime_config_json
+    assert "EmergencyKey" not in runtime_config_json
+    assert "SecretArn" not in runtime_config_json
+    assert "clientSecret" not in runtime_config_json
+
+    policies = template.find_resources("AWS::CloudFront::ResponseHeadersPolicy")
+    assert len(policies) == 1
+    policy_id, policy = next(iter(policies.items()))
+    security = policy["Properties"]["ResponseHeadersPolicyConfig"][
+        "SecurityHeadersConfig"
+    ]
+    assert security["ContentTypeOptions"]["Override"] is True
+    assert security["FrameOptions"] == {
+        "FrameOption": "DENY",
+        "Override": True,
+    }
+    assert security["StrictTransportSecurity"] == {
+        "AccessControlMaxAgeSec": 31_536_000,
+        "IncludeSubdomains": True,
+        "Override": True,
+        "Preload": True,
+    }
+    csp = json.dumps(security["ContentSecurityPolicy"])
+    assert "default-src 'self'" in csp
+    assert "frame-ancestors 'none'" in csp
+    assert "https://*.lambda-url.us-east-1.on.aws" in csp
+    assert "cognito-identity.us-east-1." in csp
+    assert "amazoncognito.com" in csp
+    assert "GatewayFnFunctionUrl" not in csp
+    csp_parts = security["ContentSecurityPolicy"]["ContentSecurityPolicy"][
+        "Fn::Join"
+    ][1]
+    identity_origin = next(
+        index
+        for index, part in enumerate(csp_parts)
+        if isinstance(part, str)
+        and "https://cognito-identity.us-east-1." in part
+    )
+    assert csp_parts[identity_origin + 1] == {"Ref": "AWS::URLSuffix"}
+
+    distribution = resources["AdminUiDistribution580370A5"]["Properties"]
+    assert distribution["DistributionConfig"]["DefaultCacheBehavior"][
+        "ResponseHeadersPolicyId"
+    ] == {"Ref": policy_id}
+    function_url = next(
+        iter(template.find_resources("AWS::Lambda::Url").values())
+    )
+    assert function_url["Properties"]["AuthType"] == "AWS_IAM"
+    cors = function_url["Properties"]["Cors"]
+    assert cors["AllowOrigins"] != ["*"]
+    assert cors["AllowOrigins"] == [
+        {
+            "Fn::Join": [
+                "",
+                [
+                    "https://",
+                    {
+                        "Fn::GetAtt": [
+                            "AdminUiDistribution580370A5",
+                            "DomainName",
+                        ]
+                    },
+                ],
+            ]
+        }
+    ]
+
+
+def test_demo_client_without_admin_ui_keeps_explicit_auth_and_disables_oauth():
+    template = _template({"manage_invocation_logging": True})
+    client = next(
+        iter(template.find_resources("AWS::Cognito::UserPoolClient").values())
+    )["Properties"]
+    assert set(client["ExplicitAuthFlows"]) == {
+        "ALLOW_USER_PASSWORD_AUTH",
+        "ALLOW_USER_SRP_AUTH",
+        "ALLOW_REFRESH_TOKEN_AUTH",
+    }
+    assert client["GenerateSecret"] is False
+    assert "AllowedOAuthFlows" not in client
+    assert "CallbackURLs" not in client
+    template.resource_count_is("AWS::Cognito::UserPoolDomain", 0)
+    template.resource_count_is("AWS::Cognito::ManagedLoginBranding", 0)
+
+
+def test_price_refresh_schedule_parameter_and_fallback_alarm():
+    template = _template({"manage_invocation_logging": True})
+
+    # The deployment snapshot seeds a runtime SSM parameter combining the
+    # resolved model prices and the conservative fallback.
+    parameters = template.find_resources("AWS::SSM::Parameter")
+    assert len(parameters) == 1
+    parameter = next(iter(parameters.values()))["Properties"]
+    joined = parameter["Value"]["Fn::Join"][1]
+    assert joined[0] == '{"models":'
+    assert joined[2] == ',"fallback":'
+
+    # A daily EventBridge rule targets the scheduled resolver entrypoint and
+    # carries the pricing config in the event, mirroring the custom
+    # resource's properties shape.
+    schedule_rule = next(
+        resource["Properties"]
+        for resource in template.find_resources("AWS::Events::Rule").values()
+        if resource["Properties"].get("ScheduleExpression") == "rate(1 day)"
+    )
+    rule_input = json.dumps(schedule_rule["Targets"][0]["Input"])
+    assert "CatalogModels" in rule_input
+    assert "PinnedPrices" in rule_input
+    # Pinned prices flow without the deploy-time-only reason metadata.
+    assert "reason" not in rule_input
+    refresher = next(
+        resource["Properties"]
+        for name, resource in template.find_resources(
+            "AWS::Lambda::Function"
+        ).items()
+        if name.startswith("PriceRefreshFn")
+    )
+    assert refresher["Handler"] == "handler.scheduled_handler"
+    assert list(refresher["Environment"]["Variables"]) == [
+        "PRICES_PARAMETER_NAME"
+    ]
+
+    # Metering reads the parameter and keeps the env snapshot fallback.
+    processor_env = _environment_with(template, "WARN_THRESHOLD")
+    assert "PRICES_PARAMETER_NAME" in processor_env
+    assert "MODEL_PRICES_JSON" in processor_env
+
+    # Fallback-priced requests are an alarmed operational event.
+    template.has_resource_properties(
+        "AWS::CloudWatch::Alarm",
+        {
+            "MetricName": "FallbackPricedRequests",
+            "Statistic": "Sum",
+            "Threshold": 1,
+            "TreatMissingData": "notBreaching",
+        },
+    )
+    broker_env = _environment_with(template, "BEDROCK_USER_ROLE_ARN")
+    alarm_names = broker_env["OPERATIONS_ALARM_NAMES_JSON"]
+    assert "pricing_fallback" in json.dumps(alarm_names)
+
+
+def test_price_overrides_require_a_documented_reason():
+    from cdk.stacks.configuration import _model_pricing
+    from pathlib import Path
+
+    valid = {
+        "catalog_models": {"gpt-oss-20b": ["openai.gpt-oss-20b"]},
+        "price_overrides": {
+            "x.model": {
+                "input_per_mtok": 1.0,
+                "output_per_mtok": 2.0,
+                "reason": "catalog gap documented here",
+            }
+        },
+        "fallback_price": {"input_per_mtok": 15.0, "output_per_mtok": 75.0},
+    }
+    pricing = _model_pricing(valid, Path("."))
+    # The reason is deploy metadata; resolved overrides carry only rates.
+    assert pricing.price_overrides["x.model"] == {
+        "input_per_mtok": 1.0,
+        "output_per_mtok": 2.0,
+    }
+
+    missing_reason = json.loads(json.dumps(valid))
+    del missing_reason["price_overrides"]["x.model"]["reason"]
+    with pytest.raises(ValueError, match="reason"):
+        _model_pricing(missing_reason, Path("."))
+
+    blank_reason = json.loads(json.dumps(valid))
+    blank_reason["price_overrides"]["x.model"]["reason"] = "  "
+    with pytest.raises(ValueError, match="reason"):
+        _model_pricing(blank_reason, Path("."))

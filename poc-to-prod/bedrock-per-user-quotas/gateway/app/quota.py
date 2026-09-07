@@ -13,13 +13,18 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 import boto3
+from boto3.dynamodb.types import TypeSerializer
 from botocore.exceptions import ClientError
 
 from .config import settings
 
 MICRO = 1_000_000
+_SERIALIZER = TypeSerializer()
+ADMIN_AUDIT_SCOPE = "routine-admin"
+IDEMPOTENCY_EVENT_KEY = "REQUEST"
 RESERVED_USER_ID_PREFIXES = (
     "SESSION#",
     "VEND#",
@@ -68,10 +73,36 @@ class UserRecord:
     daily_usd_micro: int
     daily_input_tokens: int
     daily_output_tokens: int
+    version: int = 0
+    created_at: str | None = None
+    updated_at: str | None = None
+    status_origin: str = "legacy"
 
     @property
     def active(self) -> bool:
         return self.status == "active"
+
+
+@dataclass(frozen=True)
+class AdminMutationResult:
+    user: UserRecord
+    replayed: bool = False
+
+
+class UserAlreadyExists(Exception):
+    def __init__(self, current_user: UserRecord):
+        super().__init__(f"user {current_user.user_id!r} already exists")
+        self.current_user = current_user
+
+
+class VersionConflict(Exception):
+    def __init__(self, current_user: UserRecord):
+        super().__init__(f"user {current_user.user_id!r} has changed")
+        self.current_user = current_user
+
+
+class IdempotencyConflict(Exception):
+    """An idempotency key was already used for a different request."""
 
 
 @dataclass(frozen=True)
@@ -100,7 +131,7 @@ class LeaseExpired(Exception):
 
 
 class QuotaStore:
-    """Small read/write surface over the two stack-owned tables."""
+    """Read/write surface over quota state and isolated admin audit data."""
 
     def __init__(
         self,
@@ -117,6 +148,17 @@ class QuotaStore:
         )
         self._users = self._dynamodb.Table(settings.users_table)
         self._usage = self._dynamodb.Table(settings.usage_table)
+        self._admin_audit = self._dynamodb.Table(settings.admin_audit_table)
+        # Transactions send TypeSerializer-encoded items and therefore need a
+        # genuine low-level client. A boto3 *resource* meta client carries the
+        # document-interface transform, which would re-serialize the already
+        # encoded attribute values into nested maps ({"S": ...} -> {"M":
+        # {"S": {"S": ...}}}) and make DynamoDB reject the item keys.
+        self._client = (
+            dynamodb.meta.client
+            if dynamodb is not None
+            else boto3.client("dynamodb", region_name=settings.aws_region)
+        )
         self._lease_seconds = (
             lease_seconds
             if lease_seconds is not None
@@ -143,6 +185,62 @@ class QuotaStore:
             else 0
         )
 
+    @staticmethod
+    def _is_conditional_failure(exc: ClientError) -> bool:
+        return exc.response.get("Error", {}).get("Code") in {
+            "ConditionalCheckFailedException",
+            "TransactionCanceledException",
+        }
+
+    @staticmethod
+    def _serialize(values: dict) -> dict:
+        return {key: _SERIALIZER.serialize(value) for key, value in values.items()}
+
+    @staticmethod
+    def _encode_cursor(key: dict | None, context: dict) -> str | None:
+        if not key:
+            return None
+        return json.dumps(
+            {"version": 1, "key": key, "context": context},
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    @staticmethod
+    def _decode_cursor(
+        cursor: str | None,
+        *,
+        key_fields: set[str],
+        context: dict,
+    ) -> dict | None:
+        if not cursor:
+            return None
+        try:
+            envelope = json.loads(cursor)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("invalid cursor") from exc
+        if not isinstance(envelope, dict):
+            raise ValueError("invalid cursor")
+        if set(envelope) != {"version", "key", "context"}:
+            raise ValueError("invalid cursor")
+        key = envelope.get("key")
+        if (
+            envelope.get("version") != 1
+            or envelope.get("context") != context
+            or not isinstance(key, dict)
+            or set(key) != key_fields
+            or not all(isinstance(value, str) for value in key.values())
+        ):
+            raise ValueError("invalid cursor")
+        return key
+
+    def _get_user_item(self, user_id: str) -> dict | None:
+        validate_user_id(user_id)
+        item = self._users.get_item(
+            Key={"user_id": user_id}, ConsistentRead=True
+        ).get("Item")
+        return dict(item) if item else None
+
     def get_user(
         self, user_id: str, use_cache: bool = False
     ) -> UserRecord | None:
@@ -159,13 +257,18 @@ class QuotaStore:
         user = self.get_user(user_id)
         if user is not None:
             return user
-        self.put_user(
-            user_id=user_id,
-            name=name or user_id,
-            daily_usd=settings.default_daily_usd,
-            daily_input_tokens=settings.default_daily_input_tokens,
-            daily_output_tokens=settings.default_daily_output_tokens,
-        )
+        try:
+            self.put_user(
+                user_id=user_id,
+                name=name or user_id,
+                daily_usd=settings.default_daily_usd,
+                daily_input_tokens=settings.default_daily_input_tokens,
+                daily_output_tokens=settings.default_daily_output_tokens,
+            )
+        except UserAlreadyExists:
+            # A concurrent admin create is authoritative. Never replace it
+            # with auto-provision defaults; return the winning row instead.
+            pass
         user = self.get_user(user_id)
         assert user is not None
         return user
@@ -179,18 +282,32 @@ class QuotaStore:
         daily_output_tokens: int,
     ) -> None:
         validate_user_id(user_id)
-        self._users.put_item(
-            Item={
-                "user_id": user_id,
-                "name": name,
-                "status": "active",
-                "status_reason": "",
-                "daily_usd_micro": _usd_to_micro(daily_usd),
-                "daily_input_tokens": daily_input_tokens,
-                "daily_output_tokens": daily_output_tokens,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
-        )
+        now = datetime.now(timezone.utc).isoformat()
+        item = {
+            "user_id": user_id,
+            "name": name,
+            "status": "active",
+            "status_reason": "",
+            "daily_usd_micro": _usd_to_micro(daily_usd),
+            "daily_input_tokens": daily_input_tokens,
+            "daily_output_tokens": daily_output_tokens,
+            "version": 1,
+            "created_at": now,
+            "updated_at": now,
+            "status_origin": "automatic",
+        }
+        try:
+            self._users.put_item(
+                Item=item,
+                ConditionExpression="attribute_not_exists(user_id)",
+            )
+        except ClientError as exc:
+            if not self._is_conditional_failure(exc):
+                raise
+            current = self.get_user(user_id)
+            if current is None:
+                raise
+            raise UserAlreadyExists(current) from exc
 
     def record_session(self, session_name: str, user_id: str) -> None:
         validate_user_id(user_id)
@@ -473,22 +590,77 @@ class QuotaStore:
         )
 
     def set_user_status(
-        self, user_id: str, status: str, reason: str = ""
-    ) -> None:
+        self,
+        user_id: str,
+        status: str,
+        reason: str = "",
+        *,
+        origin: str | None = None,
+        expected_version: int | None = None,
+        expected_status: str | None = None,
+        expected_reason: str | None = None,
+    ) -> bool:
+        """Write a non-admin status transition and advance config version.
+
+        Automatic callers can bind the write to their observed configuration.
+        Session, lease, warning, and vend-rate bookkeeping deliberately use
+        separate writes and do not change the user configuration version.
+        """
         validate_user_id(user_id)
+        if origin is None:
+            origin = "automatic" if reason.startswith("auto:") else "legacy"
         changed_at = datetime.now(timezone.utc).isoformat()
-        self._users.update_item(
-            Key={"user_id": user_id},
-            UpdateExpression=(
-                "SET #s = :s, status_reason = :r, status_changed_at = :t"
+        values = {
+            ":s": status,
+            ":r": reason,
+            ":t": changed_at,
+            ":origin": origin,
+            ":zero": 0,
+            ":one": 1,
+        }
+        conditions: list[str] = []
+        if expected_version is not None:
+            values[":expected_version"] = expected_version
+            conditions.append(
+                "(attribute_not_exists(#version) OR "
+                "#version = :expected_version)"
+                if expected_version == 0
+                else "#version = :expected_version"
+            )
+        if expected_status is not None:
+            values[":expected_status"] = expected_status
+            conditions.append("#s = :expected_status")
+        if expected_reason is not None:
+            values[":expected_reason"] = expected_reason
+            conditions.append(
+                "(attribute_not_exists(status_reason) OR "
+                "status_reason = :expected_reason)"
+                if expected_reason == ""
+                else "status_reason = :expected_reason"
+            )
+        update_kwargs = {
+            "Key": {"user_id": user_id},
+            "UpdateExpression": (
+                "SET #s = :s, status_reason = :r, status_changed_at = :t, "
+                "updated_at = :t, status_origin = :origin, "
+                "#version = if_not_exists(#version, :zero) + :one"
             ),
-            ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={
-                ":s": status,
-                ":r": reason,
-                ":t": changed_at,
+            "ExpressionAttributeNames": {
+                "#s": "status",
+                "#version": "version",
             },
-        )
+            "ExpressionAttributeValues": values,
+        }
+        if conditions:
+            update_kwargs["ConditionExpression"] = " AND ".join(conditions)
+        try:
+            self._users.update_item(**update_kwargs)
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") != (
+                "ConditionalCheckFailedException"
+            ):
+                raise
+            return False
         user = self._users.get_item(
             Key={"user_id": user_id}, ConsistentRead=True
         ).get("Item", {})
@@ -502,6 +674,7 @@ class QuotaStore:
                 "expires_at": window_ttl_epoch(),
             }
         )
+        return True
 
     def set_user_limits(
         self,
@@ -523,11 +696,411 @@ class QuotaStore:
             sets.append("daily_output_tokens = :o")
             values[":o"] = daily_output_tokens
         if sets:
+            now = datetime.now(timezone.utc).isoformat()
+            sets.extend(
+                [
+                    "updated_at = :updated",
+                    "#version = if_not_exists(#version, :zero) + :one",
+                ]
+            )
+            values.update({":updated": now, ":zero": 0, ":one": 1})
             self._users.update_item(
                 Key={"user_id": user_id},
                 UpdateExpression="SET " + ", ".join(sets),
+                ExpressionAttributeNames={"#version": "version"},
                 ExpressionAttributeValues=values,
             )
+
+    @staticmethod
+    def _user_snapshot(user: UserRecord) -> dict:
+        return {
+            "user_id": user.user_id,
+            "name": user.name,
+            "status": user.status,
+            "status_reason": user.status_reason,
+            "limits": {
+                "daily_usd_micro": user.daily_usd_micro,
+                "daily_input_tokens": user.daily_input_tokens,
+                "daily_output_tokens": user.daily_output_tokens,
+            },
+            "version": user.version,
+            "created_at": user.created_at,
+            "updated_at": user.updated_at,
+            "status_origin": user.status_origin,
+        }
+
+    @staticmethod
+    def _snapshot_to_user(snapshot: dict) -> UserRecord:
+        limits = snapshot.get("limits", {})
+        return UserRecord(
+            user_id=str(snapshot["user_id"]),
+            name=str(snapshot.get("name", "")),
+            status=str(snapshot.get("status", "active")),
+            status_reason=str(snapshot.get("status_reason", "")),
+            daily_usd_micro=int(limits.get("daily_usd_micro", 0)),
+            daily_input_tokens=int(limits.get("daily_input_tokens", 0)),
+            daily_output_tokens=int(limits.get("daily_output_tokens", 0)),
+            version=int(snapshot.get("version", 0)),
+            created_at=snapshot.get("created_at"),
+            updated_at=snapshot.get("updated_at"),
+            status_origin=str(snapshot.get("status_origin", "legacy")),
+        )
+
+    def _idempotency_result(
+        self, idempotency_key: str, request_hash: str
+    ) -> AdminMutationResult | None:
+        marker = self._admin_audit.get_item(
+            Key={
+                "subject_id": f"IDEMPOTENCY#{idempotency_key}",
+                "event_key": IDEMPOTENCY_EVENT_KEY,
+            },
+            ConsistentRead=True,
+        ).get("Item")
+        if not marker:
+            return None
+        if marker.get("request_hash") != request_hash:
+            raise IdempotencyConflict(
+                "idempotency key was already used for a different request"
+            )
+        snapshot = marker.get("result_user")
+        if not isinstance(snapshot, dict):
+            raise IdempotencyConflict("idempotency marker is incomplete")
+        return AdminMutationResult(
+            user=self._snapshot_to_user(snapshot), replayed=True
+        )
+
+    def _admin_metadata_items(
+        self,
+        *,
+        user: UserRecord,
+        before: UserRecord | None,
+        event_type: str,
+        actor: str,
+        auth_method: str,
+        reason: str,
+        idempotency_key: str,
+        request_hash: str,
+        now: datetime,
+    ) -> list[dict]:
+        created_at = now.isoformat()
+        expires_at = int(now.timestamp()) + (
+            settings.admin_audit_retention_days * 86400
+        )
+        event_key = f"{created_at}#{uuid.uuid4()}"
+        audit_item = {
+            "subject_id": user.user_id,
+            "event_key": event_key,
+            "scope": ADMIN_AUDIT_SCOPE,
+            "event_type": event_type,
+            "actor": actor,
+            "auth_method": auth_method,
+            "reason": reason,
+            "request_id": idempotency_key,
+            "created_at": created_at,
+            "expires_at": expires_at,
+            "before": self._user_snapshot(before) if before else None,
+            "after": self._user_snapshot(user),
+        }
+        marker_item = {
+            "subject_id": f"IDEMPOTENCY#{idempotency_key}",
+            "event_key": IDEMPOTENCY_EVENT_KEY,
+            "scope": "idempotency",
+            "request_hash": request_hash,
+            "result_user": self._user_snapshot(user),
+            "created_at": created_at,
+            "expires_at": expires_at,
+        }
+        return [
+            {
+                "Put": {
+                    "TableName": self._admin_audit.name,
+                    "Item": self._serialize(audit_item),
+                    "ConditionExpression": "attribute_not_exists(subject_id)",
+                }
+            },
+            {
+                "Put": {
+                    "TableName": self._admin_audit.name,
+                    "Item": self._serialize(marker_item),
+                    "ConditionExpression": "attribute_not_exists(subject_id)",
+                }
+            },
+        ]
+
+    def create_admin_user(
+        self,
+        *,
+        user_id: str,
+        name: str,
+        daily_usd: float,
+        daily_input_tokens: int,
+        daily_output_tokens: int,
+        actor: str,
+        auth_method: str,
+        idempotency_key: str,
+        request_hash: str,
+        now: datetime | None = None,
+    ) -> AdminMutationResult:
+        validate_user_id(user_id)
+        replay = self._idempotency_result(idempotency_key, request_hash)
+        if replay is not None:
+            return replay
+        now = now or datetime.now(timezone.utc)
+        timestamp = now.isoformat()
+        item = {
+            "user_id": user_id,
+            "name": name,
+            "status": "active",
+            "status_reason": "",
+            "daily_usd_micro": _usd_to_micro(daily_usd),
+            "daily_input_tokens": daily_input_tokens,
+            "daily_output_tokens": daily_output_tokens,
+            "version": 1,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "status_origin": "admin",
+        }
+        user = self._to_user(item)
+        transaction = [
+            {
+                "Put": {
+                    "TableName": self._users.name,
+                    "Item": self._serialize(item),
+                    "ConditionExpression": "attribute_not_exists(user_id)",
+                }
+            },
+            *self._admin_metadata_items(
+                user=user,
+                before=None,
+                event_type="user.created",
+                actor=actor,
+                auth_method=auth_method,
+                reason="admin user creation",
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                now=now,
+            ),
+        ]
+        try:
+            self._client.transact_write_items(TransactItems=transaction)
+        except ClientError as exc:
+            if not self._is_conditional_failure(exc):
+                raise
+            replay = self._idempotency_result(
+                idempotency_key, request_hash
+            )
+            if replay is not None:
+                return replay
+            current = self.get_user(user_id)
+            if current is not None:
+                raise UserAlreadyExists(current) from exc
+            raise
+        return AdminMutationResult(user=user)
+
+    @staticmethod
+    def _version_condition(expected_version: int) -> str:
+        if expected_version == 0:
+            return (
+                "attribute_exists(user_id) AND "
+                "(attribute_not_exists(#version) OR #version = :expected)"
+            )
+        return "attribute_exists(user_id) AND #version = :expected"
+
+    def update_admin_limits(
+        self,
+        user_id: str,
+        limits: dict,
+        *,
+        reason: str,
+        expected_version: int,
+        actor: str,
+        auth_method: str,
+        idempotency_key: str,
+        request_hash: str,
+        now: datetime | None = None,
+    ) -> AdminMutationResult:
+        replay = self._idempotency_result(idempotency_key, request_hash)
+        if replay is not None:
+            return replay
+        current_item = self._get_user_item(user_id)
+        if current_item is None:
+            raise KeyError(user_id)
+        current = self._to_user(current_item)
+        now = now or datetime.now(timezone.utc)
+        values = {
+            ":expected": expected_version,
+            ":next": expected_version + 1,
+            ":updated": now.isoformat(),
+        }
+        sets = ["#version = :next", "updated_at = :updated"]
+        next_item = dict(current_item)
+        if "daily_usd" in limits:
+            value = _usd_to_micro(limits["daily_usd"])
+            values[":daily_usd"] = value
+            sets.append("daily_usd_micro = :daily_usd")
+            next_item["daily_usd_micro"] = value
+        if "daily_input_tokens" in limits:
+            value = int(limits["daily_input_tokens"])
+            values[":daily_input_tokens"] = value
+            sets.append("daily_input_tokens = :daily_input_tokens")
+            next_item["daily_input_tokens"] = value
+        if "daily_output_tokens" in limits:
+            value = int(limits["daily_output_tokens"])
+            values[":daily_output_tokens"] = value
+            sets.append("daily_output_tokens = :daily_output_tokens")
+            next_item["daily_output_tokens"] = value
+        next_item.update(
+            {"version": expected_version + 1, "updated_at": now.isoformat()}
+        )
+        updated = self._to_user(next_item)
+        transaction = [
+            {
+                "Update": {
+                    "TableName": self._users.name,
+                    "Key": self._serialize({"user_id": user_id}),
+                    "UpdateExpression": "SET " + ", ".join(sets),
+                    "ConditionExpression": self._version_condition(
+                        expected_version
+                    ),
+                    "ExpressionAttributeNames": {"#version": "version"},
+                    "ExpressionAttributeValues": self._serialize(values),
+                }
+            },
+            *self._admin_metadata_items(
+                user=updated,
+                before=current,
+                event_type="user.limits.updated",
+                actor=actor,
+                auth_method=auth_method,
+                reason=reason,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                now=now,
+            ),
+        ]
+        try:
+            self._client.transact_write_items(TransactItems=transaction)
+        except ClientError as exc:
+            if not self._is_conditional_failure(exc):
+                raise
+            replay = self._idempotency_result(
+                idempotency_key, request_hash
+            )
+            if replay is not None:
+                return replay
+            latest = self.get_user(user_id)
+            if latest is None:
+                raise KeyError(user_id) from exc
+            if latest.version != expected_version:
+                raise VersionConflict(latest) from exc
+            raise
+        return AdminMutationResult(user=updated)
+
+    def update_admin_status(
+        self,
+        user_id: str,
+        status: str,
+        reason: str,
+        *,
+        expected_version: int,
+        actor: str,
+        auth_method: str,
+        idempotency_key: str,
+        request_hash: str,
+        now: datetime | None = None,
+    ) -> AdminMutationResult:
+        replay = self._idempotency_result(idempotency_key, request_hash)
+        if replay is not None:
+            return replay
+        current_item = self._get_user_item(user_id)
+        if current_item is None:
+            raise KeyError(user_id)
+        current = self._to_user(current_item)
+        now = now or datetime.now(timezone.utc)
+        timestamp = now.isoformat()
+        next_item = dict(current_item)
+        next_item.update(
+            {
+                "status": status,
+                "status_reason": reason,
+                "status_changed_at": timestamp,
+                "status_origin": "admin",
+                "updated_at": timestamp,
+                "version": expected_version + 1,
+            }
+        )
+        updated = self._to_user(next_item)
+        values = {
+            ":status": status,
+            ":reason": reason,
+            ":updated": timestamp,
+            ":origin": "admin",
+            ":expected": expected_version,
+            ":next": expected_version + 1,
+        }
+        revocation = {
+            "user_id": f"REVOCATION#{user_id}",
+            "maps_to": user_id,
+            "desired_status": status,
+            "source_identity": str(current_item.get("source_identity", "")),
+            "updated_at": timestamp,
+            "expires_at": window_ttl_epoch(now),
+        }
+        transaction = [
+            {
+                "Update": {
+                    "TableName": self._users.name,
+                    "Key": self._serialize({"user_id": user_id}),
+                    "UpdateExpression": (
+                        "SET #status = :status, status_reason = :reason, "
+                        "status_changed_at = :updated, updated_at = :updated, "
+                        "status_origin = :origin, #version = :next"
+                    ),
+                    "ConditionExpression": self._version_condition(
+                        expected_version
+                    ),
+                    "ExpressionAttributeNames": {
+                        "#status": "status",
+                        "#version": "version",
+                    },
+                    "ExpressionAttributeValues": self._serialize(values),
+                }
+            },
+            {
+                "Put": {
+                    "TableName": self._users.name,
+                    "Item": self._serialize(revocation),
+                }
+            },
+            *self._admin_metadata_items(
+                user=updated,
+                before=current,
+                event_type="user.status.updated",
+                actor=actor,
+                auth_method=auth_method,
+                reason=reason,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                now=now,
+            ),
+        ]
+        try:
+            self._client.transact_write_items(TransactItems=transaction)
+        except ClientError as exc:
+            if not self._is_conditional_failure(exc):
+                raise
+            replay = self._idempotency_result(
+                idempotency_key, request_hash
+            )
+            if replay is not None:
+                return replay
+            latest = self.get_user(user_id)
+            if latest is None:
+                raise KeyError(user_id) from exc
+            if latest.version != expected_version:
+                raise VersionConflict(latest) from exc
+            raise
+        return AdminMutationResult(user=updated)
 
     @staticmethod
     def _to_user(item: dict) -> UserRecord:
@@ -539,6 +1112,14 @@ class QuotaStore:
             daily_usd_micro=int(item.get("daily_usd_micro", 0)),
             daily_input_tokens=int(item.get("daily_input_tokens", 0)),
             daily_output_tokens=int(item.get("daily_output_tokens", 0)),
+            version=int(item.get("version", 0)),
+            created_at=(
+                str(item["created_at"]) if item.get("created_at") else None
+            ),
+            updated_at=(
+                str(item["updated_at"]) if item.get("updated_at") else None
+            ),
+            status_origin=str(item.get("status_origin", "legacy")),
         )
 
     def get_window_usage(
@@ -573,20 +1154,37 @@ class QuotaStore:
             )
         )
 
-    def refresh_auto_status(self, user: UserRecord) -> UserRecord:
-        """Reactivate a prior automatic block after reset or a limit increase."""
-        if (
-            not user.active
+    @staticmethod
+    def _automatic_status_owned(user: UserRecord) -> bool:
+        return user.status_origin == "automatic" or (
+            user.status_origin == "legacy"
             and user.status_reason.startswith("auto:")
-            and not self.is_over_budget(user)
-        ):
-            self.set_user_status(
-                user.user_id, "active", "auto: current window is under quota"
+        )
+
+    def refresh_auto_status(self, user: UserRecord) -> UserRecord:
+        """Reactivate an owned automatic block after reset/limit increase."""
+        current = user
+        for _ in range(3):
+            if (
+                current.active
+                or not self._automatic_status_owned(current)
+                or self.is_over_budget(current)
+            ):
+                return current
+            changed = self.set_user_status(
+                current.user_id,
+                "active",
+                "auto: current window is under quota",
+                expected_version=current.version,
+                expected_status=current.status,
+                expected_reason=current.status_reason,
             )
-            refreshed = self.get_user(user.user_id)
+            refreshed = self.get_user(current.user_id)
             assert refreshed is not None
-            return refreshed
-        return user
+            if changed:
+                return refreshed
+            current = refreshed
+        return current
 
     @staticmethod
     def _is_sentinel(item: dict) -> bool:
@@ -621,19 +1219,206 @@ class QuotaStore:
         return users
 
     def list_users_page(
-        self, limit: int = 50, cursor: str | None = None
+        self,
+        limit: int = 50,
+        cursor: str | None = None,
+        *,
+        status: str | None = None,
+        query: str | None = None,
     ) -> tuple[list[UserRecord], str | None]:
-        scan_kwargs: dict = {"Limit": max(1, limit)}
-        if cursor:
+        normalized_query = (query or "").strip().casefold()
+        cursor_context = {
+            "kind": "users",
+            "status": status or "",
+            "query": normalized_query,
+        }
+        exclusive_key = self._decode_cursor(
+            cursor,
+            key_fields={"user_id"},
+            context=cursor_context,
+        )
+        users: list[UserRecord] = []
+        evaluated = 0
+        max_evaluated = min(1000, max(limit * 10, 100))
+        next_key = exclusive_key
+        while len(users) < limit and evaluated < max_evaluated:
+            chunk = min(max(limit - len(users), 1), max_evaluated - evaluated)
+            scan_kwargs: dict = {"Limit": chunk}
+            if next_key:
+                scan_kwargs["ExclusiveStartKey"] = next_key
             try:
-                scan_kwargs["ExclusiveStartKey"] = json.loads(cursor)
-            except (ValueError, TypeError) as exc:
+                response = self._users.scan(**scan_kwargs)
+            except ClientError as exc:
+                if exc.response.get("Error", {}).get("Code") != (
+                    "ValidationException"
+                ):
+                    raise
                 raise ValueError("invalid cursor") from exc
-        response = self._users.scan(**scan_kwargs)
-        users = [
-            self._to_user(item)
+            items = response.get("Items", [])
+            evaluated += len(items)
+            for item in items:
+                if self._is_sentinel(item):
+                    continue
+                user = self._to_user(item)
+                if status and user.status != status:
+                    continue
+                if normalized_query and normalized_query not in (
+                    f"{user.user_id}\n{user.name}".casefold()
+                ):
+                    continue
+                users.append(user)
+                if len(users) == limit:
+                    break
+            next_key = response.get("LastEvaluatedKey")
+            if not next_key:
+                break
+        return users, self._encode_cursor(next_key, cursor_context)
+
+    def get_usage_history_page(
+        self,
+        user_id: str,
+        *,
+        start: str,
+        end: str,
+        limit: int,
+        cursor: str | None = None,
+    ) -> tuple[list[dict], str | None]:
+        query_kwargs: dict = {
+            "KeyConditionExpression": (
+                "user_id = :user_id AND #window BETWEEN :start AND :end"
+            ),
+            "ExpressionAttributeNames": {"#window": "window"},
+            "ExpressionAttributeValues": {
+                ":user_id": user_id,
+                ":start": start,
+                ":end": end,
+            },
+            "ScanIndexForward": False,
+            "Limit": limit,
+        }
+        cursor_context = {
+            "kind": "usage-history",
+            "user_id": user_id,
+            "start": start,
+            "end": end,
+        }
+        key = self._decode_cursor(
+            cursor,
+            key_fields={"user_id", "window"},
+            context=cursor_context,
+        )
+        if key is not None:
+            if (
+                key["user_id"] != user_id
+                or not start <= key["window"] <= end
+            ):
+                raise ValueError("invalid cursor")
+            query_kwargs["ExclusiveStartKey"] = key
+        try:
+            response = self._usage.query(**query_kwargs)
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") != (
+                "ValidationException"
+            ):
+                raise
+            raise ValueError("invalid cursor") from exc
+        history = [
+            {
+                "user_id": user_id,
+                "window": str(item["window"]),
+                "cost_usd": int(item.get("cost_micro", 0)) / MICRO,
+                "input_tokens": int(item.get("input_tokens", 0)),
+                "output_tokens": int(item.get("output_tokens", 0)),
+                "requests": int(item.get("requests", 0)),
+            }
             for item in response.get("Items", [])
-            if not self._is_sentinel(item)
         ]
         last = response.get("LastEvaluatedKey")
-        return users, json.dumps(last) if last else None
+        return history, self._encode_cursor(last, cursor_context)
+
+    @staticmethod
+    def _json_safe(value):
+        if isinstance(value, Decimal):
+            return int(value) if value == value.to_integral_value() else float(value)
+        if isinstance(value, dict):
+            return {
+                key: QuotaStore._json_safe(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [QuotaStore._json_safe(item) for item in value]
+        return value
+
+    @staticmethod
+    def _public_audit_event(item: dict) -> dict:
+        return {
+            "user_id": str(item.get("subject_id", "")),
+            "event_key": str(item.get("event_key", "")),
+            "event_type": str(item.get("event_type", "")),
+            "actor": str(item.get("actor", "")),
+            "auth_method": str(item.get("auth_method", "")),
+            "reason": str(item.get("reason", "")),
+            "request_id": str(item.get("request_id", "")),
+            "created_at": str(item.get("created_at", "")),
+            "before": QuotaStore._json_safe(item.get("before")),
+            "after": QuotaStore._json_safe(item.get("after")),
+        }
+
+    def list_admin_audit_page(
+        self,
+        *,
+        user_id: str | None,
+        limit: int,
+        cursor: str | None = None,
+    ) -> tuple[list[dict], str | None]:
+        if user_id:
+            query_kwargs: dict = {
+                "KeyConditionExpression": "subject_id = :subject_id",
+                "ExpressionAttributeValues": {":subject_id": user_id},
+                "ScanIndexForward": False,
+                "Limit": limit,
+            }
+        else:
+            query_kwargs = {
+                "IndexName": "scope-event-key-index",
+                "KeyConditionExpression": "#scope = :scope",
+                "ExpressionAttributeNames": {"#scope": "scope"},
+                "ExpressionAttributeValues": {":scope": ADMIN_AUDIT_SCOPE},
+                "ScanIndexForward": False,
+                "Limit": limit,
+            }
+        cursor_context = {
+            "kind": "admin-audit",
+            "user_id": user_id or "",
+        }
+        key_fields = (
+            {"subject_id", "event_key"}
+            if user_id
+            else {"subject_id", "event_key", "scope"}
+        )
+        key = self._decode_cursor(
+            cursor,
+            key_fields=key_fields,
+            context=cursor_context,
+        )
+        if key is not None:
+            if user_id and key["subject_id"] != user_id:
+                raise ValueError("invalid cursor")
+            if not user_id and key["scope"] != ADMIN_AUDIT_SCOPE:
+                raise ValueError("invalid cursor")
+            query_kwargs["ExclusiveStartKey"] = key
+        try:
+            response = self._admin_audit.query(**query_kwargs)
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") != (
+                "ValidationException"
+            ):
+                raise
+            raise ValueError("invalid cursor") from exc
+        events = [
+            self._public_audit_event(item)
+            for item in response.get("Items", [])
+            if item.get("scope") == ADMIN_AUDIT_SCOPE
+        ]
+        last = response.get("LastEvaluatedKey")
+        return events, self._encode_cursor(last, cursor_context)
