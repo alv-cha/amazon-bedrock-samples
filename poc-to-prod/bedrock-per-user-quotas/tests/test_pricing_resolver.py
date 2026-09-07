@@ -80,9 +80,17 @@ def test_snapshot_uses_standard_prices_and_maps_all_model_ids():
         },
         {
             "anthropic.claude-opus-4-7": {
-                "input_per_mtok": 15,
-                "output_per_mtok": 75,
-            }
+                "input_per_mtok": 5,
+                "output_per_mtok": 25,
+            },
+            "global.anthropic.claude-opus-4-7": {
+                "input_per_mtok": 5,
+                "output_per_mtok": 25,
+            },
+            "us.anthropic.claude-opus-4-7": {
+                "input_per_mtok": 5.5,
+                "output_per_mtok": 27.5,
+            },
         },
     )
 
@@ -90,8 +98,16 @@ def test_snapshot_uses_standard_prices_and_maps_all_model_ids():
     assert snapshot["openai.gpt-oss-20b"] == expected
     assert snapshot["openai.gpt-oss-20b-1:0"] == expected
     assert snapshot["anthropic.claude-opus-4-7"] == {
-        "input_per_mtok": 15.0,
-        "output_per_mtok": 75.0,
+        "input_per_mtok": 5.0,
+        "output_per_mtok": 25.0,
+    }
+    assert snapshot["global.anthropic.claude-opus-4-7"] == {
+        "input_per_mtok": 5.0,
+        "output_per_mtok": 25.0,
+    }
+    assert snapshot["us.anthropic.claude-opus-4-7"] == {
+        "input_per_mtok": 5.5,
+        "output_per_mtok": 27.5,
     }
     assert pricing.calls[0]["ServiceCode"] == "AmazonBedrock"
 
@@ -139,3 +155,87 @@ def test_delete_does_not_query_pricing(monkeypatch):
         None,
     )
     assert result == {"PhysicalResourceId": "bedrock-model-prices-us-east-1"}
+
+
+class _FakeSsm:
+    def __init__(self):
+        self.puts = []
+
+    def put_parameter(self, **kwargs):
+        self.puts.append(kwargs)
+        return {"Version": len(self.puts)}
+
+
+def test_scheduled_refresh_writes_the_price_parameter(monkeypatch):
+    monkeypatch.setenv("PRICES_PARAMETER_NAME", "/quota/model-prices")
+    pricing = _FakePricing([
+        _product("in", "Input tokens", "0.0000700000"),
+        _product("out", "Output tokens", "0.0003000000"),
+    ])
+    ssm = _FakeSsm()
+
+    # EventBridge delivers the same properties shape as the deploy-time
+    # custom resource.
+    result = resolver.scheduled_handler(
+        {
+            "RegionCode": "us-east-1",
+            "CatalogModels": {"gpt-oss-20b": ["openai.gpt-oss-20b"]},
+            "PinnedPrices": {
+                "us.anthropic.claude-opus-4-7": {
+                    "input_per_mtok": 5.5,
+                    "output_per_mtok": 27.5,
+                }
+            },
+            "FallbackPrice": {
+                "input_per_mtok": 15.0,
+                "output_per_mtok": 75.0,
+            },
+        },
+        None,
+        pricing_client=pricing,
+        ssm_client=ssm,
+    )
+
+    assert result["models"] == 2
+    assert len(ssm.puts) == 1
+    put = ssm.puts[0]
+    assert put["Name"] == "/quota/model-prices"
+    assert put["Overwrite"] is True
+    value = json.loads(put["Value"])
+    assert value["models"]["openai.gpt-oss-20b"] == {
+        "input_per_mtok": 0.07,
+        "output_per_mtok": 0.3,
+    }
+    assert value["models"]["us.anthropic.claude-opus-4-7"] == {
+        "input_per_mtok": 5.5,
+        "output_per_mtok": 27.5,
+    }
+    # Conservative fallback is never lower than any known price.
+    assert value["fallback"] == {
+        "input_per_mtok": 15.0,
+        "output_per_mtok": 75.0,
+    }
+    assert value["resolved_at"]
+
+
+def test_scheduled_refresh_failure_leaves_parameter_unwritten(monkeypatch):
+    monkeypatch.setenv("PRICES_PARAMETER_NAME", "/quota/model-prices")
+    # Ambiguous catalog data must fail the refresh, not write bad prices.
+    pricing = _FakePricing([
+        _product("in-a", "Input tokens", "0.0000700000"),
+        _product("in-b", "Input tokens", "0.0000900000"),
+        _product("out", "Output tokens", "0.0003000000"),
+    ])
+    ssm = _FakeSsm()
+
+    with pytest.raises(ValueError):
+        resolver.scheduled_handler(
+            {
+                "RegionCode": "us-east-1",
+                "CatalogModels": {"gpt-oss-20b": ["openai.gpt-oss-20b"]},
+            },
+            None,
+            pricing_client=pricing,
+            ssm_client=ssm,
+        )
+    assert ssm.puts == []

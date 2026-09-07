@@ -1,6 +1,8 @@
 """Resolve standard on-demand Bedrock token prices during stack deployment."""
 
 import json
+import os
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import boto3
@@ -94,6 +96,28 @@ def conservative_fallback(snapshot: dict, configured: dict) -> dict:
     return fallback
 
 
+def _resolve(pricing_client, properties: dict) -> tuple[dict, dict]:
+    """Resolve (snapshot, fallback) from a CatalogModels/PinnedPrices dict.
+
+    The same shape arrives as CloudFormation ResourceProperties at deploy
+    time and as the EventBridge rule input on scheduled refreshes.
+    """
+    snapshot = resolve_snapshot(
+        pricing_client,
+        properties["RegionCode"],
+        properties["CatalogModels"],
+        properties.get("PinnedPrices", {}),
+    )
+    fallback = conservative_fallback(
+        snapshot,
+        properties.get(
+            "FallbackPrice",
+            {"input_per_mtok": 15.0, "output_per_mtok": 75.0},
+        ),
+    )
+    return snapshot, fallback
+
+
 def handler(event, _context):
     properties = event["ResourceProperties"]
     physical_id = f"bedrock-model-prices-{properties['RegionCode']}"
@@ -101,19 +125,7 @@ def handler(event, _context):
         return {"PhysicalResourceId": physical_id}
 
     client = boto3.client("pricing", region_name=PRICING_API_REGION)
-    snapshot = resolve_snapshot(
-        client,
-        properties["RegionCode"],
-        properties["CatalogModels"],
-        properties.get("PinnedPrices", {}),
-    )
-    fallback = conservative_fallback(
-        snapshot,
-        properties.get("FallbackPrice", {
-            "input_per_mtok": 15.0,
-            "output_per_mtok": 75.0,
-        }),
-    )
+    snapshot, fallback = _resolve(client, properties)
     return {
         "PhysicalResourceId": physical_id,
         "Data": {
@@ -125,3 +137,49 @@ def handler(event, _context):
             ),
         },
     }
+
+
+def scheduled_handler(event, _context, *, pricing_client=None, ssm_client=None):
+    """Refresh the model price parameter from the live Pricing API.
+
+    EventBridge invokes this daily with the same properties shape as the
+    deploy-time custom resource, so metering follows catalog price changes
+    without a redeploy. The metering Lambda keeps the last good parameter
+    value (and the deployment-time env snapshot before the first read), so
+    a failed refresh (this function raising) leaves the previous value in
+    place and alarms via the Lambda error metric instead of silently
+    mispricing.
+    """
+    parameter_name = os.environ["PRICES_PARAMETER_NAME"]
+    pricing = pricing_client or boto3.client(
+        "pricing", region_name=PRICING_API_REGION
+    )
+    ssm = ssm_client or boto3.client("ssm")
+    snapshot, fallback = _resolve(pricing, event)
+    resolved_at = datetime.now(timezone.utc).isoformat()
+    ssm.put_parameter(
+        Name=parameter_name,
+        Value=json.dumps(
+            {
+                "models": snapshot,
+                "fallback": fallback,
+                "resolved_at": resolved_at,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        Type="String",
+        Overwrite=True,
+    )
+    print(
+        json.dumps(
+            {
+                "level": "info",
+                "message": "Refreshed Bedrock model price parameter",
+                "parameter": parameter_name,
+                "models": len(snapshot),
+                "resolved_at": resolved_at,
+            }
+        )
+    )
+    return {"models": len(snapshot), "resolved_at": resolved_at}
