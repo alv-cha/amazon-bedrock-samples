@@ -78,12 +78,29 @@ outside this direct-to-Runtime architecture.
 | BedrockUserRole | Runtime-only permissions restricted by model ARN and permissions boundary |
 | Users table | Identity, status, limits, logical leases, session maps, control state |
 | Usage table | Daily aggregates and invocation idempotency markers |
+| Admin audit table | Routine mutation audit events and idempotency records (365-day retention) |
 | Invocation logging | Trusted principal ARN, model, request ID, and tokens |
 | Usage processor | Event-driven pricing, deduplication, counters, blocking, detection-lag metric |
 | Revocation processor | Optional sharded `SourceIdentity` deny reconciliation |
 | Emergency processor | Operator-controlled role-wide deny state machine |
 | CloudWatch/SNS | Operational metrics, alarms, warnings, and block notifications |
 | Admin UI | User controls plus read-only enforcement, emergency, revocation, alarm/DLQ, and qualification status |
+
+The admin UI uses Cognito managed login with authorization-code + PKCE, then
+exchanges the current ID token through the Identity Pool for temporary AWS
+credentials. It remains an `AWS_IAM`/SigV4 client; the browser never receives
+the shared routine or break-glass key. The same secretless User Pool client and
+JWT audience retain `USER_SRP_AUTH` and `USER_PASSWORD_AUTH` for the
+notebook/CLI programmatic flows.
+
+The Users view uses 25-row server pagination and server-side search/status
+filters. It includes a conditional-create wizard, reasoned block/unblock,
+versioned limit editing with optional audit reasons, and a detail drawer for
+retained usage and per-user changes. A non-empty reason is required when a
+positive limit becomes Unlimited or a submitted finite limit is below current
+usage; other limit reasons remain optional. A separate global Audit view shows
+routine administrative changes. Independent failures leave only the affected
+view visibly stale.
 
 The admin UI's Operations panel is read-only. The broker reads CloudWatch
 metrics and alarm state server-side with `GetMetricData` and `DescribeAlarms`;
@@ -94,8 +111,26 @@ policy controls, or emergency/revocation mutation buttons. Missing metrics and
 CloudWatch is the observability system. DynamoDB remains necessary because the
 broker needs a low-latency quota decision when credentials are requested.
 
-An admin API limit of `0` disables that one dimension. Declarative deployment
-defaults must be positive so auto-provisioning cannot create unlimited users.
+An admin API limit of `0` disables that one dimension and is displayed as
+**Unlimited**. The UI requires explicit confirmation and a non-empty reason
+before a positive limit becomes Unlimited. It also requires a reason for any
+submitted finite limit below current usage; reasons are optional for other
+limit changes. Declarative deployment defaults must be positive so
+auto-provisioning cannot create unlimited users accidentally.
+
+Routine creates are conditional: an existing identity returns
+`409 user_already_exists` and is never overwritten. Every routine mutation
+uses a UUID `Idempotency-Key`; limit and status changes also use `If-Match`
+with the reviewed ETag/version. Successful writes return the complete canonical
+user and a new ETag. The conditional/idempotency headers and complete response
+fields are additive for compatible update/status clients, while duplicate
+create is intentionally no longer an upsert. Safe clients surface every
+version, duplicate, and idempotency conflict for review.
+Routine create/limit/status audit begins when the audit-table deployment is
+installed, is currently retained for 365 days, and has no historical backfill.
+
+Temporary overrides, bulk operations, browser emergency mutation, user delete,
+and usage reset are explicitly outside this MVP.
 
 ## Identity
 
@@ -106,7 +141,10 @@ defaults must be positive so auto-provisioning cannot create unlimited users.
 
 The broker derives a collision-resistant STS session name from the claim.
 Bedrock invocation logging captures that session in `identity.arn`; a temporary
-DynamoDB reverse map resolves it to the original claim value.
+DynamoDB reverse map resolves it to the original claim value. Routine JWT
+administrative audit uses the verified token `sub` as the human actor when it
+is a non-empty string, independent of a tenant/team/project quota claim; it
+falls back to the configured quota identity only when `sub` is unavailable.
 
 `requestMetadata` is useful for analysis but is caller-controlled and is not
 trusted for enforcement attribution.
@@ -134,15 +172,66 @@ prevents retries from charging a request twice.
 Prices are captured once during deployment from AWS Price List. There is no
 periodic price refresh.
 
-- GPT OSS standard on-demand prices are resolved dynamically.
-- Models that cannot be resolved can use explicit overrides.
-- Unknown model IDs use the configured conservative fallback.
+- GPT OSS standard on-demand prices are resolved dynamically for the stack
+  Region. In `us-east-1`, the official Price List API currently returns
+  `$0.07/$0.30` per MTok for 20B and `$0.15/$0.60` for 120B
+  (input/output).
+- Claude Opus 4.7 is billed through AWS Marketplace and uses explicit profile
+  mappings: direct/global `$5/$25` per MTok and US geographic profile
+  `us.anthropic.claude-opus-4-7` `$5.50/$27.50` per MTok.
+- Model and inference-profile IDs are matched literally. A known profile must
+  have its exact ID in the snapshot; prefixes such as `us.` and `global.` are
+  not stripped or inferred.
+- Unknown model IDs use the configured conservative `$15/$75` fallback. This
+  is a conservative estimate, not the advertised price of Opus 4.7 or a
+  guaranteed upper bound.
+
+Authoritative references: [Amazon Bedrock pricing](https://aws.amazon.com/bedrock/pricing/),
+[Claude Opus 4.7 model card](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-4-7.html),
+and [Global cross-Region inference pricing behavior](https://docs.aws.amazon.com/bedrock/latest/userguide/global-cross-region-inference.html).
+
+### Export the complete regional price catalog
+
+`tools/bedrock_price_catalog.py` downloads the official public AWS Price List
+bulk offer and exports every model-related price dimension, grouped by Region.
+It requires no AWS credentials and preserves token, image, video, request,
+hourly, and model-month units instead of assuming that every price is per
+input/output token.
+
+```bash
+# All model prices in all published Regions.
+python3 tools/bedrock_price_catalog.py \
+  --output /tmp/bedrock-prices.json
+
+# One Region, as CSV.
+python3 tools/bedrock_price_catalog.py \
+  --region eu-south-2 \
+  --format csv \
+  --output /tmp/bedrock-prices-eu-south-2.csv
+
+# Only rows that can feed the current input/output token calculator.
+python3 tools/bedrock_price_catalog.py \
+  --region us-east-1 \
+  --metering-compatible \
+  --output /tmp/bedrock-metering-prices-us-east-1.json
+```
+
+The export includes the AWS catalog version and publication timestamp. The
+`metering_compatible` marker means that a row has a standard on-demand USD
+input/output token rate; it does not establish a mapping from the Price List
+model name to a Bedrock Runtime model or inference-profile ID. Keep those
+aliases explicit in `cdk/config/model-pricing.json`.
 
 At deployment, the fallback is raised to at least the highest input and output
 rates in the known snapshot. It can therefore overestimate an unknown model
 and block a user earlier than the final AWS bill. It is not a universal billing
 upper bound: production must review it when allowing a more expensive model or
-a modality that is not priced by input/output tokens.
+a modality that is not priced by input/output tokens. A daily scheduled
+refresh keeps catalog prices current in an SSM parameter, and any request
+priced by the fallback raises the `pricing_fallback` alarm instead of being
+silently tarified. Updating prices
+affects only future invocation events; existing daily DynamoDB aggregates and
+blocked status are not repriced automatically.
 
 USD quotas are estimates against the deployed catalog, not a billing
 guarantee. Prompt caching, service tiers, provisioned throughput, tools, and
@@ -212,7 +301,13 @@ diagnostic; it is not part of enforcement.
 
 ## Administrative client
 
-The existing SigV4 client manages all three limits:
+The SigV4 client manages all three limits. Routine writes generate a UUID
+`Idempotency-Key`; `update-user`, `block-user`, and `unblock-user` first fetch
+the exact user and send its ETag (or canonical integer version) as `If-Match`.
+`update-user` accepts an optional `--reason` and omits the field when not
+supplied. A concurrent change therefore returns `409 version_conflict` instead
+of being silently overwritten. Create is conditional and returns `409
+user_already_exists` without changing the existing row.
 
 ```bash
 python examples/sigv4_gateway.py \
@@ -226,12 +321,42 @@ python examples/sigv4_gateway.py \
   --daily-output-tokens 200000
 ```
 
+The notebook uses the same safe routine-write flow and performs an exact GET
+before deciding whether to create, so rerunning it does not rely on duplicate
+POST upsert behavior. Status changes and the baseline, low-quota, recovery,
+and controlled stress limit writes carry explicit reasons. Limit reasons are
+optional for compatible API and CLI clients; omitted or blank values use the
+standardized legacy audit fallback.
+
+The canonical exact-user route family is:
+
+- `GET /admin/user?user_id=<encoded>` for detail.
+- `PUT /admin/user/limits?user_id=<encoded>` for limits.
+- `PUT /admin/user/status?user_id=<encoded>` for status.
+- `GET /admin/user/usage?user_id=<encoded>&window=...` for usage.
+- `/admin/user/usage-history` and `/admin/user/audit` with the same `user_id`
+  query parameter for retained history and per-user audit.
+
+First-party clients pass the raw identity as a request parameter and let the
+HTTP client encode it once before SigV4 signing. The legacy-compatible
+`/admin/users/{id}` route and its suffixes remain available, but are ambiguous
+for path-like identities containing values such as `/audit` or `/usage` and
+are not the preferred first-party form.
+
+User listing supports server cursors plus status/search filters; the UI fixes
+its page size at 25. Successful mutations return the complete canonical user,
+`ETag`, and `X-Request-Id`. The global Audit view has an explicit refresh and
+its own last-successful freshness/error state. Routine audit retention is 365
+days from event creation and begins at deployment—earlier changes are not
+backfilled.
+
 Commands: `create-user`, `list-users`, `update-user`, `block-user`,
 `unblock-user`, `get-usage`, `emergency-stop`, and `emergency-recover`.
-Emergency commands require the separate `EmergencyKeySecretArn`, a reason,
-and the API's explicit confirmation phrase; routine admin keys/JWTs cannot
-invoke them. Triggering one affects every vended session and must be an
-operator break-glass decision.
+Emergency commands use a separate route and require the separate
+`EmergencyKeySecretArn`, a reason, and the API's explicit confirmation phrase;
+routine admin/conditional/idempotency headers are not sent to that route.
+Triggering one affects every vended session and must be an operator break-glass
+decision.
 
 ## Repository layout
 

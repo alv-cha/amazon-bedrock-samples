@@ -29,6 +29,17 @@ file's status without attaching the probe output and target account/Region.
 - One-minute lease, invocation-log latency/load, revocation, in-flight stream,
   and emergency mutation tests: not run
 
+## Pricing correction impact (2026-09-01)
+
+The first successful Opus stress run was priced through the conservative
+`$15/$75` fallback because `us.anthropic.claude-opus-4-7` was absent from the
+snapshot. Its 4,896 input + 139,264 output tokens were recorded as `$10.51824`.
+Using the corrected US geographic-profile rates `$5.50/$27.50`, the same token
+base is `$3.856688` (a `-$6.661552` correction) and would not cross the `$10`
+quota. That historical DynamoDB aggregate and blocked status are not rewritten
+by a pricing deployment; a new stress identity is required for clean evidence
+unless an explicit data migration is approved.
+
 ## Current decision matrix
 
 | Mechanism | Local status | Live status | Deployment decision |

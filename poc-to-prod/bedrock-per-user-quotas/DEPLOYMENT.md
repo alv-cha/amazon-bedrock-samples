@@ -17,6 +17,7 @@ sample.
 | Auto-provisioning | Enabled | Usually disabled |
 | Function URL callers | Account default | Explicit backend/admin role ARNs |
 | Usage retention | 35 days | Policy-defined value |
+| Routine admin audit | Fixed 365 days from deployment; no backfill | Fixed 365 days from deployment; no backfill |
 | DynamoDB deletion | `DESTROY` | `RETAIN` |
 | Alerts | Personal email | Operations topic/email |
 | Admin UI | Stack-created Cognito path | Integrate corporate IdP and Identity Pool |
@@ -95,6 +96,59 @@ Direct `-c key=value` values override the file.
 | `snapstart` | `false` | Enable Python Lambda SnapStart for the broker |
 | `adapter_layer_arn` | regional default | Override Lambda Web Adapter layer |
 
+### Safe routine administration
+
+The routine API remains behind the `AWS_IAM` Function URL. Browser requests are
+SigV4-signed with temporary Identity Pool credentials and carry the current ID
+token in `X-Quota-User-Token`; trusted programmatic clients may use the shared
+routine key. The demo browser authenticates with Cognito managed login using an
+authorization-code + PKCE flow. Its secretless app client still enables
+`USER_SRP_AUTH` and `USER_PASSWORD_AUTH` for the notebook/CLI and keeps the
+same client ID as the gateway JWT audience.
+
+Routine create is conditional. `POST /admin/users` returns `409
+user_already_exists`, the current user, and its ETag rather than overwriting an
+existing row. Every safe mutation sends a UUID `Idempotency-Key`; limit and
+status changes also send `If-Match` with the reviewed ETag/version. Successful
+writes return the complete canonical user plus `ETag` and `X-Request-Id`.
+Duplicate-content replay is safe; changed content under the same key,
+duplicate create, and stale version each have a distinct `409` code. The new
+headers and complete response fields are additive for compatible clients, but
+clients that want concurrency/retry safety must send and retain them.
+
+The dedicated `AdminAuditTable` stores routine create, limit, and status audit
+events plus mutation idempotency records. Limit events persist a trimmed
+operator reason when supplied; omitted or blank reasons from compatible legacy
+clients use a standardized fallback. The broker currently sets their TTL to
+365 days. Collection starts when this deployment is installed; earlier
+administrative changes do not exist and are not backfilled. This is distinct
+from `usage_retention_days`, which bounds usage history.
+
+`GET /admin/users` supports bounded server pages, opaque cursors, status, and
+search filters. Canonical exact-user operations use query routes:
+
+- `GET /admin/user?user_id=<encoded>` for detail.
+- `PUT /admin/user/limits?user_id=<encoded>` for limits.
+- `PUT /admin/user/status?user_id=<encoded>` for status.
+- `GET /admin/user/usage?user_id=<encoded>&window=...` for usage.
+- `GET /admin/user/usage-history?user_id=<encoded>` for retained history.
+- `GET /admin/user/audit?user_id=<encoded>` for per-user audit.
+
+First-party clients pass the raw identity through request parameters so it is
+encoded once before signing. `/admin/users/{id}` and its exact-user suffixes
+remain legacy-compatible, but path-like identities containing values such as
+`/audit` or `/usage` are ambiguous in that form. Global audit remains
+`GET /admin/audit`. The UI uses 25-row pages, gives global Audit an explicit
+refresh, and preserves independent last-successful freshness/error state for
+each surface.
+
+A limit of `0` means **Unlimited** for that one dimension. The UI requires
+explicit confirmation plus a non-empty reason when a positive limit becomes
+Unlimited. It also requires a reason for a submitted finite limit below
+current usage; other limit reasons are optional. Deployment defaults remain
+positive. Temporary overrides, bulk operations, browser emergency mutation,
+user delete, and usage reset are not part of this MVP.
+
 ### Read-only Operations panel
 
 `GET /admin/operations` uses the routine admin authorization path and powers a
@@ -120,10 +174,6 @@ revocation, and emergency live qualification remain pending until recorded in
 Legacy `mode_a_allowed_model_arns` is accepted as an alias for
 `allowed_model_arns`. Former dual-mode keys synthesize only for migration and
 are ignored with a warning. Remove them.
-
-For limits changed through the admin API, `0` disables that individual quota
-dimension. Deployment defaults must remain positive so auto-provisioned users
-never become unlimited accidentally.
 
 ### Upgrading the former dual-mode stack
 
@@ -249,9 +299,17 @@ temporary STS credentials and SigV4.
     "price-list-model-name": ["runtime-model-id"]
   },
   "price_overrides": {
-    "model-without-resolvable-standard-price": {
-      "input_per_mtok": 15,
-      "output_per_mtok": 75
+    "anthropic.claude-opus-4-7": {
+      "input_per_mtok": 5,
+      "output_per_mtok": 25
+    },
+    "global.anthropic.claude-opus-4-7": {
+      "input_per_mtok": 5,
+      "output_per_mtok": 25
+    },
+    "us.anthropic.claude-opus-4-7": {
+      "input_per_mtok": 5.5,
+      "output_per_mtok": 27.5
     }
   },
   "fallback_price": {
@@ -261,17 +319,69 @@ temporary STS credentials and SigV4.
 }
 ```
 
-AWS Price List is queried once during deployment. The resulting snapshot is
-injected only into the usage processor. No scheduled refresh exists.
+AWS Price List is queried during deployment and the resulting snapshot seeds
+an SSM parameter plus a usage-processor environment fallback. A daily
+EventBridge schedule re-resolves catalog prices and rewrites the parameter,
+so Pricing API changes reach metering without a redeploy; if Parameter Store
+or a refresh fails, metering continues on the deployment snapshot and the
+refresh failure surfaces through the Lambda error metric. Current official
+standard rates in `us-east-1` are resolved dynamically for GPT OSS
+20B (`$0.07/$0.30` input/output per MTok) and 120B (`$0.15/$0.60`). Claude
+Opus 4.7 is billed through Marketplace, so this sample pins its exact runtime
+IDs: direct/global `$5/$25`, and US geographic profile `$5.50/$27.50` per
+MTok. Every `price_overrides` entry must document a `reason` explaining why
+the Pricing API cannot price it; synthesis fails otherwise. See
+[Amazon Bedrock pricing](https://aws.amazon.com/bedrock/pricing/),
+the [Opus 4.7 model card](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-4-7.html),
+and [global CRIS pricing behavior](https://docs.aws.amazon.com/bedrock/latest/userguide/global-cross-region-inference.html).
+
+The usage processor first performs an exact lookup of the `modelId` emitted
+by invocation logging, so an explicit profile entry (for example the US
+geographic uplift) always wins. An unmatched geographic or cross-Region
+profile ID (`us.`, `eu.`, `apac.`, `global.`, ...) then resolves to its base
+foundation-model price before the conservative fallback applies. Requests
+priced by the fallback emit the `FallbackPricedRequests` metric and raise the
+`pricing_fallback` alarm shown in the admin console Operations panel.
+
+#### Discover all published regional prices
+
+Use the credential-free exporter from the repository root:
+
+```bash
+# Complete JSON catalog, grouped by all Regions published by AWS Price List.
+python3 tools/bedrock_price_catalog.py \
+  --output /tmp/bedrock-prices.json
+
+# Review the standard token rows relevant to this metering implementation.
+python3 tools/bedrock_price_catalog.py \
+  --region us-east-1 \
+  --metering-compatible \
+  --format csv \
+  --output /tmp/bedrock-metering-us-east-1.csv
+```
+
+The source is the [official AWS Price List bulk offer](https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonBedrock/current/index.json).
+The exported metadata records its immutable catalog version and publication
+time. Each normalized row retains Region, model, provider, SKU, feature,
+service tier, inference/token type, routing, term, unit, currency, unit price,
+and the original product attributes.
+
+Do not inject the complete catalog into `MODEL_PRICES_JSON`: it contains many
+Regions and incompatible units and can exceed CloudFormation and Lambda
+environment limits. Use it for discovery/audit, then map only the exact Runtime
+model and inference-profile IDs needed by the deployed Region. `--metering-compatible`
+selects the standard on-demand input/output USD token rows and computes
+`price_per_million_tokens`, but it deliberately does not guess Runtime IDs.
 
 An unknown ID is charged at the fallback, which deployment raises to at least
-the highest input and output rates in the known snapshot. This can make USD
-usage higher than the final bill. It is not a universal upper bound for a more
-expensive model or a modality that is not billed by input/output tokens.
-Review pricing before adding models, inference profiles, service tiers, prompt
-caching, provisioned throughput, image/video generation, or separately billed
-tools. Add every model ID or profile ARN emitted by invocation logging to the
-pricing mapping when accurate USD enforcement is required.
+the highest input and output rates in the known snapshot. The configured
+`$15/$75` fallback is deliberately conservative and is not the Opus 4.7 list
+price. It can make USD usage higher than the final bill. It is not a universal
+upper bound for a more expensive model or a modality that is not billed by
+input/output tokens. Review pricing before adding models, inference profiles,
+service tiers, prompt caching, provisioned throughput, image/video generation,
+or separately billed tools. Updating pricing changes future events only;
+existing DynamoDB daily aggregates and blocked status are not repriced.
 
 ### Invocation logging ownership
 
@@ -422,9 +532,24 @@ aws cognito-idp admin-add-user-to-group \
   --group-name quota-admins
 ```
 
-Open the `AdminUiUrl` output. The deployment writes `config.js` with the
-generated broker URL, Region, user pool/client, and identity pool. It contains
-no secret. Sign in as `quota-admin` or its verified `admin@example.com` alias.
+Open the `AdminUiUrl` output. For an admin-UI deployment, expect
+`DemoUserPoolId`, `DemoUserPoolClientId`, `AdminIdentityPoolId`, and
+`AdminUiUrl` outputs plus an `AdminAuditTable` CloudFormation resource. The
+routine audit table is not a substitute for historical records: it begins
+collecting at this deployment and retains new events for 365 days.
+
+The deployment writes `config.js` with public identifiers only: broker URL,
+Region, User Pool/client, Identity Pool, Cognito managed-login domain, and
+Cognito issuer. It contains no client secret, JWT, shared admin key, emergency
+key, or AWS credentials. The registered callback is
+`AdminUiUrl/auth/callback` and logout returns to `AdminUiUrl/`. Sign in as
+`quota-admin` or its verified `admin@example.com` alias; the browser starts an
+authorization-code + PKCE managed-login flow. The UI content security policy
+must allow both the regional Lambda Function URL destination
+`https://*.lambda-url.<region>.on.aws` and the regional Cognito Identity
+endpoint `https://cognito-identity.<region>.<AWS URL suffix>` in `connect-src`.
+The first permits the signed broker request; the second permits credential
+bootstrap before that request.
 
 ### 6. Administrative smoke test
 
@@ -448,6 +573,22 @@ cdk/.venv/bin/python examples/sigv4_gateway.py \
   --admin-key "$ADMIN_KEY" \
   list-users
 ```
+
+Use a new identity for the create smoke test. Rerunning the same create is an
+expected `409 user_already_exists`; it never resets the existing status or
+limits. The client automatically adds UUID idempotency and calls
+`GET /admin/user?user_id=...` before update/block/unblock. It then uses
+`PUT /admin/user/limits?user_id=...` or
+`PUT /admin/user/status?user_id=...` with the current `If-Match` value.
+`get-usage` uses `GET /admin/user/usage?user_id=...&window=...`. User IDs are
+supplied as raw query values and encoded once by the signed HTTP client. Do not
+treat duplicate, version, or idempotency conflicts as success.
+
+In the UI, verify 25-row server pagination/search, explicit Unlimited
+confirmation, required reasons for Unlimited and finite-below-usage changes,
+optional reasons for ordinary limit edits, reasoned status changes, the detail
+Usage/Changes views, and the global Audit log. Operations and emergency state
+remain read-only.
 
 ### 7. Runtime smoke test
 
@@ -478,6 +619,15 @@ cdk/.venv/bin/python examples/sigv4_gateway.py \
 
 For the complete enforcement smoke test, run
 [`notebook/per_user_quota_demo.ipynb`](notebook/per_user_quota_demo.ipynb).
+The notebook intentionally uses `USER_PASSWORD_AUTH` with the same secretless
+app client/audience used by managed login. It reads exact quota users through
+`GET /admin/user?user_id=...`, so reruns load an existing user and only POST on
+an explicit 404. Limit/status writes and usage reads use the canonical singular
+query routes with raw identities supplied through request parameters. Every
+routine write uses UUID idempotency, and each PUT refreshes ETag/version before
+sending `If-Match`. Its baseline, low-quota, recovery, and controlled stress
+limit writes include explicit audit reasons.
+
 Its main path:
 
 1. Reads the identity's current daily aggregate.
@@ -609,16 +759,20 @@ Identity Pool that trusts the OIDC provider, grant its authenticated admin role
 window.QUOTA_ADMIN_CONFIG = {
   gatewayUrl: "BROKER_API_URL",
   region: "us-east-1",
-  userPoolId: "YOUR_AUTH_PROVIDER_CONFIGURATION",
+  userPoolId: "YOUR_COGNITO_USER_POOL_ID",
   userPoolClientId: "YOUR_CLIENT_ID",
-  identityPoolId: "YOUR_IDENTITY_POOL_ID"
+  identityPoolId: "YOUR_IDENTITY_POOL_ID",
+  cognitoDomain: "https://YOUR_DOMAIN.auth.us-east-1.amazoncognito.com",
+  cognitoIssuer: "https://cognito-idp.us-east-1.amazonaws.com/YOUR_USER_POOL_ID"
 };
 ```
 
-The current React login implementation targets Cognito User Pools. Replacing
-`admin-ui/src/auth.ts` with the customer's OIDC login is an integration task,
-not a change to quota enforcement. The separately hosted UI also requires the
-Function URL CORS policy to allow its exact HTTPS origin and the SigV4 headers;
+The current React login implementation targets Cognito User Pools managed
+login with authorization-code + PKCE and requires exact HTTPS callback/logout
+URLs. Its public `config.js` must contain the Cognito domain and issuer shown
+above, but no client secret or other secret. Replacing `admin-ui/src/auth.ts`
+with the customer's OIDC login is an integration task, not a change to quota
+enforcement. The separately hosted UI also requires the Function URL CORS policy to allow its exact HTTPS origin and the SigV4 headers;
 the stack configures this automatically only for its own demo CloudFront
 distribution. Do not use a wildcard production origin. The shared admin key is
 for trusted CLI or backend use and must never be embedded in the browser.
@@ -685,8 +839,29 @@ Verify all of the following:
     removes the deny before reopening vending.
 14. Unknown models use the configured conservative fallback.
 15. Destroy testing confirms production tables are retained.
+16. Managed login completes authorization-code + PKCE while the same app
+    client still issues the notebook's `USER_PASSWORD_AUTH` token/audience.
+17. Duplicate create preserves the existing user; stale `If-Match` and changed
+    idempotency reuse return distinct `409` errors; an exact replay is stable.
+18. Successful routine writes return the complete canonical user/new ETag and
+    appear in per-user/global audit. Confirm a supplied limit reason is trimmed
+    and persisted, an omitted reason uses the compatibility fallback, and the
+    audit window begins at this deployment and expires after the configured
+    fixed 365-day period.
+19. Server-paginated user search and retained usage/audit history preserve
+    cursors and independent stale states.
 
 ## Administrative commands
+
+The client generates a new UUID idempotency key for each routine mutation.
+Update/block/unblock automatically call `GET /admin/user?user_id=...` first
+and send the returned ETag/version as `If-Match` to the canonical limit/status
+query route; `get-usage` calls
+`GET /admin/user/usage?user_id=...&window=...`. A race still surfaces as an
+HTTP failure with conflict guidance. Status commands send a reason. `update-user`
+accepts an optional `--reason`, includes it only when supplied, and the backend
+stores its trimmed value with the immutable limit audit event. Omitted or blank
+reasons use the standardized legacy fallback.
 
 ```bash
 # Create
@@ -707,7 +882,8 @@ python examples/sigv4_gateway.py \
   --gateway-url "$BROKER_API_URL" --profile "$AWS_PROFILE" \
   --region "$AWS_REGION" --admin-key "$ADMIN_KEY" \
   update-user tenant-acme --daily-usd 30 \
-  --daily-input-tokens 12000000 --daily-output-tokens 2500000
+  --daily-input-tokens 12000000 --daily-output-tokens 2500000 \
+  --reason "Reviewed annual allocation"
 
 # Block
 python examples/sigv4_gateway.py \
