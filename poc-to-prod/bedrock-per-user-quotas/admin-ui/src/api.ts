@@ -176,6 +176,15 @@ export interface UsageTotals {
   requests: number;
 }
 
+export interface LeaseState {
+  active: boolean;
+  expires_at: string;
+  refresh_after: string | null;
+  generation: number;
+  granted_at: string;
+  lease_seconds: number;
+}
+
 export interface AdminUser {
   user_id: string;
   name: string;
@@ -186,6 +195,7 @@ export interface AdminUser {
   created_at: string | null;
   updated_at: string | null;
   limits: QuotaLimits;
+  lease?: LeaseState | null;
 }
 
 export interface UserRow extends AdminUser {
@@ -442,7 +452,19 @@ export function isAdminUser(value: unknown): value is AdminUser {
     isNonNegativeInteger(value.version) &&
     hasNullableString(value, "created_at") &&
     hasNullableString(value, "updated_at") &&
-    isQuotaLimits(value.limits);
+    isQuotaLimits(value.limits) &&
+    isNullableLeaseState((value as { lease?: unknown }).lease);
+}
+
+function isNullableLeaseState(value: unknown): value is LeaseState | null | undefined {
+  if (value === null || value === undefined) return true;
+  return isObject(value) &&
+    hasBoolean(value, "active") &&
+    hasString(value, "expires_at") &&
+    hasNullableString(value, "refresh_after") &&
+    isNonNegativeInteger(value.generation) &&
+    hasString(value, "granted_at") &&
+    hasNumber(value, "lease_seconds");
 }
 
 function isUserRow(value: unknown): value is UserRow {
@@ -641,6 +663,15 @@ export const api = {
       { validate: isUserListResponse },
     )).data;
   },
+
+  leaseSnapshot: async (cfg: AdminConfig, session: Session): Promise<UserListResponse> =>
+    (await transport<UserListResponse>(
+      cfg,
+      session,
+      "GET",
+      "/admin/users?limit=50",
+      { validate: isUserListResponse },
+    )).data,
 
   createUser: (
     cfg: AdminConfig,

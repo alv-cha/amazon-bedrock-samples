@@ -77,6 +77,9 @@ class UserRecord:
     created_at: str | None = None
     updated_at: str | None = None
     status_origin: str = "legacy"
+    lease_expires_at_epoch: int | None = None
+    lease_refresh_after_epoch: int | None = None
+    lease_generation: int | None = None
 
     @property
     def active(self) -> bool:
@@ -1120,6 +1123,21 @@ class QuotaStore:
                 str(item["updated_at"]) if item.get("updated_at") else None
             ),
             status_origin=str(item.get("status_origin", "legacy")),
+            lease_expires_at_epoch=(
+                int(item["lease_expires_at_epoch"])
+                if item.get("lease_expires_at_epoch") is not None
+                else None
+            ),
+            lease_refresh_after_epoch=(
+                int(item["lease_refresh_after_epoch"])
+                if item.get("lease_refresh_after_epoch") is not None
+                else None
+            ),
+            lease_generation=(
+                int(item["lease_generation"])
+                if item.get("lease_generation") is not None
+                else None
+            ),
         )
 
     def get_window_usage(

@@ -35,7 +35,7 @@ import {
   type UserRow,
   type UserStatus,
 } from "./api";
-import { CreateUserWizard, GlobalAuditView, UserDetailDrawer } from "./OperationalUi";
+import { CreateUserWizard, GlobalAuditView, LiveLeases, UserDetailDrawer } from "./OperationalUi";
 import { useModalLifecycle } from "./modal";
 
 export type UserFilter = "all" | "active" | "blocked";
@@ -365,7 +365,7 @@ export function Dashboard({
             )}
             {summary ? <SummaryPanel summary={summary} /> : summaryLoading ? <SummarySkeleton /> : <UnavailableState label="Summary unavailable" />}
 
-            <OperationsPanel error={operationsError} loading={operationsLoading} operations={operations} stale={operationsStale} />
+            <OperationsPanel cfg={cfg} error={operationsError} loading={operationsLoading} operations={operations} session={session} stale={operationsStale} />
 
             <UsersPanel
               cfg={cfg}
@@ -477,14 +477,18 @@ function SummaryPanel({ summary }: { summary: Summary }) {
 }
 
 function OperationsPanel({
+  cfg,
   error,
   loading,
   operations,
+  session,
   stale,
 }: {
+  cfg: AdminConfig;
   error: string;
   loading: boolean;
   operations: Operations | null;
+  session: Session;
   stale: boolean;
 }) {
   if (loading && !operations) {
@@ -615,6 +619,8 @@ function OperationsPanel({
           <OperationsRow label="Emergency failures" value={metrics.recent_emergency_failure_count === null ? "No data" : metrics.recent_emergency_failure_count.toLocaleString()} />
         </OperationsCard>
       </div>
+
+      <LiveLeases cfg={cfg} configuration={config} session={session} />
 
       <div className="alarm-strip" aria-label="Operational alarms">
         <div className="alarm-title"><BellRing aria-hidden="true" size={16} /><strong>Alarms and DLQs</strong></div>

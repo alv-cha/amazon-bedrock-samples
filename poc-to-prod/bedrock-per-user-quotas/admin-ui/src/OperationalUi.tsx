@@ -25,6 +25,7 @@ import {
   type AuditUserSnapshot,
   type CreateUserRequest,
   type QuotaLimits,
+  type Operations,
   type UsageHistoryResponse,
   type UserAuditListResponse,
   type UserRow,
@@ -564,4 +565,105 @@ export function GlobalAuditView({ cfg, session, onTargetUser }: { cfg: AdminConf
     {error && loadedAt !== null && <span className="ops-status ops-status-amber audit-stale" role="status"><span aria-hidden="true" />Showing cached audit data loaded {loadedAt}.</span>}
     {loading && lastSuccessfulAt === null ? <div className="audit-loading"><BusyLabel>Loading audit log</BusyLabel></div> : lastSuccessfulAt !== null ? <><AuditTable events={events} label="Global administrative audit log" onTarget={onTargetUser} /><Pagination busy={loading} hasNext={Boolean(nextCursor)} hasPrevious={pageIndex > 0} label={`${events.length} events on this page`} onNext={() => nextCursor && void load({ cursor: nextCursor, targetIndex: pageIndex + 1, reset: false })} onPrevious={() => void load({ cursor: cursors[pageIndex - 1], targetIndex: pageIndex - 1, reset: false })} /></> : <div className="compact-empty">The audit log could not be loaded. Retry the request.</div>}
   </section>;
+}
+
+export function LiveLeases({ cfg, configuration, session }: {
+  cfg: AdminConfig;
+  configuration: Operations["configuration"];
+  session: Session;
+}) {
+  const [rows, setRows] = useState<UserRow[]>([]);
+  const [loaded, setLoaded] = useState(false);
+  const [now, setNow] = useState(() => Date.now());
+  const generations = useRef<Record<string, number>>({});
+  const renewedAt = useRef<Record<string, number>>({});
+
+  useEffect(() => {
+    let cancelled = false;
+    async function poll() {
+      try {
+        const page = await api.leaseSnapshot(cfg, session);
+        if (cancelled) return;
+        for (const user of page.users) {
+          const generation = user.lease?.generation;
+          if (generation !== undefined && generations.current[user.user_id] !== undefined
+              && generation > generations.current[user.user_id]) {
+            renewedAt.current[user.user_id] = Date.now();
+          }
+          if (generation !== undefined) generations.current[user.user_id] = generation;
+        }
+        setRows(page.users);
+        setLoaded(true);
+      } catch {
+        // Keep the previous rows; the next poll retries.
+      }
+    }
+    void poll();
+    const interval = window.setInterval(poll, 5000);
+    return () => { cancelled = true; window.clearInterval(interval); };
+  }, [cfg, session]);
+
+  useEffect(() => {
+    const tick = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(tick);
+  }, []);
+
+  const leaseSeconds = configuration.effective_permission_lease_seconds
+    ?? configuration.post_detection_fallback_seconds;
+  const stsSeconds = configuration.credential_ttl_seconds;
+  const active = rows.filter((user) => user.lease !== null && user.lease !== undefined);
+  const clock = (iso: string) => new Date(iso).toISOString().slice(11, 19);
+
+  return (
+    <div aria-label="Live leases" className="credential-timeline live-leases">
+      <div className="timeline-title">
+        <RefreshCw aria-hidden="true" size={16} />
+        <strong>Live leases</strong>
+        <span>Real vended credentials, updated every 5 seconds — grant time, remaining authority, and renewals as they happen.</span>
+      </div>
+      {!loaded ? (
+        <p className="operations-muted">Loading lease state…</p>
+      ) : active.length === 0 ? (
+        <p className="operations-muted">No vended credentials right now. Leases appear here the moment a user vends.</p>
+      ) : active.map((user) => {
+        const lease = user.lease!;
+        const expires = new Date(lease.expires_at).getTime();
+        const granted = new Date(lease.granted_at).getTime();
+        const remaining = Math.max(0, Math.round((expires - now) / 1000));
+        const pct = Math.min(Math.max(((now - granted) / (expires - granted)) * 100, 0), 100);
+        const alive = lease.active && remaining > 0;
+        const stsExpiry = granted + stsSeconds * 1000;
+        const justRenewed = renewedAt.current[user.user_id] !== undefined
+          && now - renewedAt.current[user.user_id] < 4000;
+        return (
+          <div className="timeline-row" key={user.user_id}>
+            <span className="timeline-label">
+              {user.name || user.user_id} · granted {clock(lease.granted_at)} UTC ·
+              renewal #{lease.generation}
+              {justRenewed && <span className="lease-renewed-flash"> · renewed</span>}
+            </span>
+            <div className="timeline-bar">
+              <div
+                className={alive ? "timeline-authority" : "timeline-dead"}
+                style={{ width: "100%" }}
+                title={`Lease of ${leaseSeconds}s · expires ${clock(lease.expires_at)} UTC · keys physically live until ~${new Date(stsExpiry).toISOString().slice(11, 19)} UTC`}
+              >
+                <div className="lease-progress" style={{ width: `${pct}%` }} aria-hidden="true" />
+                <span className="lease-caption">
+                  {alive
+                    ? `authority ${remaining}s remaining of ${leaseSeconds}s`
+                    : "lease expired — IAM refuses; next vend or renewal re-checks the quota"}
+                </span>
+              </div>
+            </div>
+            <div className="timeline-ticks">
+              <span>granted {clock(lease.granted_at)}</span>
+              <span>{lease.refresh_after ? `renewable from ${clock(lease.refresh_after)}` : ""}</span>
+              <span>deadline {clock(lease.expires_at)} · keys die ≈ {new Date(stsExpiry).toISOString().slice(11, 19)}</span>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
 }

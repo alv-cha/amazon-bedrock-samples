@@ -1715,3 +1715,81 @@ def test_non_conditional_transaction_cancellation_is_retryable_not_version_confl
     assert response.headers["retry-after"] == "1"
     assert store.get_user("alice").version == 1
     assert store.list_admin_audit_page(user_id="alice", limit=10)[0] == []
+
+
+def test_admin_user_payload_exposes_lease_timing_but_never_the_lease_id(
+    client, monkeypatch
+):
+    api, _, _ = client
+    monkeypatch.setattr(
+        gateway,
+        "settings",
+        replace(
+            gateway.settings,
+            credential_enforcement_mode="lease",
+            permission_lease_seconds=300,
+        ),
+    )
+    token = make_jwt("alice")
+
+    before = api.get(
+        "/admin/user",
+        params={"user_id": "alice"},
+        headers={"X-Quota-Admin-Key": "admin-secret"},
+    )
+    vend = api.post(
+        "/v1/credentials",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "X-Quota-Lease-Id": "lease-a",
+        },
+    )
+    after = api.get(
+        "/admin/user",
+        params={"user_id": "alice"},
+        headers={"X-Quota-Admin-Key": "admin-secret"},
+    )
+    listed = api.get(
+        "/admin/users",
+        headers={"X-Quota-Admin-Key": "admin-secret"},
+    )
+
+    assert vend.status_code == 200
+    if before.status_code == 200:
+        assert before.json()["user"]["lease"] is None
+    lease = after.json()["user"]["lease"]
+    assert lease is not None
+    assert lease["active"] is True
+    assert lease["generation"] >= 1
+    assert lease["lease_seconds"] == 300
+    assert lease["expires_at"] == vend.json()["expiration"]
+    assert lease["refresh_after"] == vend.json()["refresh_after"]
+    assert "lease_id" not in lease  # the renewal token must never leak
+    row = next(u for u in listed.json()["users"] if u["user_id"] == "alice")
+    assert row["lease"]["generation"] == lease["generation"]
+
+
+def test_admin_user_lease_serializes_in_revocation_mode(client, monkeypatch):
+    """Regression: _lease_json crashed with AttributeError in non-lease modes
+    (post_detection_fallback_seconds does not exist on Settings)."""
+    api, _, _ = client
+    monkeypatch.setattr(
+        gateway,
+        "settings",
+        replace(
+            gateway.settings,
+            credential_enforcement_mode="revocation",
+            vended_credential_ttl_seconds=3600,
+        ),
+    )
+    token = make_jwt("victor")
+    vend = api.post(
+        "/v1/credentials", headers={"Authorization": f"Bearer {token}"}
+    )
+    listed = api.get(
+        "/admin/users", headers={"X-Quota-Admin-Key": "admin-secret"}
+    )
+    assert vend.status_code == 200
+    assert listed.status_code == 200  # was 500 before the fix
+    row = next(u for u in listed.json()["users"] if u["user_id"] == "victor")
+    assert row["lease"]["lease_seconds"] == 3600

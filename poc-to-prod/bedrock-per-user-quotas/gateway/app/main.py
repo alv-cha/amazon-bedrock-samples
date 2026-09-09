@@ -509,6 +509,35 @@ def _limits_json(user: UserRecord) -> dict:
     }
 
 
+def _lease_json(user: UserRecord) -> dict | None:
+    """Lease timing for the admin UI. The lease_id itself is the renewal
+    token and is deliberately never exposed on admin read paths."""
+    if user.lease_expires_at_epoch is None or user.lease_generation is None:
+        return None
+    now = datetime.now(timezone.utc)
+    expires_at = datetime.fromtimestamp(user.lease_expires_at_epoch, tz=timezone.utc)
+    refresh_after = (
+        datetime.fromtimestamp(user.lease_refresh_after_epoch, tz=timezone.utc)
+        if user.lease_refresh_after_epoch is not None
+        else None
+    )
+    lease_seconds = (
+        settings.permission_lease_seconds
+        if settings.credential_enforcement_mode == "lease"
+        else settings.vended_credential_ttl_seconds
+    )
+    return {
+        "active": now < expires_at,
+        "expires_at": expires_at.isoformat(),
+        "refresh_after": refresh_after.isoformat() if refresh_after else None,
+        "generation": user.lease_generation,
+        "granted_at": datetime.fromtimestamp(
+            user.lease_expires_at_epoch - lease_seconds, tz=timezone.utc
+        ).isoformat(),
+        "lease_seconds": lease_seconds,
+    }
+
+
 def _user_json(user: UserRecord) -> dict:
     return {
         "user_id": user.user_id,
@@ -520,6 +549,7 @@ def _user_json(user: UserRecord) -> dict:
         "created_at": user.created_at,
         "updated_at": user.updated_at,
         "limits": _limits_json(user),
+        "lease": _lease_json(user),
     }
 
 

@@ -2350,3 +2350,114 @@ tbody tr:hover {
     flex-direction: column;
   }
 }
+
+/* Credential timeline — the two clocks (STS lifetime vs permission lease) */
+.credential-timeline {
+  margin: 0 18px 4px;
+  padding: 14px;
+  background: #f8f9fb;
+  border: 1px solid #e0e4e9;
+  border-radius: 6px;
+}
+
+.timeline-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 12px;
+  color: #344054;
+}
+
+.timeline-title span {
+  color: #667085;
+  font-size: 0.82rem;
+}
+
+.timeline-row {
+  margin-bottom: 10px;
+}
+
+.timeline-row:last-child {
+  margin-bottom: 0;
+}
+
+.timeline-label {
+  display: block;
+  margin-bottom: 4px;
+  color: #475467;
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.timeline-bar {
+  display: flex;
+  height: 26px;
+  border-radius: 4px;
+  overflow: hidden;
+  border: 1px solid #d0d5dd;
+}
+
+.timeline-authority {
+  background: #12805c;
+  color: #ffffff;
+  font-size: 0.72rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+  overflow: hidden;
+  min-width: 8px;
+}
+
+.timeline-dead {
+  background: repeating-linear-gradient(135deg, #fdf1e8, #fdf1e8 8px, #f9dfcd 8px, #f9dfcd 16px);
+  color: #9a5b25;
+  font-size: 0.72rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.timeline-renew {
+  background: #0972d3;
+  color: #ffffff;
+  font-size: 0.72rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.timeline-ticks {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 3px;
+  color: #667085;
+  font-size: 0.72rem;
+}
+
+/* Live leases — real vended credentials with countdown */
+.live-leases .timeline-bar {
+  position: relative;
+}
+
+.lease-progress {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: rgba(255, 255, 255, 0.25);
+  border-right: 2px solid rgba(255, 255, 255, 0.85);
+  transition: width 1s linear;
+}
+
+.lease-caption {
+  position: relative;
+  z-index: 1;
+}
+
+.lease-renewed-flash {
+  color: #0972d3;
+  font-weight: 700;
+}
