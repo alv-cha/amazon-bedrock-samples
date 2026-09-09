@@ -84,6 +84,11 @@ class Settings:
         default_factory=lambda: int(_env("REVOCATION_POLICY_MAX_CHARACTERS", "6144")))
     operations_alarm_names_json: str = field(
         default_factory=lambda: _env("OPERATIONS_ALARM_NAMES_JSON", "{}"))
+    # Workload-mode roster for admin surfacing: {workload_id: {name,
+    # enforcement_ready}}. Static deploy config; enforcement itself runs in
+    # the dedicated enforcer Lambda.
+    workload_enforcement_json: str = field(
+        default_factory=lambda: _env("WORKLOAD_ENFORCEMENT_JSON", "{}"))
     qualification_status_json: str = field(
         default_factory=lambda: _env(
             "QUALIFICATION_STATUS_JSON",

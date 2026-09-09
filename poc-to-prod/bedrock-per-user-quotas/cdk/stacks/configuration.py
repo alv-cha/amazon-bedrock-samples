@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,6 +51,7 @@ _DEPLOYMENT_KEYS = {
     "vend_rate_limit_per_minute",
     "vended_ttl_seconds",
     "warn_threshold",
+    "workloads",
 }
 
 _DEFAULTS = {
@@ -84,6 +86,7 @@ _DEFAULTS = {
     "vend_rate_limit_per_minute": 6,
     "vended_ttl_seconds": 900,
     "warn_threshold": 0.8,
+    "workloads": "",
 }
 
 
@@ -92,6 +95,28 @@ class ModelPricingConfig:
     catalog_models: dict[str, list[str]]
     price_overrides: dict[str, dict[str, float]]
     fallback_price: dict[str, float]
+
+
+@dataclass(frozen=True)
+class WorkloadConfig:
+    """One directly-invoking application enrolled in workload mode.
+
+    ``name`` becomes the quota subject ``workload:<name>``; ``model`` is the
+    foundation-model ID or cross-region inference-profile ID the dedicated
+    application inference profile copies from; ``role_arn`` (optional) is the
+    workload's IAM role for direct policy attachment and Deny enforcement.
+    Without ``role_arn`` the stack emits a policy snippet instead and the
+    workload is metered/alerted but not hard-enforced (enforcement_ready is
+    false until a role is provided).
+    """
+
+    name: str
+    model: str
+    role_arn: str = ""
+
+    @property
+    def workload_id(self) -> str:
+        return f"workload:{self.name}"
 
 
 @dataclass(frozen=True)
@@ -127,6 +152,7 @@ class DeploymentConfig:
     vend_rate_limit_per_minute: int
     vended_ttl_seconds: int
     warn_threshold: float
+    workloads: tuple[WorkloadConfig, ...]
 
     @classmethod
     def from_node(cls, node: Node) -> "DeploymentConfig":
@@ -178,6 +204,13 @@ class DeploymentConfig:
             else deployment_dir
         )
         model_pricing = _model_pricing(model_source, model_base)
+
+        workloads_base = (
+            CDK_DIR
+            if node.try_get_context("workloads") is not None
+            else deployment_dir
+        )
+        workloads = _workloads(value("workloads"), workloads_base)
 
         new_allowlist_explicit = (
             node.try_get_context("allowed_model_arns") is not None
@@ -405,6 +438,7 @@ class DeploymentConfig:
             vend_rate_limit_per_minute=vend_rate_limit_per_minute,
             vended_ttl_seconds=vended_ttl_seconds,
             warn_threshold=warn_threshold,
+            workloads=workloads,
         )
 
 
@@ -488,6 +522,72 @@ def _model_pricing(raw: Any, base_dir: Path) -> ModelPricingConfig:
         )
     fallback = _price("fallback_price", data["fallback_price"])
     return ModelPricingConfig(catalog_models, price_overrides, fallback)
+
+
+_WORKLOAD_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
+_WORKLOAD_ROLE_ARN = re.compile(r"^arn:aws[a-z-]*:iam::\d{12}:role/.+")
+_WORKLOAD_KEYS = {"name", "model", "role_arn"}
+
+
+def _workloads(raw: Any, base_dir: Path) -> tuple[WorkloadConfig, ...]:
+    """Parse the optional workload-mode roster.
+
+    Accepts '' (workload mode off), an inline JSON object, or a JSON file
+    path. The document shape is {"workloads": [{"name", "model",
+    "role_arn"?}, ...]}.
+    """
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return ()
+    data, _ = _mapping("workloads", raw, base_dir)
+    unknown = sorted(set(data) - {"workloads"})
+    if unknown:
+        raise ValueError("Unknown workloads keys: " + ", ".join(unknown))
+    entries = data.get("workloads")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError(
+            "workloads must contain a non-empty 'workloads' JSON array"
+        )
+    parsed: list[WorkloadConfig] = []
+    seen_names: set[str] = set()
+    for index, entry in enumerate(entries):
+        label = f"workloads[{index}]"
+        if not isinstance(entry, dict):
+            raise ValueError(f"{label} must be a JSON object")
+        unknown_entry = sorted(set(entry) - _WORKLOAD_KEYS)
+        if unknown_entry:
+            raise ValueError(
+                f"Unknown {label} keys: " + ", ".join(unknown_entry)
+            )
+        name = entry.get("name")
+        if not isinstance(name, str) or not _WORKLOAD_NAME.match(name):
+            raise ValueError(
+                f"{label}.name must match [a-z0-9][a-z0-9-]{{0,47}}; "
+                f"got {name!r}"
+            )
+        if name in seen_names:
+            raise ValueError(f"workloads names must be unique; {name!r} repeats")
+        seen_names.add(name)
+        model = entry.get("model")
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError(f"{label}.model must be a non-empty string")
+        if model.startswith("arn:"):
+            raise ValueError(
+                f"{label}.model must be a model or inference-profile ID, "
+                f"not an ARN: {model}"
+            )
+        role_arn = entry.get("role_arn", "")
+        if role_arn and (
+            not isinstance(role_arn, str)
+            or not _WORKLOAD_ROLE_ARN.match(role_arn)
+        ):
+            raise ValueError(
+                f"{label}.role_arn must be an IAM role ARN "
+                f"(arn:aws:iam::<account>:role/...); got {role_arn!r}"
+            )
+        parsed.append(
+            WorkloadConfig(name=name, model=model.strip(), role_arn=role_arn)
+        )
+    return tuple(parsed)
 
 
 def _mapping(

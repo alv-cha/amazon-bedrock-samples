@@ -722,3 +722,210 @@ def test_stale_parameter_value_outlives_a_failed_refresh(monkeypatch, capsys):
         ssm, 1_000.0 + processor._PRICE_CACHE_TTL_SECONDS + 2
     )
     assert ssm.calls == 2
+
+
+# ---------------------------------------------------------------------------
+# Workload mode: attribution by application-inference-profile ARN
+# ---------------------------------------------------------------------------
+
+PROFILE_ARN = (
+    "arn:aws:bedrock:us-east-1:111122223333:"
+    "application-inference-profile/abc123xyz"
+)
+
+
+def _workload_env(monkeypatch, *, model="us.anthropic.claude-opus-4-7"):
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    monkeypatch.setenv(
+        "MODEL_PRICES_JSON",
+        json.dumps(
+            {model: {"input_per_mtok": 5.5, "output_per_mtok": 27.5}}
+        ),
+    )
+    monkeypatch.setenv(
+        "WORKLOAD_PROFILES_JSON",
+        json.dumps(
+            {
+                "payments": {
+                    "workload_id": "workload:payments",
+                    "profile_arn": PROFILE_ARN,
+                    "model": model,
+                }
+            }
+        ),
+    )
+    monkeypatch.setenv("DEFAULT_DAILY_USD", "2.5")
+    monkeypatch.setenv("DEFAULT_DAILY_INPUT_TOKENS", "111")
+    monkeypatch.setenv("DEFAULT_DAILY_OUTPUT_TOKENS", "222")
+
+
+def _workload_record(**overrides) -> dict:
+    """A direct-invocation record: customer principal, profile-ARN modelId."""
+    record = _record(
+        model=overrides.pop("model", PROFILE_ARN),
+        request_id=overrides.pop("request_id", "workload-req-1"),
+        **overrides,
+    )
+    message = json.loads(record["message"])
+    message["identity"] = {
+        "arn": "arn:aws:iam::111122223333:role/payments-app"
+    }
+    record["message"] = json.dumps(message)
+    return record
+
+
+def test_workload_invocation_attributes_by_profile_arn(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    _workload_env(monkeypatch)
+
+    result = _run(
+        _subscription(
+            [_workload_record(input_tokens=1000, output_tokens=100)]
+        ),
+        fake_dynamodb,
+        fake_sns,
+    )
+
+    assert result["processed"] == 1
+    assert result["ignored"] == 0
+    window = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    usage = (
+        fake_dynamodb.Table(os.environ["USAGE_TABLE"])
+        .get_item(
+            Key={"user_id": "workload:payments", "window": window}
+        )
+        .get("Item")
+    )
+    # Priced by the profile's underlying model, not the fallback:
+    # 1000 in * 5.5/M + 100 out * 27.5/M = 8250 micro-USD.
+    assert usage["cost_micro"] == 8250
+    assert usage["input_tokens"] == 1000
+
+
+def test_workload_row_is_auto_provisioned_with_deploy_defaults(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    _workload_env(monkeypatch)
+
+    _run(_subscription([_workload_record()]), fake_dynamodb, fake_sns)
+
+    row = (
+        fake_dynamodb.Table(os.environ["USERS_TABLE"])
+        .get_item(Key={"user_id": "workload:payments"})
+        .get("Item")
+    )
+    assert row["name"] == "payments"
+    assert row["status"] == "active"
+    assert row["status_origin"] == "automatic"
+    assert row["daily_usd_micro"] == 2_500_000
+    assert row["daily_input_tokens"] == 111
+    assert row["daily_output_tokens"] == 222
+    assert row["version"] == 1
+
+
+def test_workload_auto_provision_never_overwrites_admin_limits(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    _workload_env(monkeypatch)
+    _seed_user(fake_dynamodb, "workload:payments", usd=9.0)
+
+    _run(_subscription([_workload_record()]), fake_dynamodb, fake_sns)
+
+    row = (
+        fake_dynamodb.Table(os.environ["USERS_TABLE"])
+        .get_item(Key={"user_id": "workload:payments"})
+        .get("Item")
+    )
+    assert row["daily_usd_micro"] == 9 * processor.MICRO
+
+
+def test_unknown_application_profile_is_ignored(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    _workload_env(monkeypatch)
+    foreign = (
+        "arn:aws:bedrock:us-east-1:111122223333:"
+        "application-inference-profile/not-ours"
+    )
+
+    result = _run(
+        _subscription([_workload_record(model=foreign)]),
+        fake_dynamodb,
+        fake_sns,
+    )
+
+    assert result["processed"] == 0
+    assert result["ignored"] == 1
+    assert result["unresolved_sessions"] == []
+
+
+def test_workload_usage_is_idempotent_per_request_id(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    _workload_env(monkeypatch)
+    event = _subscription(
+        [
+            _workload_record(request_id="dup-1"),
+            _workload_record(request_id="dup-1"),
+        ]
+    )
+
+    result = _run(event, fake_dynamodb, fake_sns)
+
+    assert result["processed"] == 1
+    assert result["duplicates"] == 1
+
+
+def test_workload_over_budget_blocks_the_workload_row(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    _workload_env(monkeypatch)
+    monkeypatch.setenv("DEFAULT_DAILY_USD", "0.008")  # 8000 micro
+
+    result = _run(
+        _subscription(
+            [_workload_record(input_tokens=1000, output_tokens=100)]
+        ),
+        fake_dynamodb,
+        fake_sns,
+    )
+
+    assert result["processed"] == 1
+    row = (
+        fake_dynamodb.Table(os.environ["USERS_TABLE"])
+        .get_item(Key={"user_id": "workload:payments"})
+        .get("Item")
+    )
+    assert row["status"] == "blocked"
+    assert row["status_origin"] == "automatic"
+    assert row["status_reason"].startswith("auto: quota exhausted")
+
+
+def test_vended_session_via_workload_profile_bills_the_workload(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    """Deterministic precedence: the profile is the cost object."""
+    _workload_env(monkeypatch)
+    _seed_user(fake_dynamodb, "alice")
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+    record = _record(model=PROFILE_ARN, request_id="mixed-1")
+
+    result = _run(_subscription([record]), fake_dynamodb, fake_sns)
+
+    assert result["processed"] == 1
+    window = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    workload_usage = (
+        fake_dynamodb.Table(os.environ["USAGE_TABLE"])
+        .get_item(
+            Key={"user_id": "workload:payments", "window": window}
+        )
+        .get("Item")
+    )
+    alice_usage = (
+        fake_dynamodb.Table(os.environ["USAGE_TABLE"])
+        .get_item(Key={"user_id": "alice", "window": window})
+        .get("Item")
+    )
+    assert workload_usage is not None
+    assert alice_usage is None

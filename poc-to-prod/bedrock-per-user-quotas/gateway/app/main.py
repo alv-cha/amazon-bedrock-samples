@@ -33,6 +33,7 @@ from .broker import BrokerError, CredentialBroker
 from .config import settings
 from .quota import (
     MICRO,
+    WORKLOAD_USER_ID_PREFIX,
     IdempotencyConflict,
     LeaseExpired,
     LeaseNotRefreshable,
@@ -160,6 +161,16 @@ def _authenticate(
         validate_user_id(identity.user_id)
     except ValueError as exc:
         return None, None, str(exc)
+    if identity.user_id.startswith(WORKLOAD_USER_ID_PREFIX):
+        # Workload budgets are attributed by inference profile and enforced
+        # on the workload's own IAM principal; a JWT claiming the namespace
+        # must never vend credentials against a workload's budget.
+        return (
+            None,
+            None,
+            "The 'workload:' namespace is reserved for workload-mode "
+            "subjects and cannot authenticate through the vend path.",
+        )
 
     user = store().get_user(identity.user_id)
     if user is None:
@@ -538,8 +549,12 @@ def _lease_json(user: UserRecord) -> dict | None:
     }
 
 
+def _workload_registry() -> dict:
+    return _json_object(settings.workload_enforcement_json)
+
+
 def _user_json(user: UserRecord) -> dict:
-    return {
+    payload = {
         "user_id": user.user_id,
         "name": user.name,
         "status": user.status,
@@ -551,6 +566,15 @@ def _user_json(user: UserRecord) -> dict:
         "limits": _limits_json(user),
         "lease": _lease_json(user),
     }
+    if user.user_id.startswith(WORKLOAD_USER_ID_PREFIX):
+        entry = _workload_registry().get(user.user_id)
+        payload["granularity"] = "workload"
+        payload["enforcement_ready"] = bool(
+            isinstance(entry, dict) and entry.get("enforcement_ready")
+        )
+    else:
+        payload["granularity"] = "user"
+    return payload
 
 
 def _etag(user: UserRecord) -> str:
@@ -757,6 +781,7 @@ async def list_users(
     cursor: str | None = None,
     status: str | None = None,
     query: str | None = None,
+    granularity: str | None = None,
 ) -> Response:
     if (denied := _require_admin(request)) is not None:
         return denied
@@ -770,9 +795,19 @@ async def list_users(
             "status must be 'active' or 'blocked'.",
             "invalid_request_error",
         )
+    if granularity is not None and granularity not in {"user", "workload"}:
+        return _error(
+            400,
+            "granularity must be 'user' or 'workload'.",
+            "invalid_request_error",
+        )
     try:
         users, next_cursor = store().list_users_page(
-            limit=limit, cursor=cursor, status=status, query=query
+            limit=limit,
+            cursor=cursor,
+            status=status,
+            query=query,
+            granularity=granularity,
         )
     except ValueError:
         return _error(400, "Invalid cursor.", "invalid_request_error")

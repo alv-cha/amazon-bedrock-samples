@@ -777,6 +777,27 @@ tbody tr:hover {
   background: var(--red);
 }
 
+.granularity-stack {
+  display: inline-flex;
+  gap: 4px;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+
+.status-workload {
+  color: #4c3d99;
+  background: #f4f1ff;
+  border-color: #cdc3f0;
+  text-transform: none;
+}
+
+.status-not-enforced {
+  color: #8a5a00;
+  background: #fff8ec;
+  border-color: #ecd3a0;
+  text-transform: none;
+}
+
 .quota-usage {
   display: grid;
   gap: 7px;

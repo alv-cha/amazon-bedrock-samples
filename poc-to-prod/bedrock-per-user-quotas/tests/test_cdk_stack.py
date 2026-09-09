@@ -1014,3 +1014,206 @@ def test_price_overrides_require_a_documented_reason():
     blank_reason["price_overrides"]["x.model"]["reason"] = "  "
     with pytest.raises(ValueError, match="reason"):
         _model_pricing(blank_reason, Path("."))
+
+
+# ---------------------------------------------------------------------------
+# Workload mode: inference profiles, direct-attach policies, enforcer
+# ---------------------------------------------------------------------------
+
+_WORKLOADS_CONTEXT = {
+    "manage_invocation_logging": True,
+    "workloads": json.dumps(
+        {
+            "workloads": [
+                {
+                    "name": "payments",
+                    "model": "us.anthropic.claude-opus-4-7",
+                    "role_arn": (
+                        "arn:aws:iam::111122223333:role/payments-app"
+                    ),
+                },
+                {
+                    "name": "reports",
+                    "model": "anthropic.claude-haiku-4-5-20251001-v1:0",
+                },
+            ]
+        }
+    ),
+}
+
+
+def test_no_workloads_means_no_workload_resources():
+    template = _template({"manage_invocation_logging": True})
+    template.resource_count_is(
+        "AWS::Bedrock::ApplicationInferenceProfile", 0
+    )
+    rendered = json.dumps(template.to_json())
+    assert "WorkloadEnforcerFn" not in rendered
+    assert "WORKLOAD_ENFORCEMENT_JSON" in rendered  # empty roster, present
+    env = _environment_with(template, "WORKLOAD_ENFORCEMENT_JSON")
+    assert env["WORKLOAD_ENFORCEMENT_JSON"] == "{}"
+
+
+def test_workloads_create_profiles_with_tags_and_correct_model_sources():
+    template = _template(_WORKLOADS_CONTEXT)
+    template.resource_count_is(
+        "AWS::Bedrock::ApplicationInferenceProfile", 2
+    )
+    template.has_resource_properties(
+        "AWS::Bedrock::ApplicationInferenceProfile",
+        {
+            "InferenceProfileName": "bedrock-quota-payments",
+            "Tags": [
+                {"Key": "bedrock-quota-workload", "Value": "payments"}
+            ],
+        },
+    )
+    template.has_resource_properties(
+        "AWS::Bedrock::ApplicationInferenceProfile",
+        {
+            "InferenceProfileName": "bedrock-quota-reports",
+            "Tags": [
+                {"Key": "bedrock-quota-workload", "Value": "reports"}
+            ],
+        },
+    )
+    # CopyFrom ARNs are Fn::Join over partition/region tokens; assert the
+    # literal segments: CR profile IDs get account-scoped inference-profile
+    # ARNs, plain model IDs get foundation-model ARNs (no account).
+    rendered = json.dumps(template.to_json())
+    assert ":inference-profile/us.anthropic.claude-opus-4-7" in rendered
+    assert (
+        "::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0"
+        in rendered
+    )
+
+
+def test_direct_attach_policy_pins_the_role_to_its_profile():
+    template = _template(_WORKLOADS_CONTEXT)
+    policies = template.find_resources("AWS::IAM::Policy")
+    attach = next(
+        resource
+        for logical_id, resource in policies.items()
+        if logical_id.startswith("WorkloadInvokePolicyPayments")
+    )
+    assert attach["Properties"]["Roles"] == ["payments-app"]
+    statements = attach["Properties"]["PolicyDocument"]["Statement"]
+    by_sid = {statement["Sid"]: statement for statement in statements}
+    assert set(by_sid) == {
+        "InvokeOwnQuotaProfile",
+        "InvokeRoutedModelsViaQuotaProfileOnly",
+    }
+    condition = by_sid["InvokeRoutedModelsViaQuotaProfileOnly"]["Condition"]
+    assert "bedrock:InferenceProfileArn" in condition["StringEquals"]
+    # The snippet-only workload must not synthesize an attachment.
+    assert not any(
+        logical_id.startswith("WorkloadInvokePolicyReports")
+        for logical_id in policies
+    )
+
+
+def test_snippet_workload_emits_policy_output_and_not_ready_flag():
+    template = _template(_WORKLOADS_CONTEXT)
+    outputs = template.to_json()["Outputs"]
+    assert any(
+        key.startswith("WorkloadPolicySnippetReports") for key in outputs
+    )
+    assert not any(
+        key.startswith("WorkloadPolicySnippetPayments") for key in outputs
+    )
+    assert any(
+        key.startswith("WorkloadProfileArnPayments") for key in outputs
+    )
+    env = _environment_with(template, "WORKLOAD_ENFORCEMENT_JSON")
+    roster = json.loads(env["WORKLOAD_ENFORCEMENT_JSON"])
+    assert roster["workload:payments"]["enforcement_ready"] is True
+    assert roster["workload:reports"]["enforcement_ready"] is False
+
+
+def test_enforcer_wiring_least_privilege_and_schedules():
+    template = _template(_WORKLOADS_CONTEXT)
+    # Second subscription filter for profile-attributed traffic.
+    template.resource_count_is("AWS::Logs::SubscriptionFilter", 2)
+    # Emergency (1m) + price refresh (24h) + workload enforcement (5m).
+    template.resource_count_is("AWS::Events::Rule", 3)
+    # Users-table stream now feeds the enforcer too.
+    template.resource_count_is("AWS::Lambda::EventSourceMapping", 2)
+    env = _environment_with(template, "WORKLOADS_JSON")
+    assert env["DENY_POLICY_NAME"] == "bedrock-quota-workload-deny"
+
+    rendered = template.to_json()
+    enforcer_policies = [
+        statement
+        for resource in rendered["Resources"].values()
+        if resource["Type"] == "AWS::IAM::Policy"
+        for statement in resource["Properties"]["PolicyDocument"][
+            "Statement"
+        ]
+        if isinstance(statement.get("Action"), list)
+        and "iam:PutRolePolicy" in statement["Action"]
+    ]
+    assert len(enforcer_policies) == 1
+    statement = enforcer_policies[0]
+    # Explicit ARN scoping: only the enrolled role, never a wildcard.
+    assert statement["Resource"] == (
+        "arn:aws:iam::111122223333:role/payments-app"
+    )
+    assert set(statement["Action"]) == {
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:GetRolePolicy",
+    }
+
+
+def test_processor_receives_the_workload_profile_map():
+    template = _template(_WORKLOADS_CONTEXT)
+    env = _environment_with(template, "WORKLOAD_PROFILES_JSON")
+    assert "DEFAULT_DAILY_USD" in env
+    assert env["BEDROCK_USER_ROLE_NAME"]  # user path unchanged
+    profiles = env["WORKLOAD_PROFILES_JSON"]
+    rendered = json.dumps(profiles)
+    assert "workload:payments" in rendered
+    assert "workload:reports" in rendered
+
+
+def test_workloads_config_validation_errors():
+    with pytest.raises(ValueError, match="name must match"):
+        _template(
+            {
+                "manage_invocation_logging": True,
+                "workloads": json.dumps(
+                    {"workloads": [{"name": "Bad_Name", "model": "m"}]}
+                ),
+            }
+        )
+    with pytest.raises(ValueError, match="must be unique"):
+        _template(
+            {
+                "manage_invocation_logging": True,
+                "workloads": json.dumps(
+                    {
+                        "workloads": [
+                            {"name": "a", "model": "m"},
+                            {"name": "a", "model": "m"},
+                        ]
+                    }
+                ),
+            }
+        )
+    with pytest.raises(ValueError, match="IAM role ARN"):
+        _template(
+            {
+                "manage_invocation_logging": True,
+                "workloads": json.dumps(
+                    {
+                        "workloads": [
+                            {
+                                "name": "a",
+                                "model": "m",
+                                "role_arn": "arn:aws:iam::1:user/x",
+                            }
+                        ]
+                    }
+                ),
+            }
+        )

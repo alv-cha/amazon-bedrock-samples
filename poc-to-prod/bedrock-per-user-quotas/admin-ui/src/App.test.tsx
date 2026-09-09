@@ -508,7 +508,7 @@ describe("server-side user pagination", () => {
     expect(await screen.findByRole("button", { name: "Bob Example" })).toBeInTheDocument();
     expect(listUsers.mock.calls[3][2]).toMatchObject({ cursor: null, query: "bob" });
 
-    await actor.selectOptions(screen.getByLabelText("Filter users by status"), "blocked");
+    await actor.selectOptions(screen.getByLabelText("Filter users"), "blocked");
     await waitFor(() => expect(listUsers).toHaveBeenCalledTimes(5));
     expect(listUsers.mock.calls[4][2]).toMatchObject({ cursor: null, query: "bob", status: "blocked" });
   });
@@ -635,8 +635,8 @@ describe("additional canonical and modal safety", () => {
     render(<Dashboard cfg={cfg} onSignOut={vi.fn()} session={session} />);
 
     await screen.findByRole("button", { name: "Alice Example" });
-    await actor.selectOptions(screen.getByLabelText("Filter users by status"), "active");
-    await waitFor(() => expect(screen.getByLabelText("Filter users by status")).toHaveValue("active"));
+    await actor.selectOptions(screen.getByLabelText("Filter users"), "active");
+    await waitFor(() => expect(screen.getByLabelText("Filter users")).toHaveValue("active"));
     await actor.click(screen.getByRole("button", { name: "Block Alice Example" }));
     await actor.type(screen.getByLabelText(/Reason/), "Policy request");
     await actor.click(screen.getByRole("button", { name: "Block user" }));
@@ -682,7 +682,7 @@ describe("filtered detail and precision edge cases", () => {
     render(<Dashboard cfg={cfg} onSignOut={vi.fn()} session={session} />);
 
     await screen.findByRole("button", { name: "Bob Example" });
-    await actor.selectOptions(screen.getByLabelText("Filter users by status"), "blocked");
+    await actor.selectOptions(screen.getByLabelText("Filter users"), "blocked");
     await actor.click(await screen.findByRole("button", { name: "Bob Example" }));
     resolveDetail({ data: { user: canonical({ user_id: bob.user_id, name: bob.name, status: "active", version: 2 }) }, etag: '"2"', requestId: null, status: 200 });
 
@@ -721,5 +721,48 @@ describe("filtered detail and precision edge cases", () => {
     const drawer = screen.getByRole("dialog", { name: "Alice Example" });
     expect(within(drawer).getByRole("button", { name: /Status change unavailable/ })).toBeDisabled();
     expect(screen.queryByRole("dialog", { name: "Confirm block" })).not.toBeInTheDocument();
+  });
+});
+
+describe("workload mode", () => {
+  const paymentsWorkload: UserRow = {
+    ...alice,
+    user_id: "workload:payments",
+    name: "payments",
+    granularity: "workload",
+    enforcement_ready: true,
+  };
+  const reportsWorkload: UserRow = {
+    ...alice,
+    user_id: "workload:reports",
+    name: "reports",
+    granularity: "workload",
+    enforcement_ready: false,
+  };
+
+  it("filters by granularity and renders workload badges with enforcement state", async () => {
+    const actor = userEvent.setup();
+    const listUsers = vi.spyOn(api, "listUsersPage")
+      .mockResolvedValueOnce({ users: [alice, paymentsWorkload, reportsWorkload], next_cursor: null })
+      .mockResolvedValueOnce({ users: [paymentsWorkload, reportsWorkload], next_cursor: null });
+    vi.spyOn(api, "summary").mockResolvedValue(summary);
+    vi.spyOn(api, "operations").mockResolvedValue(operations);
+    render(<Dashboard cfg={cfg} onSignOut={vi.fn()} session={session} />);
+
+    expect(await screen.findByRole("button", { name: "Alice Example" })).toBeInTheDocument();
+    expect(screen.getAllByText("workload")).toHaveLength(2);
+    // Only the role-less workload warns that it cannot be hard-blocked.
+    expect(screen.getAllByText("metering only")).toHaveLength(1);
+
+    await actor.selectOptions(screen.getByLabelText("Filter users"), "workloads");
+    await waitFor(() => expect(listUsers).toHaveBeenCalledTimes(2));
+    expect(listUsers.mock.calls[1][2]).toMatchObject({
+      cursor: null,
+      granularity: "workload",
+      status: undefined,
+    });
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Alice Example" })).not.toBeInTheDocument(),
+    );
   });
 });

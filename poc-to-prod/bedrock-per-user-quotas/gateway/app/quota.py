@@ -33,6 +33,12 @@ RESERVED_USER_ID_PREFIXES = (
     "EMERGENCY_AUDIT#",
 )
 
+# Public namespace for workload-mode quota subjects (apps calling
+# bedrock-runtime with their own IAM credentials, attributed by application
+# inference profile). Workload rows share the users table and admin API but
+# never authenticate through the JWT vend path.
+WORKLOAD_USER_ID_PREFIX = "workload:"
+
 
 def validate_user_id(user_id: str) -> str:
     if not user_id or any(
@@ -1243,12 +1249,14 @@ class QuotaStore:
         *,
         status: str | None = None,
         query: str | None = None,
+        granularity: str | None = None,
     ) -> tuple[list[UserRecord], str | None]:
         normalized_query = (query or "").strip().casefold()
         cursor_context = {
             "kind": "users",
             "status": status or "",
             "query": normalized_query,
+            "granularity": granularity or "",
         }
         exclusive_key = self._decode_cursor(
             cursor,
@@ -1280,6 +1288,14 @@ class QuotaStore:
                 user = self._to_user(item)
                 if status and user.status != status:
                     continue
+                if granularity:
+                    is_workload = user.user_id.startswith(
+                        WORKLOAD_USER_ID_PREFIX
+                    )
+                    if granularity == "workload" and not is_workload:
+                        continue
+                    if granularity == "user" and is_workload:
+                        continue
                 if normalized_query and normalized_query not in (
                     f"{user.user_id}\n{user.name}".casefold()
                 ):

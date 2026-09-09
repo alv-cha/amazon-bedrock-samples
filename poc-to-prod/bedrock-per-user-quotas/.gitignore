@@ -1,2 +1,6 @@
 # Local semantic-review session logs
 semantic-review/
+
+# Private deployment rosters (real account IDs / role ARNs).
+# Commit cdk/config/workloads.example.json instead.
+cdk/config/workloads.json

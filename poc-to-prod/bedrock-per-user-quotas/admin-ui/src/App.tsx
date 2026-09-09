@@ -38,7 +38,14 @@ import {
 import { CreateUserWizard, GlobalAuditView, LiveLeases, UserDetailDrawer } from "./OperationalUi";
 import { useModalLifecycle } from "./modal";
 
-export type UserFilter = "all" | "active" | "blocked";
+export type UserFilter = "all" | "active" | "blocked" | "users" | "workloads";
+
+export function matchesUserFilter(user: AdminUser, filter: UserFilter): boolean {
+  if (filter === "active" || filter === "blocked") return user.status === filter;
+  if (filter === "workloads") return user.user_id.startsWith("workload:");
+  if (filter === "users") return !user.user_id.startsWith("workload:");
+  return true;
+}
 const USER_PAGE_SIZE = 25;
 
 export function mergeCanonicalUser(rows: UserRow[], updated: AdminUser): UserRow[] {
@@ -235,7 +242,8 @@ export function Dashboard({
       const page = await api.listUsersPage(cfg, session, {
         limit: USER_PAGE_SIZE,
         cursor,
-        status: filter === "all" ? undefined : filter,
+        status: filter === "active" || filter === "blocked" ? filter : undefined,
+        granularity: filter === "workloads" ? "workload" : filter === "users" ? "user" : undefined,
         query,
       });
       if (request !== usersRequest.current) return false;
@@ -293,7 +301,7 @@ export function Dashboard({
     setUsers((current) => {
       const cached = current.find((user) => user.user_id === updated.user_id);
       if (cached && updated.version < cached.version) return current;
-      return userFilter !== "all" && updated.status !== userFilter
+      return !matchesUserFilter(updated, userFilter)
         ? current.filter((user) => user.user_id !== updated.user_id)
         : mergeCanonicalUser(current, updated);
     });
@@ -301,7 +309,7 @@ export function Dashboard({
 
   function addCreatedUser(created: AdminUser, openDetails: boolean) {
     const needle = userQuery.trim().toLocaleLowerCase();
-    const matches = (userFilter === "all" || created.status === userFilter) &&
+    const matches = matchesUserFilter(created, userFilter) &&
       (!needle || created.user_id.toLocaleLowerCase().includes(needle) || created.name.toLocaleLowerCase().includes(needle));
     const fitsCurrentPage = userPageIndex === 0 && users.length < USER_PAGE_SIZE && matches;
     if (fitsCurrentPage) {
@@ -835,7 +843,7 @@ export function UsersPanel({
               <div className="search-field"><Search aria-hidden="true" size={17} /><input aria-label="Search users" placeholder="Search users" type="search" value={searchDraft} onChange={(event) => setSearchDraft(event.target.value)} /></div>
               <button className="button button-secondary" disabled={loading} type="submit">Search</button>
             </form>
-            <div className="select-wrap"><select aria-label="Filter users by status" disabled={loading} value={filter} onChange={(event) => onFilterChange(event.target.value as UserFilter)}><option value="all">All statuses</option><option value="active">Active</option><option value="blocked">Blocked</option></select><ChevronDown aria-hidden="true" size={16} /></div>
+            <div className="select-wrap"><select aria-label="Filter users" disabled={loading} value={filter} onChange={(event) => onFilterChange(event.target.value as UserFilter)}><option value="all">All subjects</option><option value="active">Active</option><option value="blocked">Blocked</option><option value="users">Users (JWT)</option><option value="workloads">Workloads</option></select><ChevronDown aria-hidden="true" size={16} /></div>
           </div>
         </div>
       </div>
@@ -896,6 +904,16 @@ function UserTableRow({
           <div>
             <button className="user-name-button" disabled={busy} onClick={onOpen} title={user.name} type="button">{displayName(user)}</button>
             <span title={user.user_id}>{user.user_id}</span>
+            {user.granularity === "workload" && (
+              <span className="granularity-stack">
+                <span className="status-badge status-workload">workload</span>
+                {user.enforcement_ready === false && (
+                  <span className="status-badge status-not-enforced" title="No IAM role configured: this workload is metered and alerted but cannot be hard-blocked. Add role_arn to the workloads config and redeploy.">
+                    metering only
+                  </span>
+                )}
+              </span>
+            )}
           </div>
         </div>
       </td>

@@ -196,6 +196,8 @@ export interface AdminUser {
   updated_at: string | null;
   limits: QuotaLimits;
   lease?: LeaseState | null;
+  granularity?: "user" | "workload";
+  enforcement_ready?: boolean;
 }
 
 export interface UserRow extends AdminUser {
@@ -212,6 +214,7 @@ export interface ListUsersOptions {
   cursor?: string | null;
   status?: UserStatus;
   query?: string;
+  granularity?: "user" | "workload";
 }
 
 export interface CreateUserRequest extends QuotaLimits {
@@ -655,6 +658,7 @@ export const api = {
     if (options.cursor) params.set("cursor", options.cursor);
     if (options.status) params.set("status", options.status);
     if (options.query?.trim()) params.set("query", options.query.trim());
+    if (options.granularity) params.set("granularity", options.granularity);
     return (await transport<UserListResponse>(
       cfg,
       session,

@@ -139,6 +139,15 @@ and usage reset are explicitly outside this MVP.
 - `sub` gives each human or workload a separate quota.
 - A tenant, team, or project claim shares one quota across all members.
 
+One governance layer supports three quota granularities on the same tables,
+admin API, and dashboard:
+
+| Granularity | Mechanism | Target |
+|---|---|---|
+| Per user | JWT claim (`sub`) via the credential broker or proxy | any app with an IdP |
+| Per tenant | JWT with a tenant/team claim (`jwt_user_claim`) | ISV per-tenant caps |
+| Per workload | Application inference profile + IAM Deny ([workload mode](#workload-mode)) | SMB and ISV internal workloads with no JWT |
+
 The broker derives a collision-resistant STS session name from the claim.
 Bedrock invocation logging captures that session in `identity.arn`; a temporary
 DynamoDB reverse map resolves it to the original claim value. Routine JWT
@@ -149,13 +158,49 @@ falls back to the configured quota identity only when `sub` is unavailable.
 `requestMetadata` is useful for analysis but is caller-controlled and is not
 trusted for enforcement attribution.
 
+## Workload mode
+
+Workload mode puts a budget on applications that call `bedrock-runtime`
+directly with their own IAM credentials — no JWT, no vend flow, zero client
+code change. Each configured workload gets:
+
+- A dedicated **application inference profile**. The app invokes with the
+  profile ARN as `modelId`; invocation-log records preserve that ARN, which
+  is the attribution key (verified empirically against the log schema).
+- An **invoke policy** that pins the workload's IAM role to its own profile
+  (an allow on the profile plus a `bedrock:InferenceProfileArn` condition on
+  the routed models). With `role_arn` configured the stack attaches it
+  directly; without it the policy is emitted as a stack output to attach
+  manually.
+- A quota row `workload:<name>` in the same users table, with the same
+  limits schema, windows, admin endpoints, and dashboard as JWT identities.
+- **Enforcement**: when the budget is exhausted the metering processor blocks
+  the row, and the workload enforcer Lambda attaches an inline
+  `bedrock:InvokeModel*` Deny to the workload's role (users-table stream fast
+  path plus a 5-minute repair schedule). The Deny applies to already-issued
+  STS sessions after IAM propagation. On window reset the enforcer lifts
+  automatic blocks and removes the Deny. Manual admin blocks never auto-lift.
+
+Configure workloads in `cdk/config/workloads.json` (see
+`cdk/config/workloads.example.json`) and pass `-c workloads=config/workloads.json`
+or the `workloads` key of `deployment_config`. Workloads without `role_arn`
+are metered and alerted but cannot be hard-blocked; they surface as
+`enforcement_ready: false` in the admin API and as "metering only" in the UI.
+
+Enforcement latency is metering lag (about 15 s) plus IAM propagation
+(seconds to about a minute) — bounded overspend, like Mode A. For hard
+pre-spend denial use the inline proxy (Mode B).
+
 ## Metering
 
 CloudWatch Logs invokes the usage processor for each Bedrock invocation log.
 The processor:
 
-1. Accepts only records from the vended role.
-2. Resolves the STS session to the quota identity.
+1. Accepts records from the vended role (session attribution) and from
+   managed application inference profiles (workload attribution).
+2. Resolves the STS session to the quota identity, or the profile ARN to its
+   `workload:<name>` row (auto-provisioned with deploy defaults on first
+   usage and priced by the profile's underlying model).
 3. Prices input and output tokens.
 4. Creates a `requestId` idempotency marker.
 5. Updates the daily aggregate in the same DynamoDB transaction.
@@ -365,6 +410,7 @@ decision.
 | `cdk/` | Validated configuration and AWS infrastructure |
 | `gateway/` | Broker and administrative control-plane API |
 | `usage_processor/` | Invocation-log subscription consumer |
+| `workload_enforcer/` | Workload-mode IAM Deny convergence Lambda |
 | `revocation_processor/` | Optional sharded per-user IAM deny reconciler |
 | `emergency_processor/` | Operator-controlled shared-role deny controller |
 | `admin-ui/` | Static React administration console |

@@ -21,6 +21,7 @@ from aws_cdk import (
     Duration,
     RemovalPolicy,
     Stack,
+    aws_bedrock as bedrock,
     aws_cloudfront as cloudfront,
     aws_cloudfront_origins as cloudfront_origins,
     aws_cloudwatch as cw,
@@ -49,6 +50,32 @@ from constructs import Construct
 from .configuration import DeploymentConfig
 
 METRICS_NAMESPACE = "BedrockQuotaGateway"
+
+# Tag key stamped on workload inference profiles (cost allocation + audit).
+WORKLOAD_TAG_KEY = "bedrock-quota-workload"
+
+# Cross-region inference-profile ID prefixes; must stay in sync with
+# usage_processor/handler.py _PROFILE_PREFIXES.
+_CR_PROFILE_PREFIXES = {
+    "us", "eu", "apac", "jp", "au", "ca", "sa", "global", "us-gov",
+}
+
+
+def _model_source_arn(
+    partition: str, region: str, account: str, model: str
+) -> str:
+    """ARN for CfnApplicationInferenceProfile.copy_from.
+
+    Cross-region profile IDs (``us.anthropic...``) become account-scoped
+    inference-profile ARNs; plain model IDs become foundation-model ARNs.
+    """
+    prefix = model.split(".", 1)[0]
+    if prefix in _CR_PROFILE_PREFIXES:
+        return (
+            f"arn:{partition}:bedrock:{region}:{account}:"
+            f"inference-profile/{model}"
+        )
+    return f"arn:{partition}:bedrock:{region}::foundation-model/{model}"
 
 
 class QuotaGatewayStack(Stack):
@@ -523,6 +550,18 @@ class QuotaGatewayStack(Stack):
                 ),
                 "DEFAULT_DAILY_OUTPUT_TOKENS": str(
                     config.default_daily_output_tokens
+                ),
+                # Workload roster for the admin API: granularity labeling
+                # and enforcement_ready surfacing (static config, no tokens).
+                "WORKLOAD_ENFORCEMENT_JSON": json.dumps(
+                    {
+                        workload.workload_id: {
+                            "name": workload.name,
+                            "enforcement_ready": bool(workload.role_arn),
+                        }
+                        for workload in config.workloads
+                    },
+                    sort_keys=True,
                 ),
                 "USAGE_RETENTION_DAYS": str(config.usage_retention_days),
                 # Credential lifetime and refresh controls. The runtime keeps
@@ -1049,6 +1088,133 @@ class QuotaGatewayStack(Stack):
         if alert_email:
             alert_topic.add_subscription(subs.EmailSubscription(alert_email))
 
+        # ------------------------------------------------------------------
+        # Workload mode: one application inference profile per directly-
+        # invoking app. The profile ARN in invocation-log records is the
+        # attribution key (verified empirically: the log ``modelId`` field
+        # preserves the application-inference-profile ARN). With a role ARN
+        # the invoke policy is attached directly (paved road); without one
+        # the policy document is emitted as an output for the customer to
+        # attach, and the workload is metered but not hard-enforced.
+        # ------------------------------------------------------------------
+        workload_profiles: dict[str, dict[str, object]] = {}
+        workload_enforcement: dict[str, dict[str, object]] = {}
+        workload_role_arns: list[str] = []
+        for workload in config.workloads:
+            logical = "".join(
+                part.capitalize() for part in workload.name.split("-")
+            )
+            profile = bedrock.CfnApplicationInferenceProfile(
+                self,
+                f"WorkloadProfile{logical}",
+                inference_profile_name=f"bedrock-quota-{workload.name}",
+                # CloudFormation restricts descriptions to
+                # ^([0-9a-zA-Z:.][ _-]?)+$ -- letters, digits, colons, dots.
+                description=(
+                    f"Quota-gateway workload {workload.name}: "
+                    "cost attribution and budget enforcement"
+                ),
+                model_source=(
+                    bedrock.CfnApplicationInferenceProfile
+                    .InferenceProfileModelSourceProperty(
+                        copy_from=_model_source_arn(
+                            self.partition,
+                            self.region,
+                            self.account,
+                            workload.model,
+                        )
+                    )
+                ),
+                tags=[
+                    cdk.CfnTag(
+                        key=WORKLOAD_TAG_KEY, value=workload.name
+                    )
+                ],
+            )
+            profile_arn = profile.attr_inference_profile_arn
+            invoke_statements = [
+                iam.PolicyStatement(
+                    sid="InvokeOwnQuotaProfile",
+                    actions=[
+                        "bedrock:InvokeModel",
+                        "bedrock:InvokeModelWithResponseStream",
+                    ],
+                    resources=[profile_arn],
+                ),
+                iam.PolicyStatement(
+                    sid="InvokeRoutedModelsViaQuotaProfileOnly",
+                    actions=[
+                        "bedrock:InvokeModel",
+                        "bedrock:InvokeModelWithResponseStream",
+                    ],
+                    resources=[
+                        f"arn:{self.partition}:bedrock:*::foundation-model/*",
+                        (
+                            f"arn:{self.partition}:bedrock:*:{self.account}:"
+                            "inference-profile/*"
+                        ),
+                    ],
+                    conditions={
+                        "StringEquals": {
+                            "bedrock:InferenceProfileArn": profile_arn
+                        }
+                    },
+                ),
+            ]
+            if workload.role_arn:
+                workload_role = iam.Role.from_role_arn(
+                    self,
+                    f"WorkloadRole{logical}",
+                    workload.role_arn,
+                    mutable=True,
+                )
+                iam.Policy(
+                    self,
+                    f"WorkloadInvokePolicy{logical}",
+                    policy_name=f"bedrock-quota-workload-{workload.name}",
+                    statements=invoke_statements,
+                    roles=[workload_role],
+                )
+                workload_role_arns.append(workload.role_arn)
+            else:
+                cdk.CfnOutput(
+                    self,
+                    f"WorkloadPolicySnippet{logical}",
+                    description=(
+                        f"Attach to workload '{workload.name}' IAM role to "
+                        "restrict it to its inference profile (enforcement "
+                        "requires role_arn in the workloads config)"
+                    ),
+                    value=cdk.Fn.to_json_string(
+                        {
+                            "Version": "2012-10-17",
+                            "Statement": [
+                                statement.to_json()
+                                for statement in invoke_statements
+                            ],
+                        }
+                    ),
+                )
+            cdk.CfnOutput(
+                self,
+                f"WorkloadProfileArn{logical}",
+                description=(
+                    f"Application inference profile for workload "
+                    f"'{workload.name}' (invoke with this as modelId)"
+                ),
+                value=profile_arn,
+            )
+            workload_profiles[workload.name] = {
+                "workload_id": workload.workload_id,
+                "profile_arn": profile_arn,
+                "model": workload.model,
+            }
+            workload_enforcement[workload.workload_id] = {
+                "name": workload.name,
+                "profile_arn": profile_arn,
+                "role_arn": workload.role_arn,
+            }
+
         usage_processor_fn = lambda_.Function(
             self, "UsageProcessorFn",
             runtime=lambda_.Runtime.PYTHON_3_12,
@@ -1069,6 +1235,18 @@ class QuotaGatewayStack(Stack):
                     model_prices_parameter.parameter_name
                 ),
                 "BEDROCK_USER_ROLE_NAME": bedrock_user_role.role_name,
+                "WORKLOAD_PROFILES_JSON": (
+                    cdk.Fn.to_json_string(workload_profiles)
+                    if workload_profiles
+                    else "{}"
+                ),
+                "DEFAULT_DAILY_USD": str(config.default_daily_usd),
+                "DEFAULT_DAILY_INPUT_TOKENS": str(
+                    config.default_daily_input_tokens
+                ),
+                "DEFAULT_DAILY_OUTPUT_TOKENS": str(
+                    config.default_daily_output_tokens
+                ),
             },
         )
         users_table.grant_read_write_data(usage_processor_fn)
@@ -1091,6 +1269,24 @@ class QuotaGatewayStack(Stack):
                 f"*assumed-role/{bedrock_user_role.role_name}/*",
             ),
         )
+        if config.workloads:
+            # Workload traffic authenticates with the customer's own
+            # principal, so it never matches the vended-role subscription
+            # above. Attribution key: the invocation-log ``modelId`` field
+            # preserves the application-inference-profile ARN. The processor
+            # drops profiles it does not manage.
+            logs.SubscriptionFilter(
+                self, "WorkloadUsageSubscription",
+                log_group=invocation_log_group,
+                destination=logs_destinations.LambdaDestination(
+                    usage_processor_fn
+                ),
+                filter_pattern=logs.FilterPattern.string_value(
+                    "$.modelId",
+                    "=",
+                    "*:application-inference-profile/*",
+                ),
+            )
 
         # ------------------------------------------------------------------
         # Operator-confirmed emergency stop. The admin API closes the strongly
@@ -1406,6 +1602,129 @@ class QuotaGatewayStack(Stack):
             )
             operations_alarms["revocation_iterator_age"] = (
                 revocation_iterator_age_alarm
+            )
+
+        # ------------------------------------------------------------------
+        # Workload enforcement: converge each workload row's status onto its
+        # IAM principal. Blocked => attach an inline Deny on the workload
+        # role; active => remove it. Fast path is the users-table stream
+        # (status transitions written by the metering processor); the
+        # schedule repairs drift. PutRolePolicy is an idempotent upsert and
+        # DeleteRolePolicy tolerates absence, so repeats are safe.
+        # ------------------------------------------------------------------
+        if config.workloads:
+            workload_dlq = sqs.Queue(
+                self,
+                "WorkloadEnforcementDeadLetterQueue",
+                encryption=sqs.QueueEncryption.SQS_MANAGED,
+                retention_period=Duration.days(14),
+            )
+            workload_enforcer_fn = lambda_.Function(
+                self,
+                "WorkloadEnforcerFn",
+                runtime=lambda_.Runtime.PYTHON_3_12,
+                memory_size=256,
+                timeout=Duration.minutes(2),
+                reserved_concurrent_executions=1,
+                handler="handler.handler",
+                code=lambda_.Code.from_asset("../workload_enforcer"),
+                environment={
+                    "USERS_TABLE": users_table.table_name,
+                    "USAGE_TABLE": usage_table.table_name,
+                    "SNS_TOPIC_ARN": alert_topic.topic_arn,
+                    "METRICS_NAMESPACE": METRICS_NAMESPACE,
+                    "WORKLOADS_JSON": cdk.Fn.to_json_string(
+                        workload_enforcement
+                    ),
+                    "DENY_POLICY_NAME": "bedrock-quota-workload-deny",
+                },
+            )
+            users_table.grant_read_write_data(workload_enforcer_fn)
+            usage_table.grant_read_data(workload_enforcer_fn)
+            alert_topic.grant_publish(workload_enforcer_fn)
+            if workload_role_arns:
+                workload_enforcer_fn.add_to_role_policy(
+                    iam.PolicyStatement(
+                        actions=[
+                            "iam:PutRolePolicy",
+                            "iam:DeleteRolePolicy",
+                            "iam:GetRolePolicy",
+                        ],
+                        resources=sorted(set(workload_role_arns)),
+                    )
+                )
+            workload_enforcer_fn.add_event_source(
+                lambda_event_sources.DynamoEventSource(
+                    users_table,
+                    starting_position=lambda_.StartingPosition.LATEST,
+                    batch_size=100,
+                    max_batching_window=Duration.seconds(5),
+                    bisect_batch_on_error=True,
+                    retry_attempts=10,
+                    on_failure=lambda_event_sources.SqsDlq(workload_dlq),
+                    filters=[
+                        lambda_.FilterCriteria.filter(
+                            {
+                                "dynamodb": {
+                                    "Keys": {
+                                        "user_id": {
+                                            "S": [
+                                                {"prefix": "workload:"}
+                                            ]
+                                        }
+                                    }
+                                }
+                            }
+                        )
+                    ],
+                )
+            )
+            events.Rule(
+                self,
+                "WorkloadEnforcementSchedule",
+                schedule=events.Schedule.rate(Duration.minutes(5)),
+                targets=[
+                    events_targets.LambdaFunction(
+                        workload_enforcer_fn,
+                        event=events.RuleTargetInput.from_object(
+                            {"source": "aws.events"}
+                        ),
+                    )
+                ],
+            )
+            workload_failure_alarm = cw.Alarm(
+                self,
+                "WorkloadEnforcementFailureAlarm",
+                metric=cw.Metric(
+                    namespace=METRICS_NAMESPACE,
+                    metric_name="WorkloadEnforcementFailure",
+                    statistic="Sum",
+                    period=Duration.minutes(5),
+                ),
+                threshold=1,
+                evaluation_periods=1,
+                treat_missing_data=cw.TreatMissingData.NOT_BREACHING,
+            )
+            workload_failure_alarm.add_alarm_action(
+                cw_actions.SnsAction(alert_topic)
+            )
+            operations_alarms["workload_enforcement_failure"] = (
+                workload_failure_alarm
+            )
+            workload_dlq_alarm = cw.Alarm(
+                self,
+                "WorkloadEnforcementDlqAlarm",
+                metric=workload_dlq.metric_approximate_number_of_messages_visible(
+                    period=Duration.minutes(5)
+                ),
+                threshold=1,
+                evaluation_periods=1,
+            )
+            workload_dlq_alarm.add_alarm_action(
+                cw_actions.SnsAction(alert_topic)
+            )
+            operations_alarms["workload_enforcement_dlq"] = (
+                workload_dlq_alarm
             )
 
         # A fallback-priced request means an invocation was metered with the

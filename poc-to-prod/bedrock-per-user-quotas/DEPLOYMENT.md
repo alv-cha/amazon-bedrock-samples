@@ -95,6 +95,7 @@ Direct `-c key=value` values override the file.
 | `alert_email` | empty | Creates an SNS email subscription |
 | `snapstart` | `false` | Enable Python Lambda SnapStart for the broker |
 | `adapter_layer_arn` | regional default | Override Lambda Web Adapter layer |
+| `workloads` | empty | Workload-mode roster (inline JSON or file path); see [Workload mode](#workload-mode-per-workload-quotas) |
 
 ### Safe routine administration
 
@@ -288,6 +289,82 @@ model resources. Validate the complete policy for every profile used.
 The vended role does not grant `bedrock:CallWithBearerToken`. Bedrock API keys
 are therefore intentionally outside this sample. Applications use the
 temporary STS credentials and SigV4.
+
+### Workload mode (per-workload quotas)
+
+One governance layer, three quota granularities, one set of tables and
+dashboards:
+
+| Granularity | Mechanism | Target |
+|---|---|---|
+| Per user | JWT (`sub`) via broker or proxy | any app with an IdP |
+| Per tenant | JWT with a tenant claim (`jwt_user_claim`) | ISV per-tenant caps |
+| Per workload | Application inference profile + IAM Deny | SMB, ISV internal workloads |
+
+Workload mode covers applications that call `bedrock-runtime` directly with
+their own IAM role — no JWT, no vend flow, zero client code change. Create
+`cdk/config/workloads.json` from the example:
+
+```json
+{
+  "workloads": [
+    {
+      "name": "payments-batch",
+      "model": "us.anthropic.claude-opus-4-7",
+      "role_arn": "arn:aws:iam::111122223333:role/payments-batch-app"
+    },
+    { "name": "reports-generator", "model": "anthropic.claude-haiku-4-5-20251001-v1:0" }
+  ]
+}
+```
+
+and deploy with `-c workloads=config/workloads.json` (or the `workloads` key
+in `deployment_config`). `name` must match `[a-z0-9][a-z0-9-]{0,47}`;
+`model` is a foundation-model ID or cross-region inference-profile ID (never
+an ARN); `role_arn` is optional but strongly recommended.
+
+Per workload the stack creates an application inference profile named
+`bedrock-quota-<name>` (tagged `bedrock-quota-workload=<name>` for cost
+allocation) and outputs its ARN (`WorkloadProfileArn<Name>`). The
+application invokes with that ARN as `modelId` — the only change on the
+workload side, and it is a configuration value, not code:
+
+```python
+bedrock_runtime.converse(modelId="<WorkloadProfileArn output>", ...)
+```
+
+**Direct attach (paved road).** With `role_arn`, the stack attaches the
+invoke policy to the role: an allow on the workload's own profile plus a
+`bedrock:InferenceProfileArn`-conditioned allow on the routed models, so the
+role cannot invoke anything except through its profile. The enforcement
+Lambda's IAM permissions are scoped to exactly the enrolled role ARNs —
+never a wildcard.
+
+**Snippet fallback.** Without `role_arn`, the policy document is emitted as
+the `WorkloadPolicySnippet<Name>` output for the customer to attach. The
+workload is metered, alerted, and visible in the admin UI, but cannot be
+hard-blocked: it reports `enforcement_ready: false` in the admin API and
+"metering only" in the UI, and blocked-without-enforcement runs raise the
+`WorkloadEnforcementSkipped` metric and an SNS alert. Add `role_arn` and
+redeploy to promote it.
+
+**Runtime behavior.** Usage attributed by the profile ARN in invocation-log
+records flows into the same `workload:<name>` row, counters, and windows as
+JWT identities (auto-provisioned with the deploy default limits on first
+usage; priced by the profile's underlying model). On budget exhaustion the
+metering processor blocks the row; the workload enforcer (users-table stream
+fast path plus a 5-minute schedule) attaches an inline
+`bedrock-quota-workload-deny` policy to the role. Expect metering lag
+(about 15 s) plus IAM propagation (seconds to about a minute) of bounded
+overspend. The Deny applies to sessions the role has already issued. When
+the daily window resets, the enforcer lifts automatic blocks and removes the
+Deny; admin-origin blocks never lift automatically. All admin operations use
+the standard endpoints with `user_id=workload:<name>`, and
+`GET /admin/users?granularity=workload` filters the roster.
+
+Scale envelope: 1,000 application inference profiles per account
+(adjustable), 1,000 IAM roles per account (adjustable); the deny document is
+about 300 bytes against the 10,240-character inline policy limit.
 
 ### Price configuration
 

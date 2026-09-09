@@ -50,11 +50,13 @@ _DEFAULT_FALLBACK_PRICE = (15.00, 75.00)
 @dataclass(frozen=True)
 class InvocationUsage:
     request_id: str
-    session_name: str
+    session_name: str | None
     model_id: str
     input_tokens: int
     output_tokens: int
     occurred_at: datetime
+    workload_id: str | None = None
+    workload_name: str | None = None
 
     @property
     def window(self) -> str:
@@ -110,20 +112,40 @@ def _timestamp(record: dict, log_event: dict) -> datetime:
     return datetime.fromtimestamp(millis / 1000, tz=timezone.utc)
 
 
+def _workload_profiles() -> dict[str, dict[str, str]]:
+    """Attribution map: application-inference-profile ARN -> workload.
+
+    Built from WORKLOAD_PROFILES_JSON ({name: {workload_id, profile_arn,
+    model}}). The invocation-log ``modelId`` field preserves the profile ARN
+    (verified empirically), which makes it the attribution key for apps
+    calling bedrock-runtime with their own credentials.
+    """
+    raw = os.environ.get("WORKLOAD_PROFILES_JSON")
+    if not raw:
+        return {}
+    by_arn: dict[str, dict[str, str]] = {}
+    for name, entry in json.loads(raw).items():
+        profile_arn = str(entry.get("profile_arn", ""))
+        if not profile_arn:
+            continue
+        by_arn[profile_arn] = {
+            "workload_id": str(entry.get("workload_id") or f"workload:{name}"),
+            "model": str(entry.get("model", "")),
+            "name": str(name),
+        }
+    return by_arn
+
+
 def _parse_invocation(
-    log_event: dict, expected_role_name: str
+    log_event: dict,
+    expected_role_name: str,
+    workload_profiles: dict[str, dict[str, str]] | None = None,
 ) -> InvocationUsage | None:
     try:
         record = json.loads(log_event.get("message", ""))
     except (TypeError, json.JSONDecodeError):
         return None
     if not isinstance(record, dict):
-        return None
-
-    identity = record.get("identity")
-    arn = identity.get("arn", "") if isinstance(identity, dict) else ""
-    match = _ASSUMED_ROLE_ARN.search(str(arn))
-    if not match or match.group("role") != expected_role_name:
         return None
 
     input_data = record.get("input")
@@ -145,10 +167,37 @@ def _parse_invocation(
         request_id = hashlib.sha256(
             str(log_event.get("message", "")).encode("utf-8")
         ).hexdigest()
+
+    # Workload attribution comes first: profile-routed traffic authenticates
+    # with the customer's own principal, so the vended-role check below can
+    # never claim it, and a vended session invoking a workload profile is
+    # deterministically attributed to the workload that pays for it.
+    model_id = str(record.get("modelId") or "unknown")
+    workload = (workload_profiles or {}).get(model_id)
+    if workload is not None:
+        return InvocationUsage(
+            request_id=request_id,
+            session_name=None,
+            # Price and report by the profile's underlying model: the
+            # profile ARN itself has no price entry.
+            model_id=workload["model"] or model_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            occurred_at=_timestamp(record, log_event),
+            workload_id=workload["workload_id"],
+            workload_name=workload["name"],
+        )
+
+    identity = record.get("identity")
+    arn = identity.get("arn", "") if isinstance(identity, dict) else ""
+    match = _ASSUMED_ROLE_ARN.search(str(arn))
+    if not match or match.group("role") != expected_role_name:
+        return None
+
     return InvocationUsage(
         request_id=request_id,
         session_name=match.group("session"),
-        model_id=str(record.get("modelId") or "unknown"),
+        model_id=model_id,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         occurred_at=_timestamp(record, log_event),
@@ -572,6 +621,48 @@ def _emit_emf(
     print(json.dumps(record))
 
 
+def _default_limits() -> tuple[int, int, int]:
+    """Deploy-configured default limits, mirroring the gateway's shape."""
+    usd = float(os.environ.get("DEFAULT_DAILY_USD", "1.0"))
+    input_tokens = int(os.environ.get("DEFAULT_DAILY_INPUT_TOKENS", "1000000"))
+    output_tokens = int(
+        os.environ.get("DEFAULT_DAILY_OUTPUT_TOKENS", "200000")
+    )
+    return int(round(usd * MICRO)), input_tokens, output_tokens
+
+
+def _ensure_workload_user(users_table, workload_id: str, name: str) -> None:
+    """Create the workload's quota row on first metered usage.
+
+    Same item shape and defaults as the gateway's auto-provision path so
+    admin limit/status mutations apply identically. Losing the race to a
+    concurrent create (admin or another processor invocation) is fine.
+    """
+    usd_micro, input_tokens, output_tokens = _default_limits()
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        users_table.put_item(
+            Item={
+                "user_id": workload_id,
+                "name": name,
+                "status": "active",
+                "status_reason": "",
+                "daily_usd_micro": usd_micro,
+                "daily_input_tokens": input_tokens,
+                "daily_output_tokens": output_tokens,
+                "version": 1,
+                "created_at": now,
+                "updated_at": now,
+                "status_origin": "automatic",
+            },
+            ConditionExpression="attribute_not_exists(user_id)",
+        )
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code != "ConditionalCheckFailedException":
+            raise
+
+
 def handler(
     event,
     context,
@@ -608,19 +699,29 @@ def handler(
         "ignored": 0,
     }
     unresolved: set[str] = set()
+    workload_profiles = _workload_profiles()
     for log_event in _decode_subscription(event):
-        usage = _parse_invocation(log_event, expected_role)
+        usage = _parse_invocation(
+            log_event, expected_role, workload_profiles
+        )
         if usage is None:
             result["ignored"] += 1
             continue
-        mapping = users_table.get_item(
-            Key={"user_id": f"SESSION#{usage.session_name}"},
-            ConsistentRead=True,
-        ).get("Item")
-        if not mapping:
-            unresolved.add(usage.session_name)
-            continue
-        user_id = str(mapping["maps_to"])
+        if usage.workload_id is not None:
+            user_id = usage.workload_id
+            _ensure_workload_user(
+                users_table, user_id, usage.workload_name or user_id
+            )
+        else:
+            assert usage.session_name is not None
+            mapping = users_table.get_item(
+                Key={"user_id": f"SESSION#{usage.session_name}"},
+                ConsistentRead=True,
+            ).get("Item")
+            if not mapping:
+                unresolved.add(usage.session_name)
+                continue
+            user_id = str(mapping["maps_to"])
         rates, price_source = _price_for(prices, fallback, usage.model_id)
         cost_micro = _tokens_cost_micro(
             rates, usage.input_tokens, usage.output_tokens

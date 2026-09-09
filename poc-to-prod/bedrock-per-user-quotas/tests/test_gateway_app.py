@@ -1793,3 +1793,166 @@ def test_admin_user_lease_serializes_in_revocation_mode(client, monkeypatch):
     assert listed.status_code == 200  # was 500 before the fix
     row = next(u for u in listed.json()["users"] if u["user_id"] == "victor")
     assert row["lease"]["lease_seconds"] == 3600
+
+
+# ---------------------------------------------------------------------------
+# Workload mode: reserved namespace, granularity surfacing, list filter
+# ---------------------------------------------------------------------------
+
+
+def _seed_workload(store, workload_id="workload:payments", **overrides):
+    store.put_user(
+        workload_id,
+        overrides.get("name", "payments"),
+        overrides.get("daily_usd", 5.0),
+        overrides.get("daily_input_tokens", 0),
+        overrides.get("daily_output_tokens", 0),
+    )
+
+
+def test_workload_namespace_cannot_vend_credentials(client):
+    api, store, broker = client
+
+    response = _vend(api, make_jwt("workload:payments"))
+
+    assert response.status_code == 401
+    assert "workload:" in response.json()["error"]["message"]
+    assert broker.users == []
+    # The rejected vend must not auto-provision a row in the namespace.
+    assert store.get_user("workload:payments") is None
+
+
+def test_workload_rows_carry_granularity_and_enforcement_ready(
+    client, monkeypatch
+):
+    from dataclasses import replace as dc_replace
+
+    api, store, _ = client
+    _seed_workload(store, "workload:payments")
+    _seed_workload(store, "workload:reports", name="reports")
+    monkeypatch.setattr(
+        gateway,
+        "settings",
+        dc_replace(
+            gateway.settings,
+            workload_enforcement_json=json.dumps(
+                {
+                    "workload:payments": {
+                        "name": "payments",
+                        "enforcement_ready": True,
+                    },
+                    "workload:reports": {
+                        "name": "reports",
+                        "enforcement_ready": False,
+                    },
+                }
+            ),
+        ),
+    )
+
+    detail = api.get(
+        "/admin/user",
+        params={"user_id": "workload:payments"},
+        headers={"X-Quota-Admin-Key": "admin-secret"},
+    )
+    assert detail.status_code == 200
+    payload = detail.json()["user"]
+    assert payload["granularity"] == "workload"
+    assert payload["enforcement_ready"] is True
+
+    reports = api.get(
+        "/admin/user",
+        params={"user_id": "workload:reports"},
+        headers={"X-Quota-Admin-Key": "admin-secret"},
+    ).json()["user"]
+    assert reports["enforcement_ready"] is False
+
+
+def test_workload_missing_from_registry_reports_not_ready(client):
+    api, store, _ = client
+    _seed_workload(store, "workload:orphan", name="orphan")
+
+    detail = api.get(
+        "/admin/user",
+        params={"user_id": "workload:orphan"},
+        headers={"X-Quota-Admin-Key": "admin-secret"},
+    ).json()["user"]
+
+    assert detail["granularity"] == "workload"
+    assert detail["enforcement_ready"] is False
+
+
+def test_plain_users_report_user_granularity_without_enforcement_field(
+    client,
+):
+    api, store, _ = client
+    store.put_user("alice", "alice", 1.0, 0, 0)
+
+    detail = api.get(
+        "/admin/user",
+        params={"user_id": "alice"},
+        headers={"X-Quota-Admin-Key": "admin-secret"},
+    ).json()["user"]
+
+    assert detail["granularity"] == "user"
+    assert "enforcement_ready" not in detail
+
+
+def test_list_users_filters_by_granularity(client):
+    api, store, _ = client
+    store.put_user("alice", "alice", 1.0, 0, 0)
+    _seed_workload(store, "workload:payments")
+
+    everyone = api.get(
+        "/admin/users", headers={"X-Quota-Admin-Key": "admin-secret"}
+    ).json()["users"]
+    assert {user["user_id"] for user in everyone} == {
+        "alice",
+        "workload:payments",
+    }
+
+    workloads = api.get(
+        "/admin/users",
+        params={"granularity": "workload"},
+        headers={"X-Quota-Admin-Key": "admin-secret"},
+    ).json()["users"]
+    assert [user["user_id"] for user in workloads] == ["workload:payments"]
+
+    users = api.get(
+        "/admin/users",
+        params={"granularity": "user"},
+        headers={"X-Quota-Admin-Key": "admin-secret"},
+    ).json()["users"]
+    assert [user["user_id"] for user in users] == ["alice"]
+
+    invalid = api.get(
+        "/admin/users",
+        params={"granularity": "tenant"},
+        headers={"X-Quota-Admin-Key": "admin-secret"},
+    )
+    assert invalid.status_code == 400
+
+
+def test_workload_admin_mutations_use_standard_endpoints(client):
+    """Workloads are ordinary rows: limits and manual blocks just work."""
+    api, store, _ = client
+    _seed_workload(store, "workload:payments")
+    current = api.get(
+        "/admin/user",
+        params={"user_id": "workload:payments"},
+        headers={"X-Quota-Admin-Key": "admin-secret"},
+    )
+
+    updated = api.put(
+        "/admin/user/limits",
+        params={"user_id": "workload:payments"},
+        headers={
+            "X-Quota-Admin-Key": "admin-secret",
+            "If-Match": current.headers["ETag"],
+            "Idempotency-Key": "workload-limit-test",
+        },
+        json={"daily_usd": 9.5, "reason": "workload budget bump"},
+    )
+
+    assert updated.status_code == 200
+    assert updated.json()["user"]["limits"]["daily_usd"] == 9.5
