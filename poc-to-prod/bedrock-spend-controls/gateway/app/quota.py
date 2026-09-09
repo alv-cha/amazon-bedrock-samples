@@ -39,6 +39,10 @@ RESERVED_USER_ID_PREFIXES = (
 # never authenticate through the JWT vend path.
 WORKLOAD_USER_ID_PREFIX = "workload:"
 
+# Runtime-adjustable permission-lease windows (seconds). The dial is a
+# CONFIG#ENFORCEMENT row; the deployment context only sets the default.
+VALID_PERMISSION_LEASE_SECONDS = (60, 300, 900)
+
 
 def validate_user_id(user_id: str) -> str:
     if not user_id or any(
@@ -86,6 +90,7 @@ class UserRecord:
     lease_expires_at_epoch: int | None = None
     lease_refresh_after_epoch: int | None = None
     lease_generation: int | None = None
+    lease_duration_seconds: int | None = None
 
     @property
     def active(self) -> bool:
@@ -472,6 +477,7 @@ class QuotaStore:
             ":expires": int(expires_at.timestamp()),
             ":refresh": int(refresh_after.timestamp()),
             ":updated": now.isoformat(),
+            ":duration": int(duration),
         }
         if current is not None:
             values.update(
@@ -488,7 +494,8 @@ class QuotaStore:
                     "lease_generation = :generation, "
                     "lease_expires_at_epoch = :expires, "
                     "lease_refresh_after_epoch = :refresh, "
-                    "lease_updated_at = :updated"
+                    "lease_updated_at = :updated, "
+                    "lease_duration_seconds = :duration"
                 ),
                 ConditionExpression=condition,
                 ExpressionAttributeValues=values,
@@ -526,6 +533,112 @@ class QuotaStore:
                 "reason": "",
             }
         return dict(item)
+
+    def get_enforcement_config(self) -> dict:
+        """Runtime enforcement dial: the effective permission-lease window.
+
+        Falls back to the deployment default when no runtime override has
+        been written. Strongly consistent so a dial change applies to the
+        very next vend.
+        """
+        item = self._users.get_item(
+            Key={"user_id": "CONFIG#ENFORCEMENT"},
+            ConsistentRead=True,
+        ).get("Item")
+        if not item:
+            return {
+                "permission_lease_seconds": settings.permission_lease_seconds,
+                "source": "deployment_default",
+                "generation": 0,
+                "actor": "",
+                "reason": "",
+                "updated_at": None,
+            }
+        return {
+            "permission_lease_seconds": int(
+                item.get(
+                    "permission_lease_seconds",
+                    settings.permission_lease_seconds,
+                )
+            ),
+            "source": "runtime",
+            "generation": int(item.get("generation", 0)),
+            "actor": str(item.get("actor", "")),
+            "reason": str(item.get("reason", "")),
+            "updated_at": (
+                str(item["updated_at"]) if item.get("updated_at") else None
+            ),
+        }
+
+    def effective_permission_lease_seconds(self) -> int:
+        return int(
+            self.get_enforcement_config()["permission_lease_seconds"]
+        )
+
+    def set_permission_lease_seconds(
+        self,
+        seconds: int,
+        *,
+        actor: str,
+        reason: str,
+        now: datetime | None = None,
+    ) -> dict:
+        """Change the lease window at runtime (audited, no redeploy).
+
+        Applies to NEW vends only: outstanding credentials keep the
+        deadline they were issued with, and the revocation layer keeps
+        cutting blocked identities regardless of the dial.
+        """
+        if seconds not in VALID_PERMISSION_LEASE_SECONDS:
+            raise ValueError(
+                "permission_lease_seconds must be one of "
+                f"{sorted(VALID_PERMISSION_LEASE_SECONDS)}; got {seconds}"
+            )
+        floor = (
+            settings.refresh_overlap_seconds
+            + settings.refresh_jitter_seconds
+        )
+        if seconds <= floor:
+            raise ValueError(
+                "permission_lease_seconds must exceed refresh_overlap"
+                f"+jitter ({floor}s) or leases could never refresh"
+            )
+        now = now or datetime.now(timezone.utc)
+        current = self.get_enforcement_config()
+        generation = int(current.get("generation", 0)) + 1
+        request_id = str(uuid.uuid4())
+        # Immutable audit row first (CONFIG# prefix keeps it out of every
+        # user scan and enforcement consumer); a later state-write failure
+        # leaves an unapplied request record, never an unaudited change.
+        self._users.put_item(
+            Item={
+                "user_id": (
+                    f"CONFIG#ENFORCEMENT_AUDIT#{now.isoformat()}"
+                    f"#{request_id}"
+                ),
+                "action": "set_permission_lease_seconds",
+                "permission_lease_seconds": seconds,
+                "previous_permission_lease_seconds": int(
+                    current["permission_lease_seconds"]
+                ),
+                "actor": actor,
+                "reason": reason,
+                "generation": generation,
+                "requested_at": now.isoformat(),
+                "expires_at": window_ttl_epoch(now),
+            }
+        )
+        self._users.put_item(
+            Item={
+                "user_id": "CONFIG#ENFORCEMENT",
+                "permission_lease_seconds": seconds,
+                "generation": generation,
+                "actor": actor,
+                "reason": reason,
+                "updated_at": now.isoformat(),
+            }
+        )
+        return self.get_enforcement_config()
 
     def emergency_stop_active(self) -> bool:
         state = self.get_emergency_state()
@@ -1142,6 +1255,11 @@ class QuotaStore:
             lease_generation=(
                 int(item["lease_generation"])
                 if item.get("lease_generation") is not None
+                else None
+            ),
+            lease_duration_seconds=(
+                int(item["lease_duration_seconds"])
+                if item.get("lease_duration_seconds") is not None
                 else None
             ),
         )

@@ -164,7 +164,7 @@ def _emit(metrics: dict[str, tuple[str, int]], properties: dict) -> None:
 
 
 def _should_reconcile(event: dict) -> bool:
-    if event.get("source") == "aws.events":
+    if event.get("source") in ("aws.events", "enforcement-dispatch"):
         return True
     for record in event.get("Records", []):
         keys = record.get("dynamodb", {}).get("Keys", {})

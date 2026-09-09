@@ -307,6 +307,7 @@ export interface Summary {
     mode: string;
     credential_ttl_seconds: number;
     permission_lease_seconds: number;
+    permission_lease_source?: string;
     post_detection_fallback_seconds: number;
     refresh_overlap_seconds: number;
     refresh_jitter_seconds: number;
@@ -332,6 +333,8 @@ export interface Operations {
     mode: string;
     credential_ttl_seconds: number;
     permission_lease_seconds: number;
+    permission_lease_source?: string;
+    permission_lease_default_seconds?: number;
     permission_lease_enabled: boolean;
     effective_permission_lease_seconds: number | null;
     post_detection_fallback_seconds: number;

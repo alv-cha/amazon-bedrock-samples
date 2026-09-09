@@ -211,11 +211,13 @@ def test_manual_and_usage_blocks_prevent_vending(client):
 
 
 def test_existing_credentials_are_not_revoked_by_current_status_block(client):
+    """Blocking denies the next vend/refresh; already-issued keys keep
+    their fixed deadline (the revocation layer cuts them out-of-band)."""
     api, store, broker = client
 
     issued = _vend(api, make_jwt("alice"))
     assert issued.status_code == 200
-    assert issued.json()["expiration"] == "2026-08-18T12:15:00+00:00"
+    assert issued.json()["expiration"]  # permission deadline, always set
 
     store.set_user_status("alice", "blocked", "admin baseline")
     rejected = _vend(api, make_jwt("alice"))
@@ -226,13 +228,32 @@ def test_existing_credentials_are_not_revoked_by_current_status_block(client):
     assert issued.json()["aws_access_key_id"] == "ASIAFAKE"
 
 
-def test_current_broker_allows_overlapping_credential_vends(client):
+def test_overlapping_vends_require_the_same_lease_id(client):
+    """A second vend with a fresh lease ID cannot extend access early; the
+    same lease ID retries the fixed, non-extending deadline."""
     api, _, broker = client
 
-    first = _vend(api, make_jwt("alice"))
-    second = _vend(api, make_jwt("alice"))
+    first = api.post(
+        "/v1/credentials",
+        headers={
+            "Authorization": f"Bearer {make_jwt('alice')}",
+            "X-Quota-Lease-Id": "lease-a",
+        },
+    )
+    fresh_id = _vend(api, make_jwt("alice"))
+    retry = api.post(
+        "/v1/credentials",
+        headers={
+            "Authorization": f"Bearer {make_jwt('alice')}",
+            "X-Quota-Lease-Id": "lease-a",
+        },
+    )
 
-    assert first.status_code == second.status_code == 200
+    assert first.status_code == 200
+    assert fresh_id.status_code == 429
+    assert fresh_id.json()["error"]["type"] == "lease_not_refreshable"
+    assert retry.status_code == 200
+    assert retry.json()["expiration"] == first.json()["expiration"]
     assert broker.users == ["alice", "alice"]
 
 
@@ -245,7 +266,6 @@ def test_lease_mode_retries_fixed_lease_and_rejects_premature_new_id(
         "settings",
         replace(
             gateway.settings,
-            credential_enforcement_mode="lease",
             permission_lease_seconds=300,
         ),
     )
@@ -291,7 +311,7 @@ def test_failed_sts_attempt_keeps_fixed_lease_for_same_id_retry(
     monkeypatch.setattr(
         gateway,
         "settings",
-        replace(gateway.settings, credential_enforcement_mode="lease"),
+        replace(gateway.settings),
     )
 
     class FailingOnceBroker(FakeBroker):
@@ -347,7 +367,7 @@ def test_post_reservation_gate_recheck_catches_concurrent_block(
     monkeypatch.setattr(
         gateway,
         "settings",
-        replace(gateway.settings, credential_enforcement_mode="lease"),
+        replace(gateway.settings),
     )
     original_reserve = store.reserve_lease
 
@@ -431,9 +451,13 @@ def test_admin_summary_exposes_single_guarantee(client):
     api, store, _ = client
     store.put_user("alice", "Alice", 1, 100, 50)
     body = api.get("/admin/summary", headers=ADMIN).json()
-    assert body["enforcement"]["mode"] == "bounded_overspend"
+    assert body["enforcement"]["mode"] == "layered"
     assert body["enforcement"]["credential_ttl_seconds"] == 900
     assert body["enforcement"]["permission_lease_seconds"] == 300
+    assert body["enforcement"]["permission_lease_source"] == (
+        "deployment_default"
+    )
+    assert body["enforcement"]["post_detection_fallback_seconds"] == 300
     assert body["enforcement"]["refresh_overlap_seconds"] == 10
     assert body["enforcement"]["refresh_jitter_seconds"] == 5
     assert body["enforcement"]["vend_rate_limit_per_minute"] == 6
@@ -466,7 +490,6 @@ def test_operations_is_read_only_safe_and_reports_revocation_health(
         "settings",
         replace(
             gateway.settings,
-            credential_enforcement_mode="revocation",
             vended_credential_ttl_seconds=3600,
             operations_alarm_names_json=json.dumps(alarm_names),
         ),
@@ -562,12 +585,14 @@ def test_operations_is_read_only_safe_and_reports_revocation_health(
     assert response.status_code == 200
     body = response.json()
     assert body["configuration"] == {
-        "mode": "active_session_revocation",
+        "mode": "layered",
         "credential_ttl_seconds": 3600,
         "permission_lease_seconds": 300,
-        "permission_lease_enabled": False,
-        "effective_permission_lease_seconds": None,
-        "post_detection_fallback_seconds": 3600,
+        "permission_lease_source": "deployment_default",
+        "permission_lease_default_seconds": 300,
+        "permission_lease_enabled": True,
+        "effective_permission_lease_seconds": 300,
+        "post_detection_fallback_seconds": 300,
         "refresh_overlap_seconds": 10,
         "refresh_jitter_seconds": 5,
         "vend_rate_limit_per_minute": 6,
@@ -583,7 +608,10 @@ def test_operations_is_read_only_safe_and_reports_revocation_health(
     assert body["metrics"]["telemetry_status"] == "complete"
     assert body["metrics"]["revoked_identities_desired"] == 7
     assert body["metrics"]["reconciliation_status"] == "current"
-    assert body["qualification"]["status"] == (
+    assert body["qualification"]["lease_status"] == (
+        "pending_live_sandbox_probe"
+    )
+    assert body["qualification"]["revocation_status"] == (
         "experimental_pending_propagation_isolation_probe"
     )
     assert body["cloudwatch"]["status"] == "available"
@@ -614,7 +642,6 @@ def test_operations_marks_partial_cloudwatch_evidence_unknown(
         "settings",
         replace(
             gateway.settings,
-            credential_enforcement_mode="revocation",
             vended_credential_ttl_seconds=3600,
             operations_alarm_names_json=json.dumps(alarm_names),
         ),
@@ -679,34 +706,40 @@ def test_operations_gracefully_reports_unavailable_cloudwatch(
         "status": "unavailable",
         "error_code": "AccessDenied",
     }
-    assert body["configuration"]["mode"] == "bounded_overspend"
-    assert body["configuration"]["permission_lease_enabled"] is False
-    assert body["configuration"]["effective_permission_lease_seconds"] is None
+    assert body["configuration"]["mode"] == "layered"
+    assert body["configuration"]["permission_lease_enabled"] is True
+    assert body["configuration"]["effective_permission_lease_seconds"] == 300
     assert body["emergency"]["state"] == "inactive"
     assert body["metrics"]["detection_lag_p95_ms"] is None
-    assert body["metrics"]["reconciliation_status"] == "not_applicable"
+    # Revocation is always on: unavailable telemetry is unknown, never N/A.
+    assert body["metrics"]["reconciliation_status"] == "unknown"
     assert all(alarm["state"] == "UNAVAILABLE" for alarm in body["alarms"])
 
 
-def test_admin_summary_distinguishes_permission_lease_mode(
+def test_admin_summary_and_operations_follow_the_runtime_dial(
     client, monkeypatch
 ):
+    """The lease window is a runtime dial, not a deployment mode."""
     api, _, _ = client
-    monkeypatch.setattr(
-        gateway,
-        "settings",
-        replace(
-            gateway.settings,
-            credential_enforcement_mode="lease",
-            permission_lease_seconds=60,
-        ),
+
+    baseline = api.get("/admin/summary", headers=ADMIN).json()["enforcement"]
+    assert baseline["permission_lease_seconds"] == 300
+    assert baseline["permission_lease_source"] == "deployment_default"
+
+    updated = api.put(
+        "/admin/enforcement",
+        headers=ADMIN,
+        json={"permission_lease_seconds": 60, "reason": "incident response"},
     )
+    assert updated.status_code == 200
+    assert updated.json()["permission_lease_seconds"] == 60
+    assert updated.json()["source"] == "runtime"
 
     enforcement = api.get("/admin/summary", headers=ADMIN).json()[
         "enforcement"
     ]
-
-    assert enforcement["mode"] == "permission_lease"
+    assert enforcement["mode"] == "layered"
+    assert enforcement["permission_lease_seconds"] == 60
     assert enforcement["post_detection_fallback_seconds"] == 60
 
     monkeypatch.setattr(
@@ -724,6 +757,12 @@ def test_admin_summary_distinguishes_permission_lease_mode(
     assert operations["configuration"][
         "effective_permission_lease_seconds"
     ] == 60
+    assert operations["configuration"]["permission_lease_source"] == (
+        "runtime"
+    )
+    assert operations["configuration"][
+        "permission_lease_default_seconds"
+    ] == 300
 
 
 def test_emergency_stop_requires_break_glass_confirmation_and_gates_recovery(
@@ -1726,7 +1765,6 @@ def test_admin_user_payload_exposes_lease_timing_but_never_the_lease_id(
         "settings",
         replace(
             gateway.settings,
-            credential_enforcement_mode="lease",
             permission_lease_seconds=300,
         ),
     )
@@ -1769,30 +1807,33 @@ def test_admin_user_payload_exposes_lease_timing_but_never_the_lease_id(
     assert row["lease"]["generation"] == lease["generation"]
 
 
-def test_admin_user_lease_serializes_in_revocation_mode(client, monkeypatch):
-    """Regression: _lease_json crashed with AttributeError in non-lease modes
-    (post_detection_fallback_seconds does not exist on Settings)."""
+def test_admin_user_lease_serializes_grant_time_duration(client):
+    """Lease timing reflects the window at grant, not the current dial."""
     api, _, _ = client
-    monkeypatch.setattr(
-        gateway,
-        "settings",
-        replace(
-            gateway.settings,
-            credential_enforcement_mode="revocation",
-            vended_credential_ttl_seconds=3600,
-        ),
+    dial = api.put(
+        "/admin/enforcement",
+        headers=ADMIN,
+        json={"permission_lease_seconds": 900, "reason": "batch window"},
     )
+    assert dial.status_code == 200
     token = make_jwt("victor")
     vend = api.post(
         "/v1/credentials", headers={"Authorization": f"Bearer {token}"}
     )
+    # Dial back down: existing lease rows must keep their issued window.
+    back = api.put(
+        "/admin/enforcement",
+        headers=ADMIN,
+        json={"permission_lease_seconds": 60, "reason": "post-batch"},
+    )
+    assert back.status_code == 200
     listed = api.get(
         "/admin/users", headers={"X-Quota-Admin-Key": "admin-secret"}
     )
     assert vend.status_code == 200
-    assert listed.status_code == 200  # was 500 before the fix
+    assert listed.status_code == 200
     row = next(u for u in listed.json()["users"] if u["user_id"] == "victor")
-    assert row["lease"]["lease_seconds"] == 3600
+    assert row["lease"]["lease_seconds"] == 900
 
 
 # ---------------------------------------------------------------------------
@@ -1956,3 +1997,128 @@ def test_workload_admin_mutations_use_standard_endpoints(client):
 
     assert updated.status_code == 200
     assert updated.json()["user"]["limits"]["daily_usd"] == 9.5
+
+
+# ---------------------------------------------------------------------------
+# Layered enforcement: runtime dial + block/unblock race coherence
+# ---------------------------------------------------------------------------
+
+
+def test_enforcement_dial_validates_and_audits(client, fake_dynamodb):
+    api, _, _ = client
+
+    listed = api.get("/admin/enforcement", headers=ADMIN).json()
+    assert listed["valid_permission_lease_seconds"] == [60, 300, 900]
+    assert listed["default_permission_lease_seconds"] == 300
+    assert listed["source"] == "deployment_default"
+
+    invalid = api.put(
+        "/admin/enforcement",
+        headers=ADMIN,
+        json={"permission_lease_seconds": 120, "reason": "nope"},
+    )
+    assert invalid.status_code == 400
+    assert "must be one of" in invalid.json()["error"]["message"]
+
+    not_an_int = api.put(
+        "/admin/enforcement",
+        headers=ADMIN,
+        json={"permission_lease_seconds": "60", "reason": "strings no"},
+    )
+    assert not_an_int.status_code == 400
+
+    ok = api.put(
+        "/admin/enforcement",
+        headers=ADMIN,
+        json={"permission_lease_seconds": 60, "reason": "capstone demo"},
+    )
+    assert ok.status_code == 200
+    assert ok.json()["generation"] == 1
+
+    # House convention: a missing reason falls back to the legacy marker
+    # (consistent with every other admin mutation), it is not rejected.
+    defaulted = api.put(
+        "/admin/enforcement",
+        headers=ADMIN,
+        json={"permission_lease_seconds": 300},
+    )
+    assert defaulted.status_code == 200
+    assert defaulted.json()["generation"] == 2
+
+    # Immutable audit trail: the change writes a CONFIG#ENFORCEMENT_AUDIT row.
+    table = fake_dynamodb.Table("users-test")
+    audit_rows = sorted(
+        (
+            item
+            for item in table.scan()["Items"]
+            if str(item["user_id"]).startswith("CONFIG#ENFORCEMENT_AUDIT#")
+        ),
+        key=lambda item: str(item["user_id"]),
+    )
+    assert len(audit_rows) == 2
+    assert audit_rows[0]["permission_lease_seconds"] == 60
+    assert audit_rows[0]["previous_permission_lease_seconds"] == 300
+    assert audit_rows[0]["reason"] == "capstone demo"
+
+
+def test_vend_deadline_follows_the_runtime_dial(client):
+    api, _, broker = client
+    api.put(
+        "/admin/enforcement",
+        headers=ADMIN,
+        json={"permission_lease_seconds": 60, "reason": "tight window"},
+    )
+
+    response = _vend(api, make_jwt("alice"))
+
+    assert response.status_code == 200
+    deadline = datetime.fromisoformat(response.json()["expiration"])
+    remaining = (deadline - datetime.now(timezone.utc)).total_seconds()
+    assert 50 <= remaining <= 61
+
+
+def test_unblock_at_vend_rewrites_the_revocation_sentinel(
+    client, fake_dynamodb
+):
+    """Race coherence between the two enforcement paths.
+
+    An automatic block writes the row + sentinel (deny shards gain the
+    identity). When the window resets, the vend-path unblock must rewrite
+    the sentinel so the revocation fast path strips the deny; otherwise a
+    freshly-unblocked user would stay IAM-denied until the repair schedule.
+    """
+    api, store, _ = client
+    vend_before = api.post(
+        "/v1/credentials",
+        headers={
+            "Authorization": f"Bearer {make_jwt('alice')}",
+            "X-Quota-Lease-Id": "lease-race",
+        },
+    )
+    assert vend_before.status_code == 200
+    store.set_user_status(
+        "alice", "blocked", "auto: quota exhausted in 2026-09-08"
+    )
+    table = fake_dynamodb.Table("users-test")
+    sentinel = table.get_item(Key={"user_id": "REVOCATION#alice"}).get(
+        "Item"
+    )
+    assert sentinel and sentinel["desired_status"] == "blocked"
+
+    # New window, usage table empty: the vend-path refresh_auto_status
+    # lifts the automatic block and must re-fire the revocation fast path.
+    # Same lease ID: a valid non-extending retry of the fixed deadline.
+    recovered = api.post(
+        "/v1/credentials",
+        headers={
+            "Authorization": f"Bearer {make_jwt('alice')}",
+            "X-Quota-Lease-Id": "lease-race",
+        },
+    )
+
+    assert recovered.status_code == 200
+    assert store.get_user("alice").status == "active"
+    sentinel = table.get_item(Key={"user_id": "REVOCATION#alice"}).get(
+        "Item"
+    )
+    assert sentinel["desired_status"] == "active"

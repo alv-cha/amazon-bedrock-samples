@@ -45,15 +45,24 @@ invocation-log delivery latency
 + concurrent or already-authorized requests
 ```
 
-The credential broker supports three explicit modes:
+Enforcement is layered — there are no modes to choose. Every deployment
+carries all three layers, and each can only shorten effective access:
 
-| Mode | STS session | Post-detection behavior | Qualification |
-|---|---:|---|---|
-| `legacy` | 15–60 minutes | Blocks renewal; existing access ends at STS expiry | Default, existing behavior |
-| `lease` | 15 minutes | An immutable session policy ends Bedrock permission after 1, 5, or 15 minutes | Implemented; keep opt-in until the sandbox probe passes |
-| `revocation` | 60 minutes | Managed-policy shards deny blocked `aws:SourceIdentity` values after IAM propagation | Experimental; requires sandbox latency/capacity qualification |
+| Layer | Always on | What it does |
+|---|---|---|
+| Permission lease | yes | Every vended credential embeds an immutable session-policy deadline (60, 300, or 900 s — a **runtime dial**, changed via `PUT /admin/enforcement` with no redeploy) |
+| Active-session revocation | yes | Managed-policy shards deny blocked `aws:SourceIdentity` values after IAM propagation, cutting in-flight sessions before their lease ends |
+| Emergency stop | yes | Operator-confirmed break-glass: closes vending and applies a role-wide deny |
 
-`AssumeRole` still has a 15-minute minimum. In lease mode, the keys last 15
+When metering blocks an identity, two independent races start: the next
+lease refresh is refused (bounded by the lease window), and the revocation
+layer strips the identity's access (bounded by IAM propagation, usually
+seconds). Whichever ends first wins; overspend is limited to
+`metering lag + min(lease remainder, deny propagation)`. Both paths
+converge from the same version-guarded user row, so they can never
+contradict each other.
+
+`AssumeRole` still has a 15-minute minimum. The keys last at least 15
 minutes but their embedded session policy contains an earlier
 `aws:CurrentTime` deadline. Extending that permission requires another broker
 check and STS session. The lazy credential provider caches one set for all
@@ -63,10 +72,10 @@ The Lambda broker itself uses role chaining, so `vended_ttl_seconds` is limited
 to 3,600 seconds. An eight-hour session is rejected rather than synthesizing a
 configuration that fails at runtime.
 
-IAM updates are eventually consistent. Revocation mode reports propagation and
-capacity failures and falls back to the 60-minute session deadline. An
-operator-confirmed emergency stop closes new vending before applying a separate
-role-wide deny. Already-authorized streams may finish in every mode.
+IAM updates are eventually consistent. The revocation layer reports
+propagation and capacity failures and falls back to the lease deadline. An
+operator-confirmed emergency stop closes new vending before applying a
+separate role-wide deny. Already-authorized streams may finish.
 
 If a workload requires a strict decision before every inference request, it
 must place an enforcement component in the inference data path. That remains

@@ -22,7 +22,6 @@ _DEPLOYMENT_KEYS = {
     "allowed_model_arns",
     "alert_email",
     "auto_provision_users",
-    "credential_enforcement_mode",
     "default_daily_input_tokens",
     "default_daily_output_tokens",
     "default_daily_usd",
@@ -62,9 +61,6 @@ _DEFAULTS = {
     "allowed_model_arns": ["*"],
     "alert_email": "",
     "auto_provision_users": True,
-    # Keep legacy behavior until the non-production permission-lease probe
-    # has qualified the aws:CurrentTime session-policy mechanism.
-    "credential_enforcement_mode": "legacy",
     "default_daily_input_tokens": 1_000_000,
     "default_daily_output_tokens": 200_000,
     "default_daily_usd": 1.0,
@@ -128,7 +124,6 @@ class DeploymentConfig:
     allowed_model_arns: tuple[str, ...]
     alert_email: str
     auto_provision_users: bool
-    credential_enforcement_mode: str
     default_daily_input_tokens: int
     default_daily_output_tokens: int
     default_daily_usd: float
@@ -277,25 +272,6 @@ class DeploymentConfig:
                 f"role-chaining maximum is 3600; got {vended_ttl_seconds}"
             )
 
-        credential_enforcement_mode = _string(
-            "credential_enforcement_mode",
-            value("credential_enforcement_mode"),
-        ).lower()
-        supported_modes = {"legacy", "lease", "revocation"}
-        if credential_enforcement_mode not in supported_modes:
-            raise ValueError(
-                "credential_enforcement_mode must be one of legacy, lease, "
-                f"revocation; got {credential_enforcement_mode!r}"
-            )
-        if (
-            credential_enforcement_mode == "revocation"
-            and vended_ttl_seconds != 3_600
-        ):
-            raise ValueError(
-                "credential_enforcement_mode=revocation requires "
-                "vended_ttl_seconds=3600"
-            )
-
         permission_lease_seconds = _positive_int(
             "permission_lease_seconds", value("permission_lease_seconds")
         )
@@ -333,19 +309,12 @@ class DeploymentConfig:
         revocation_policy_shards = _positive_int(
             "revocation_policy_shards", value("revocation_policy_shards")
         )
-        if revocation_policy_shards > 19:
+        if revocation_policy_shards != 19:
             raise ValueError(
-                "revocation_policy_shards must be between 1 and 19 because "
-                "the emergency policy uses the twentieth role attachment; "
+                "revocation_policy_shards is an immutable 19-shard layout: "
+                "the emergency policy uses the twentieth role attachment, "
+                "and changing the count would rehash active denies; "
                 f"got {revocation_policy_shards}"
-            )
-        if (
-            credential_enforcement_mode == "revocation"
-            and revocation_policy_shards != 19
-        ):
-            raise ValueError(
-                "revocation mode requires the immutable 19-shard layout; "
-                "changing the shard count would rehash active denies"
             )
         revocation_reconcile_minutes = _positive_int(
             "revocation_reconcile_minutes",
@@ -402,7 +371,6 @@ class DeploymentConfig:
             auto_provision_users=_boolean(
                 "auto_provision_users", value("auto_provision_users")
             ),
-            credential_enforcement_mode=credential_enforcement_mode,
             default_daily_input_tokens=_positive_int(
                 "default_daily_input_tokens",
                 value("default_daily_input_tokens"),

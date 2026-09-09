@@ -76,11 +76,14 @@ def test_invocation_logging_requires_explicit_ownership_choice():
 def test_runtime_only_stack_is_event_driven_and_has_no_mantle_permissions():
     template = _template({"manage_invocation_logging": True})
 
-    # Emergency reconciliation (1 minute) and the daily model price refresh.
-    template.resource_count_is("AWS::Events::Rule", 2)
+    # Emergency reconciliation (1 minute), the daily model price refresh,
+    # and the always-on revocation repair schedule.
+    template.resource_count_is("AWS::Events::Rule", 3)
     template.resource_count_is("AWS::Logs::SubscriptionFilter", 1)
-    template.resource_count_is("AWS::Lambda::EventSourceMapping", 1)
-    template.resource_count_is("AWS::SQS::Queue", 1)
+    # Exactly two users-table stream consumers: the emergency processor and
+    # the enforcement dispatcher (DynamoDB Streams supports at most two).
+    template.resource_count_is("AWS::Lambda::EventSourceMapping", 2)
+    template.resource_count_is("AWS::SQS::Queue", 2)
     template.has_resource_properties(
         "AWS::Lambda::Url",
         {"AuthType": "AWS_IAM", "InvokeMode": "BUFFERED"},
@@ -91,6 +94,9 @@ def test_runtime_only_stack_is_event_driven_and_has_no_mantle_permissions():
     assert "bedrock-mantle" not in rendered
     assert "RECONCILER_INTERVAL_MINUTES" not in rendered
     assert "MODE_B_ALLOWED_MODEL_IDS_JSON" not in rendered
+    assert "CREDENTIAL_ENFORCEMENT_MODE" not in rendered
+    assert "RevocationProcessorFn" in rendered
+    assert "EnforcementDispatcherFn" in rendered
     assert any(
         logical_id.startswith("GatewayFn")
         for logical_id in template.find_resources(
@@ -151,7 +157,7 @@ def test_defaults_are_injected_and_tables_are_destroyable_for_demo():
     assert broker_env["DEFAULT_DAILY_OUTPUT_TOKENS"] == "200000"
     assert broker_env["USAGE_RETENTION_DAYS"] == "35"
     assert broker_env["VENDED_CREDENTIAL_TTL_SECONDS"] == "900"
-    assert broker_env["CREDENTIAL_ENFORCEMENT_MODE"] == "legacy"
+    assert "CREDENTIAL_ENFORCEMENT_MODE" not in broker_env
     assert broker_env["PERMISSION_LEASE_SECONDS"] == "300"
     assert broker_env["REFRESH_OVERLAP_SECONDS"] == "10"
     assert broker_env["REFRESH_JITTER_SECONDS"] == "5"
@@ -159,7 +165,7 @@ def test_defaults_are_injected_and_tables_are_destroyable_for_demo():
     assert broker_env["REVOCATION_POLICY_SHARDS"] == "19"
     assert broker_env["REVOCATION_RECONCILE_MINUTES"] == "5"
     assert broker_env["REVOCATION_POLICY_MAX_CHARACTERS"] == "6144"
-    assert "baseline_existing_behavior" in json.dumps(
+    assert "pending_live_sandbox_probe" in json.dumps(
         broker_env["QUALIFICATION_STATUS_JSON"]
     )
     assert "OPERATIONS_ALARM_NAMES_JSON" in broker_env
@@ -199,7 +205,6 @@ def test_production_values_and_table_retention():
             "usage_retention_days": 90,
             "retain_tables_on_delete": True,
             "vended_ttl_seconds": 1800,
-            "credential_enforcement_mode": "lease",
             "permission_lease_seconds": 300,
             "refresh_overlap_seconds": 20,
             "refresh_jitter_seconds": 7,
@@ -211,7 +216,7 @@ def test_production_values_and_table_retention():
     assert broker_env["AUTO_PROVISION_USERS"] == "false"
     assert broker_env["DEFAULT_DAILY_USD"] == "25.0"
     assert broker_env["VENDED_CREDENTIAL_TTL_SECONDS"] == "1800"
-    assert broker_env["CREDENTIAL_ENFORCEMENT_MODE"] == "lease"
+    assert "CREDENTIAL_ENFORCEMENT_MODE" not in broker_env
     assert broker_env["PERMISSION_LEASE_SECONDS"] == "300"
     assert broker_env["REFRESH_OVERLAP_SECONDS"] == "20"
     assert broker_env["REFRESH_JITTER_SECONDS"] == "7"
@@ -228,7 +233,6 @@ def test_supported_permission_lease_durations_synthesize(lease_seconds):
     template = _template(
         {
             "manage_invocation_logging": True,
-            "credential_enforcement_mode": "lease",
             "vended_ttl_seconds": 900,
             "permission_lease_seconds": lease_seconds,
             "refresh_overlap_seconds": 10,
@@ -239,23 +243,21 @@ def test_supported_permission_lease_durations_synthesize(lease_seconds):
     assert broker_env["PERMISSION_LEASE_SECONDS"] == str(lease_seconds)
 
 
-def test_role_chained_revocation_mode_requires_exactly_one_hour():
+def test_revocation_layer_is_always_deployed():
     template = _template(
         {
             "manage_invocation_logging": True,
-            "credential_enforcement_mode": "revocation",
-            "vended_ttl_seconds": 3600,
-            "revocation_policy_shards": 19,
             "revocation_reconcile_minutes": 3,
         }
     )
-    assert _environment_with(template, "BEDROCK_USER_ROLE_ARN")[
-        "CREDENTIAL_ENFORCEMENT_MODE"
-    ] == "revocation"
+    broker_env = _environment_with(template, "BEDROCK_USER_ROLE_ARN")
+    assert "CREDENTIAL_ENFORCEMENT_MODE" not in broker_env
     template.has_resource_properties(
         "AWS::DynamoDB::Table",
         {"StreamSpecification": {"StreamViewType": "NEW_AND_OLD_IMAGES"}},
     )
+    # Emergency processor + enforcement dispatcher: never a third stream
+    # consumer (DynamoDB Streams supports at most two per shard).
     template.resource_count_is("AWS::Lambda::EventSourceMapping", 2)
     # Emergency reconcile, revocation reconcile, and daily price refresh.
     template.resource_count_is("AWS::Events::Rule", 3)
@@ -277,6 +279,22 @@ def test_role_chained_revocation_mode_requires_exactly_one_hour():
             }
         ),
     )
+    # The dispatcher is the stream consumer and fans out asynchronously.
+    template.has_resource_properties(
+        "AWS::Lambda::Function",
+        Match.object_like(
+            {
+                "Environment": {
+                    "Variables": Match.object_like(
+                        {
+                            "REVOCATION_FUNCTION_NAME": Match.any_value(),
+                            "WORKLOAD_ENFORCER_FUNCTION_NAME": "",
+                        }
+                    )
+                },
+            }
+        ),
+    )
     rendered = json.dumps(template.to_json())
     assert rendered.count("__no_blocked_quota_identity__") == 19
     assert "iam:CreatePolicyVersion" in rendered
@@ -285,8 +303,8 @@ def test_role_chained_revocation_mode_requires_exactly_one_hour():
     assert "RevocationPolicyOverflow" in rendered
     assert "revocation_failure" in rendered
     assert "revocation_overflow" in rendered
-    assert "revocation_dlq" in rendered
-    assert "revocation_iterator_age" in rendered
+    assert "enforcement_dispatch_dlq" in rendered
+    assert "enforcement_dispatch_iterator_age" in rendered
     role = next(
         value
         for logical_id, value in template.find_resources("AWS::IAM::Role").items()
@@ -294,21 +312,24 @@ def test_role_chained_revocation_mode_requires_exactly_one_hour():
     )
     assert "PermissionsBoundary" in role["Properties"]
 
-    with pytest.raises(ValueError, match="requires vended_ttl_seconds=3600"):
-        _template(
-            {
-                "manage_invocation_logging": True,
-                "credential_enforcement_mode": "revocation",
-                "vended_ttl_seconds": 900,
-            }
-        )
     with pytest.raises(ValueError, match="immutable 19-shard layout"):
         _template(
             {
                 "manage_invocation_logging": True,
-                "credential_enforcement_mode": "revocation",
-                "vended_ttl_seconds": 3600,
                 "revocation_policy_shards": 18,
+            }
+        )
+
+
+def test_enforcement_mode_key_is_rejected_everywhere():
+    """The mode concept is gone: the key must fail loudly, not be ignored."""
+    with pytest.raises(ValueError, match="Unknown deployment_config keys"):
+        _template(
+            {
+                "deployment_config": {
+                    "manage_invocation_logging": True,
+                    "credential_enforcement_mode": "lease",
+                }
             }
         )
 
@@ -579,7 +600,6 @@ def test_admin_ui_rejects_unsupported_or_unauthorized_identity_setup():
         ("warn_threshold", 1, "less than 1"),
         ("vended_ttl_seconds", 899, "between 900"),
         ("vended_ttl_seconds", 3_601, "role-chaining maximum is 3600"),
-        ("credential_enforcement_mode", "unknown", "must be one of"),
         ("permission_lease_seconds", 120, "one of 60, 300, 900"),
         ("refresh_overlap_seconds", 0, "positive integer"),
         ("refresh_jitter_seconds", -1, "non-negative integer"),
@@ -1134,9 +1154,11 @@ def test_enforcer_wiring_least_privilege_and_schedules():
     template = _template(_WORKLOADS_CONTEXT)
     # Second subscription filter for profile-attributed traffic.
     template.resource_count_is("AWS::Logs::SubscriptionFilter", 2)
-    # Emergency (1m) + price refresh (24h) + workload enforcement (5m).
-    template.resource_count_is("AWS::Events::Rule", 3)
-    # Users-table stream now feeds the enforcer too.
+    # Emergency (1m), price refresh (24h), revocation repair (5m), and
+    # workload enforcement (5m).
+    template.resource_count_is("AWS::Events::Rule", 4)
+    # Still exactly two stream consumers: workload events arrive via the
+    # enforcement dispatcher, never a third event source mapping.
     template.resource_count_is("AWS::Lambda::EventSourceMapping", 2)
     env = _environment_with(template, "WORKLOADS_JSON")
     assert env["DENY_POLICY_NAME"] == "bedrock-spend-controls-workload-deny"

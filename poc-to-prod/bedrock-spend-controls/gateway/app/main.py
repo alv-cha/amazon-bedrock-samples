@@ -33,6 +33,7 @@ from .broker import BrokerError, CredentialBroker
 from .config import settings
 from .quota import (
     MICRO,
+    VALID_PERMISSION_LEASE_SECONDS,
     WORKLOAD_USER_ID_PREFIX,
     IdempotencyConflict,
     LeaseExpired,
@@ -216,9 +217,8 @@ def _reserve_permission_lease(
     request: Request,
     user: UserRecord,
     identity: Identity,
+    lease_seconds: int,
 ) -> tuple[LeaseReservation | None, JSONResponse | None]:
-    if settings.credential_enforcement_mode == "legacy":
-        return None, None
     requested_id = request.headers.get("x-quota-lease-id") or str(
         uuid.uuid4()
     )
@@ -235,17 +235,12 @@ def _reserve_permission_lease(
     jwt_expiration = datetime.fromtimestamp(
         raw_expiration, tz=timezone.utc
     )
-    duration = (
-        settings.permission_lease_seconds
-        if settings.credential_enforcement_mode == "lease"
-        else settings.vended_credential_ttl_seconds
-    )
     try:
         reservation = store().reserve_lease(
             user.user_id,
             requested_id,
             expires_no_later_than=jwt_expiration,
-            lease_seconds=duration,
+            lease_seconds=lease_seconds,
         )
     except LeaseRateLimited as exc:
         emf.record_throttle(user.user_id, "-", "vend-rate-limit")
@@ -333,7 +328,7 @@ async def vend_credentials(request: Request) -> Response:
         )
 
     reservation, lease_error = _reserve_permission_lease(
-        request, user, identity
+        request, user, identity, store().effective_permission_lease_seconds()
     )
     if lease_error is not None:
         return lease_error
@@ -533,9 +528,11 @@ def _lease_json(user: UserRecord) -> dict | None:
         else None
     )
     lease_seconds = (
-        settings.permission_lease_seconds
-        if settings.credential_enforcement_mode == "lease"
-        else settings.vended_credential_ttl_seconds
+        user.lease_duration_seconds
+        if user.lease_duration_seconds is not None
+        # Rows leased before grant-time persistence: assume the deployment
+        # default rather than the current runtime dial.
+        else settings.permission_lease_seconds
     )
     return {
         "active": now < expires_at,
@@ -1092,17 +1089,8 @@ async def admin_operations(request: Request) -> Response:
     if (denied := _require_admin(request)) is not None:
         return denied
     now = datetime.now(timezone.utc)
-    mode = {
-        "legacy": "bounded_overspend",
-        "lease": "permission_lease",
-        "revocation": "active_session_revocation",
-    }.get(settings.credential_enforcement_mode, "unknown")
-    revocation_enabled = settings.credential_enforcement_mode == "revocation"
-    post_detection_fallback = (
-        settings.permission_lease_seconds
-        if settings.credential_enforcement_mode == "lease"
-        else settings.vended_credential_ttl_seconds
-    )
+    enforcement_config = store().get_enforcement_config()
+    effective_lease = int(enforcement_config["permission_lease_seconds"])
     alarm_names = {
         str(key): str(value)
         for key, value in _json_object(
@@ -1112,7 +1100,7 @@ async def admin_operations(request: Request) -> Response:
     }
     metrics, alarms, cloudwatch_status = _read_operations_cloudwatch(
         now,
-        revocation_enabled=revocation_enabled,
+        revocation_enabled=True,
         alarm_names=alarm_names,
     )
     qualification = _json_object(settings.qualification_status_json)
@@ -1120,30 +1108,24 @@ async def admin_operations(request: Request) -> Response:
         {
             "as_of": now.isoformat(),
             "configuration": {
-                "mode": mode,
+                "mode": "layered",
                 "credential_ttl_seconds": (
                     settings.vended_credential_ttl_seconds
                 ),
-                "permission_lease_seconds": (
+                "permission_lease_seconds": effective_lease,
+                "permission_lease_source": enforcement_config["source"],
+                "permission_lease_default_seconds": (
                     settings.permission_lease_seconds
                 ),
-                "permission_lease_enabled": (
-                    settings.credential_enforcement_mode == "lease"
-                ),
-                "effective_permission_lease_seconds": (
-                    settings.permission_lease_seconds
-                    if settings.credential_enforcement_mode == "lease"
-                    else None
-                ),
-                "post_detection_fallback_seconds": (
-                    post_detection_fallback
-                ),
+                "permission_lease_enabled": True,
+                "effective_permission_lease_seconds": effective_lease,
+                "post_detection_fallback_seconds": effective_lease,
                 "refresh_overlap_seconds": settings.refresh_overlap_seconds,
                 "refresh_jitter_seconds": settings.refresh_jitter_seconds,
                 "vend_rate_limit_per_minute": (
                     settings.vend_rate_limit_per_minute
                 ),
-                "revocation_enabled": revocation_enabled,
+                "revocation_enabled": True,
                 "revocation_policy_shards": (
                     settings.revocation_policy_shards
                 ),
@@ -1156,10 +1138,10 @@ async def admin_operations(request: Request) -> Response:
             },
             "emergency": _safe_emergency_state(),
             "qualification": {
-                "status": str(
-                    qualification.get(
-                        settings.credential_enforcement_mode, "unknown"
-                    )
+                "status": str(qualification.get("lease", "unknown")),
+                "lease_status": str(qualification.get("lease", "unknown")),
+                "revocation_status": str(
+                    qualification.get("revocation", "unknown")
                 ),
                 "emergency_status": str(
                     qualification.get("emergency", "unknown")
@@ -1178,6 +1160,61 @@ async def get_emergency_stop(request: Request) -> Response:
     if (denied := _require_admin(request)) is not None:
         return denied
     return JSONResponse(store().get_emergency_state())
+
+
+@app.get("/admin/enforcement")
+async def get_enforcement(request: Request) -> Response:
+    if (denied := _require_admin(request)) is not None:
+        return denied
+    config = store().get_enforcement_config()
+    return JSONResponse(
+        {
+            **config,
+            "valid_permission_lease_seconds": sorted(
+                VALID_PERMISSION_LEASE_SECONDS
+            ),
+            "default_permission_lease_seconds": (
+                settings.permission_lease_seconds
+            ),
+        }
+    )
+
+
+@app.put("/admin/enforcement")
+async def set_enforcement(request: Request) -> Response:
+    """Runtime enforcement dial: change the permission-lease window.
+
+    Applies to new vends immediately (the vend path reads the row with a
+    strongly consistent get); outstanding credentials keep their issued
+    deadline, and the revocation layer keeps cutting blocked identities
+    regardless of the dial. No redeploy involved.
+    """
+    if (denied := _require_admin(request)) is not None:
+        return denied
+    principal: AdminPrincipal = request.state.admin_principal
+    body, error = await _admin_json_object(request)
+    if error is not None:
+        return error
+    assert body is not None
+    raw_seconds = body.get("permission_lease_seconds")
+    if isinstance(raw_seconds, bool) or not isinstance(raw_seconds, int):
+        return _error(
+            400,
+            "permission_lease_seconds must be an integer.",
+            "invalid_request_error",
+        )
+    reason, reason_error = _admin_reason(body)
+    if reason_error is not None:
+        return reason_error
+    assert reason is not None
+    try:
+        config = store().set_permission_lease_seconds(
+            raw_seconds, actor=principal.actor, reason=reason
+        )
+    except ValueError as exc:
+        return _error(400, str(exc), "invalid_request_error")
+    emf.record_enforcement_dial(principal.actor, raw_seconds)
+    return JSONResponse(config)
 
 
 @app.post("/admin/emergency-stop", status_code=202)
@@ -1253,32 +1290,24 @@ async def admin_summary(request: Request) -> Response:
         usage = store().get_window_usage(user.user_id)
         for key in aggregate:
             aggregate[key] += usage.get(key, 0)
-    enforcement_mode = {
-        "legacy": "bounded_overspend",
-        "lease": "permission_lease",
-        "revocation": "active_session_revocation",
-    }.get(settings.credential_enforcement_mode, "unknown")
-    post_detection_fallback = (
-        settings.permission_lease_seconds
-        if settings.credential_enforcement_mode == "lease"
-        else settings.vended_credential_ttl_seconds
-    )
+    enforcement_config = store().get_enforcement_config()
+    effective_lease = int(enforcement_config["permission_lease_seconds"])
     return JSONResponse(
         {
             "enforcement": {
-                "mode": enforcement_mode,
+                # Layered enforcement: permission lease bounds every vend,
+                # SourceIdentity revocation cuts blocked identities, and the
+                # emergency stop halts everything. No modes to select.
+                "mode": "layered",
                 "source": "dynamodb",
                 "as_of": now.isoformat(),
                 "window": now.strftime("%Y-%m-%d"),
                 "credential_ttl_seconds": (
                     settings.vended_credential_ttl_seconds
                 ),
-                "permission_lease_seconds": (
-                    settings.permission_lease_seconds
-                ),
-                "post_detection_fallback_seconds": (
-                    post_detection_fallback
-                ),
+                "permission_lease_seconds": effective_lease,
+                "permission_lease_source": enforcement_config["source"],
+                "post_detection_fallback_seconds": effective_lease,
                 "refresh_overlap_seconds": (
                     settings.refresh_overlap_seconds
                 ),

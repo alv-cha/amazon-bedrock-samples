@@ -286,3 +286,63 @@ def test_unrelated_stream_records_are_ignored(
         sns=FakeSNS(),
     )
     assert result == {"reconciled": False, "reason": "no-status-change"}
+
+
+def test_dispatch_source_triggers_reconciliation(fake_dynamodb, monkeypatch):
+    """The enforcement dispatcher's async invoke must pass the gate."""
+    arns = ["arn:aws:iam::111122223333:policy/shard-0"]
+    _configure(monkeypatch, arns)
+    iam = FakeIAM(arns)
+    _seed_user(fake_dynamodb, "alice", "alice-session")
+
+    result = revoker.handler(
+        {"source": "enforcement-dispatch"},
+        None,
+        dynamodb=fake_dynamodb,
+        iam=iam,
+        sns=FakeSNS(),
+    )
+
+    assert result["reconciled"] is True
+    assert _identities(iam.current(arns[0])) == ["alice-session"]
+
+
+def test_block_then_unblock_race_converges_to_row_state(
+    fake_dynamodb, monkeypatch
+):
+    """Race guarantee: the deny shards converge FROM the user row.
+
+    The lease-refusal path and the revocation path never fight: both derive
+    from the same row, whose writes are version-guarded. Block -> the shard
+    gains the identity; window-reset unblock (refresh_auto_status flips the
+    row and rewrites the sentinel) -> the next run strips it. Repeats are
+    no-ops either way.
+    """
+    arns = ["arn:aws:iam::111122223333:policy/shard-0"]
+    _configure(monkeypatch, arns)
+    iam = FakeIAM(arns)
+    sns = FakeSNS()
+    _seed_user(fake_dynamodb, "alice", "alice-session", status="blocked")
+
+    blocked_run = revoker.handler(
+        _event("alice"), None, dynamodb=fake_dynamodb, iam=iam, sns=sns
+    )
+    assert blocked_run["blocked_identities"] == 1
+    assert _identities(iam.current(arns[0])) == ["alice-session"]
+
+    # Window reset: the gateway's refresh_auto_status flips the row to
+    # active and rewrites the REVOCATION# sentinel (fast path re-fires).
+    _seed_user(fake_dynamodb, "alice", "alice-session", status="active")
+    unblocked_run = revoker.handler(
+        _event("alice"), None, dynamodb=fake_dynamodb, iam=iam, sns=sns
+    )
+    assert unblocked_run["blocked_identities"] == 0
+    assert _identities(iam.current(arns[0])) == [
+        "__no_blocked_quota_identity__"
+    ]
+
+    # Convergence is idempotent: replaying either event changes nothing.
+    replay = revoker.handler(
+        _event("alice"), None, dynamodb=fake_dynamodb, iam=iam, sns=sns
+    )
+    assert replay["updated_shards"] == 0

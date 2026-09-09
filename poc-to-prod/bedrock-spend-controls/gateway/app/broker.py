@@ -106,7 +106,6 @@ class CredentialBroker:
         sts_client=None,
         role_arn: str | None = None,
         ttl_seconds: int | None = None,
-        enforcement_mode: str | None = None,
         lease_seconds: int | None = None,
         now_fn: Callable[[], datetime] | None = None,
     ):
@@ -121,11 +120,9 @@ class CredentialBroker:
             if ttl_seconds is not None
             else settings.vended_credential_ttl_seconds
         )
-        self._enforcement_mode = (
-            enforcement_mode
-            if enforcement_mode is not None
-            else settings.credential_enforcement_mode
-        )
+        # Fallback lease window when the caller does not supply an explicit
+        # permission deadline (the vend path always does; this covers direct
+        # broker use and tests). The runtime dial lives in the store.
         self._lease_seconds = (
             lease_seconds
             if lease_seconds is not None
@@ -145,18 +142,17 @@ class CredentialBroker:
 
     def _permission_deadline(
         self, identity: Identity, now: datetime
-    ) -> datetime | None:
-        if self._enforcement_mode == "legacy":
-            return None
-        duration = (
-            self._lease_seconds
-            if self._enforcement_mode == "lease"
-            else self._ttl
-        )
+    ) -> datetime:
+        """Every credential carries a permission deadline: there is no
+        deadline-free vend. The window is the lease; revocation and the
+        emergency stop can only shorten effective access, never extend it.
+        """
         jwt_expiration = self._jwt_expiration(identity)
         if jwt_expiration <= now:
             raise BrokerError(401, "token expiration is not in the future")
-        return min(now + timedelta(seconds=duration), jwt_expiration)
+        return min(
+            now + timedelta(seconds=self._lease_seconds), jwt_expiration
+        )
 
     def vend(
         self,

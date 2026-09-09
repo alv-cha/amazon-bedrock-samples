@@ -86,7 +86,6 @@ def test_permission_lease_is_embedded_in_assume_role_session_policy(sts):
         sts_client=sts,
         role_arn=ROLE_ARN,
         ttl_seconds=900,
-        enforcement_mode="lease",
         lease_seconds=300,
         now_fn=lambda: now,
     )
@@ -121,7 +120,6 @@ def test_permission_lease_never_outlives_authenticating_jwt(sts):
         sts_client=sts,
         role_arn=ROLE_ARN,
         ttl_seconds=900,
-        enforcement_mode="lease",
         lease_seconds=300,
         now_fn=lambda: now,
     )
@@ -146,7 +144,6 @@ def test_permission_lease_requires_valid_jwt_expiration(sts, claims):
     broker = CredentialBroker(
         sts_client=sts,
         role_arn=ROLE_ARN,
-        enforcement_mode="lease",
         lease_seconds=60,
         now_fn=lambda: now,
     )

@@ -11,7 +11,6 @@
   "usage_retention_days": 35,
   "retain_tables_on_delete": false,
   "vended_ttl_seconds": 900,
-  "credential_enforcement_mode": "lease",
   "permission_lease_seconds": 60,
   "refresh_overlap_seconds": 10,
   "refresh_jitter_seconds": 5,

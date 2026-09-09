@@ -9,7 +9,7 @@ sample.
 |---|---|---|
 | Quota identity | JWT `sub` | Stable user, tenant, team, or project claim |
 | IdP | Stack-created Cognito | Existing OIDC IdP |
-| Enforcement | `legacy` until lease probe passes | Qualified lease mode; revocation remains experimental until propagation tests pass |
+| Enforcement | Layered (lease + revocation + emergency, always on); 300 s default lease | Same layers; pick the default lease window and tune the runtime dial per incident |
 | Credential lifetime | 900-second STS; optional 60/300/900-second permission lease | 900–3600-second STS; no role-chained session above one hour |
 | Runtime models | `*` for exploration | Explicit model and inference-profile ARNs |
 | Invocation logging | Stack managed | Reuse centrally managed logging |
@@ -25,10 +25,10 @@ sample.
 | Price fallback | Conservative default | Review against most expensive allowed model |
 
 The hard architectural decision is the enforcement guarantee. This sample
-does not inspect each inference request. `legacy` sessions remain usable until
-STS expiry; `lease` mode embeds an earlier immutable permission deadline; and
-experimental `revocation` mode depends on eventually consistent IAM policy
-propagation. Already-authorized streams may finish.
+does not inspect each inference request. Every credential embeds an
+immutable permission-lease deadline, and the always-on revocation layer
+cuts blocked identities' in-flight sessions after eventually consistent
+IAM propagation. Already-authorized streams may finish.
 
 ## Runtime-only request flow
 
@@ -41,7 +41,8 @@ propagation. Already-authorized streams may finish.
 4. DynamoDB provides status, limits, and the latest daily usage.
 5. The broker reserves one logical lease, assumes `BedrockUserRole`, and
    stamps a collision-resistant session identity. STS keys last at least 15
-   minutes; lease mode can end Bedrock permission after 1, 5, or 15 minutes.
+   minutes; the permission lease ends Bedrock permission after 1, 5, or 15
+   minutes (runtime dial, `PUT /admin/enforcement`).
 6. A lazy refresh-aware provider caches that credential set for all Runtime
    calls until the refresh window. It calls the broker/STS once per lease, not
    once per inference.
@@ -73,13 +74,12 @@ Direct `-c key=value` values override the file.
 | `usage_retention_days` | `35` | Positive integer; DynamoDB TTL retention |
 | `retain_tables_on_delete` | `false` | `true` maps tables to `RETAIN` |
 | `vended_ttl_seconds` | `900` | 900–3600; Lambda broker role chaining rejects longer sessions |
-| `credential_enforcement_mode` | `legacy` | `legacy`, `lease`, or opt-in `revocation` |
-| `permission_lease_seconds` | `300` | `60`, `300`, or `900`; effective Bedrock permission, not STS lifetime |
+| `permission_lease_seconds` | `300` | `60`, `300`, or `900`; deployment DEFAULT for the runtime dial (`PUT /admin/enforcement`) |
 | `refresh_overlap_seconds` | `10` | Positive and less than permission lease |
 | `refresh_jitter_seconds` | `5` | Non-negative and less than refresh overlap |
 | `vend_rate_limit_per_minute` | `6` | Positive per-user attempts, including retries |
-| `revocation_policy_shards` | `19` | Immutable in revocation mode; plus emergency policy = 20 role attachments |
-| `revocation_reconcile_minutes` | `5` | Positive periodic repair interval in revocation mode |
+| `revocation_policy_shards` | `19` | Immutable layout; plus emergency policy = 20 role attachments |
+| `revocation_reconcile_minutes` | `5` | Positive periodic repair interval for the revocation layer |
 | `allowed_model_arns` | `["*"]` | Non-empty Bedrock resource ARN list or `*` |
 | `invoker_principal_arns` | `[]` | IAM principals allowed to invoke the Function URL |
 | `manage_invocation_logging` | none | Explicit `true` or `false` required |
@@ -167,10 +167,9 @@ returns local state with `unavailable`, `unknown`, `not_applicable`, or
 `INSUFFICIENT_DATA`; it does not label missing telemetry healthy and does not
 break user quota administration.
 
-Qualification shown in the panel is reviewed deployment metadata, not inferred
-from selected mode or alarm health. `legacy` remains baseline, while lease,
-revocation, and emergency live qualification remain pending until recorded in
-`spikes/QUALIFICATION.md`.
+Qualification shown in the panel is reviewed deployment metadata, not
+inferred from alarm health. Lease, revocation, and emergency live
+qualification remain pending until recorded in `spikes/QUALIFICATION.md`.
 
 Legacy `mode_a_allowed_model_arns` is accepted as an alias for
 `allowed_model_arns`. Former dual-mode keys synthesize only for migration and
@@ -192,12 +191,32 @@ change set before deployment and update clients to:
 2. Build a normal `bedrock-runtime` client from the returned credentials.
 3. Stop using the old OpenAI/Anthropic proxy base URLs.
 
-There is no hard pre-spend cap after this migration. Every mode remains
-bounded overspend. Keep `credential_enforcement_mode=legacy` until the guarded
-sandbox probe in `spikes/lease_revocation_probe.py` validates lease expiration
-for the selected models/Region. Keep `revocation` experimental until targeted
-isolation and IAM propagation remain below the required cutoff across the
-recorded sample set.
+There is no hard pre-spend cap after this migration; enforcement remains
+bounded overspend. The guarded sandbox probe in
+`spikes/lease_revocation_probe.py` validates lease expiration and targeted
+revocation propagation for the selected models/Region; record results in
+`spikes/QUALIFICATION.md`.
+
+### Runtime enforcement dial
+
+Enforcement is layered and always on; the only operational knob is the
+permission-lease window, and it changes at runtime without a redeploy:
+
+```bash
+# Read the effective window, its source, and the valid values
+GET /admin/enforcement
+
+# Change it (audited; applies to NEW vends immediately)
+PUT /admin/enforcement
+{"permission_lease_seconds": 60, "reason": "incident response"}
+```
+
+Outstanding credentials keep the deadline they were issued with, and the
+revocation layer keeps cutting blocked identities regardless of the dial.
+The deployment key `permission_lease_seconds` only sets the default used
+when no runtime override exists. Every change writes an immutable
+`CONFIG#ENFORCEMENT_AUDIT` row and emits the `EnforcementDialChanged`
+metric.
 
 ### Lease and revocation qualification
 
@@ -234,7 +253,7 @@ The current broker's caller is a Lambda execution-role session, so
 configuration is rejected. Supporting it requires a separate first-hop
 federation/token-issuer design with bypass and replay analysis.
 
-Revocation mode uses an immutable 19-shard layout plus one emergency managed
+The revocation layer uses an immutable 19-shard layout plus one emergency managed
 policy: 20 role policy attachments in total. Verify that account quota before
 deployment. Changing the shard count in place is rejected because rehashing
 active identities can create a transient authorization gap; use a separately
@@ -760,7 +779,6 @@ Recommended shape:
   "usage_retention_days": 90,
   "retain_tables_on_delete": true,
   "vended_ttl_seconds": 900,
-  "credential_enforcement_mode": "legacy",
   "permission_lease_seconds": 300,
   "refresh_overlap_seconds": 10,
   "refresh_jitter_seconds": 5,
@@ -907,7 +925,7 @@ Verify all of the following:
 7. Re-delivering the same `requestId` does not increment usage twice.
 8. Warning and block SNS notifications arrive.
 9. Blocked identities cannot renew logical leases.
-10. In lease mode, new Bedrock authorization fails after the effective
+10. New Bedrock authorization fails after the effective
     permission deadline even though `sts_expiration` is later.
 11. Detection lag is reported separately from the post-detection cutoff.
 12. Revocation mode, when enabled, denies only the targeted `SourceIdentity`,

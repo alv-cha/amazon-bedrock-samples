@@ -564,11 +564,9 @@ class SpendControlsStack(Stack):
                     sort_keys=True,
                 ),
                 "USAGE_RETENTION_DAYS": str(config.usage_retention_days),
-                # Credential lifetime and refresh controls. The runtime keeps
-                # legacy behavior unless the lease/revocation mode is selected.
-                "CREDENTIAL_ENFORCEMENT_MODE": (
-                    config.credential_enforcement_mode
-                ),
+                # Credential lifetime and refresh controls. The lease window
+                # here is the deployment DEFAULT; the effective value is the
+                # runtime dial (CONFIG#ENFORCEMENT row, admin API).
                 "PERMISSION_LEASE_SECONDS": str(
                     config.permission_lease_seconds
                 ),
@@ -590,7 +588,6 @@ class SpendControlsStack(Stack):
                 "REVOCATION_POLICY_MAX_CHARACTERS": "6144",
                 "QUALIFICATION_STATUS_JSON": json.dumps(
                     {
-                        "legacy": "baseline_existing_behavior",
                         "lease": "pending_live_sandbox_probe",
                         "revocation": (
                             "experimental_pending_propagation_isolation_probe"
@@ -1410,215 +1407,151 @@ class SpendControlsStack(Stack):
         operations_alarms["emergency_dlq"] = emergency_dlq_alarm
 
         # ------------------------------------------------------------------
-        # Optional active-session revocation. IAM updates are isolated from
-        # usage accounting and serialized at concurrency one. This path stays
-        # opt-in until the non-production propagation probe qualifies it.
+        # Active-session revocation: always deployed. The 19 SourceIdentity
+        # deny shards are inert while empty (sentinel condition matches no
+        # session) and cut blocked identities' in-flight sessions when the
+        # metering layer blocks them. Layered with the permission lease:
+        # whichever cuts first wins; neither can extend access.
         # ------------------------------------------------------------------
         revocation_policies: list[iam.ManagedPolicy] = []
-        if config.credential_enforcement_mode == "revocation":
-            no_blocked_identity = "__no_blocked_quota_identity__"
-            for index in range(config.revocation_policy_shards):
-                policy = iam.ManagedPolicy(
-                    self,
-                    f"QuotaRevocationPolicy{index}",
-                    description=(
-                        "Dynamic SourceIdentity deny shard for Bedrock quota "
-                        "sessions"
-                    ),
-                    statements=[
-                        iam.PolicyStatement(
-                            effect=iam.Effect.DENY,
-                            actions=[
-                                "bedrock:CountTokens",
-                                "bedrock:InvokeModel",
-                                "bedrock:InvokeModelWithResponseStream",
-                            ],
-                            resources=["*"],
-                            conditions={
-                                "StringEquals": {
-                                    "aws:SourceIdentity": [
-                                        no_blocked_identity
-                                    ]
-                                }
-                            },
-                        )
-                    ],
-                    roles=[bedrock_user_role],
-                )
-                revocation_policies.append(policy)
-
-            revocation_dlq = sqs.Queue(
+        no_blocked_identity = "__no_blocked_quota_identity__"
+        for index in range(config.revocation_policy_shards):
+            policy = iam.ManagedPolicy(
                 self,
-                "RevocationDeadLetterQueue",
-                encryption=sqs.QueueEncryption.SQS_MANAGED,
-                retention_period=Duration.days(14),
-            )
-            revocation_fn = lambda_.Function(
-                self,
-                "RevocationProcessorFn",
-                runtime=lambda_.Runtime.PYTHON_3_12,
-                memory_size=256,
-                timeout=Duration.minutes(2),
-                reserved_concurrent_executions=1,
-                handler="handler.handler",
-                code=lambda_.Code.from_asset("../revocation_processor"),
-                environment={
-                    "USERS_TABLE": users_table.table_name,
-                    "SNS_TOPIC_ARN": alert_topic.topic_arn,
-                    "METRICS_NAMESPACE": METRICS_NAMESPACE,
-                    "REVOCATION_POLICY_ARNS_JSON": cdk.Fn.to_json_string(
-                        [
-                            policy.managed_policy_arn
-                            for policy in revocation_policies
-                        ]
-                    ),
-                    "REVOCATION_POLICY_MAX_CHARACTERS": "6144",
-                },
-            )
-            users_table.grant_read_data(revocation_fn)
-            alert_topic.grant_publish(revocation_fn)
-            revocation_fn.add_to_role_policy(
-                iam.PolicyStatement(
-                    actions=[
-                        "iam:GetPolicy",
-                        "iam:GetPolicyVersion",
-                        "iam:ListPolicyVersions",
-                        "iam:CreatePolicyVersion",
-                        "iam:DeletePolicyVersion",
-                    ],
-                    resources=[
-                        policy.managed_policy_arn
-                        for policy in revocation_policies
-                    ],
-                )
-            )
-            revocation_fn.add_event_source(
-                lambda_event_sources.DynamoEventSource(
-                    users_table,
-                    starting_position=lambda_.StartingPosition.LATEST,
-                    batch_size=100,
-                    max_batching_window=Duration.seconds(5),
-                    bisect_batch_on_error=True,
-                    retry_attempts=10,
-                    on_failure=lambda_event_sources.SqsDlq(
-                        revocation_dlq
-                    ),
-                    filters=[
-                        lambda_.FilterCriteria.filter(
-                            {
-                                "dynamodb": {
-                                    "Keys": {
-                                        "user_id": {
-                                            "S": [
-                                                {"prefix": "REVOCATION#"}
-                                            ]
-                                        }
-                                    }
-                                }
-                            }
-                        )
-                    ],
-                )
-            )
-            events.Rule(
-                self,
-                "RevocationReconciliationSchedule",
-                schedule=events.Schedule.rate(
-                    Duration.minutes(
-                        config.revocation_reconcile_minutes
-                    )
+                f"QuotaRevocationPolicy{index}",
+                description=(
+                    "Dynamic SourceIdentity deny shard for Bedrock quota "
+                    "sessions"
                 ),
-                targets=[
-                    events_targets.LambdaFunction(
-                        revocation_fn,
-                        event=events.RuleTargetInput.from_object(
-                            {"source": "aws.events"}
-                        ),
+                statements=[
+                    iam.PolicyStatement(
+                        effect=iam.Effect.DENY,
+                        actions=[
+                            "bedrock:CountTokens",
+                            "bedrock:InvokeModel",
+                            "bedrock:InvokeModelWithResponseStream",
+                        ],
+                        resources=["*"],
+                        conditions={
+                            "StringEquals": {
+                                "aws:SourceIdentity": [
+                                    no_blocked_identity
+                                ]
+                            }
+                        },
                     )
                 ],
+                roles=[bedrock_user_role],
             )
-            revocation_failure_alarm = cw.Alarm(
-                self,
-                "RevocationSyncFailureAlarm",
-                metric=cw.Metric(
-                    namespace=METRICS_NAMESPACE,
-                    metric_name="RevocationSyncFailure",
-                    statistic="Sum",
-                    period=Duration.minutes(5),
+            revocation_policies.append(policy)
+
+        revocation_fn = lambda_.Function(
+            self,
+            "RevocationProcessorFn",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            memory_size=256,
+            timeout=Duration.minutes(2),
+            reserved_concurrent_executions=1,
+            handler="handler.handler",
+            code=lambda_.Code.from_asset("../revocation_processor"),
+            environment={
+                "USERS_TABLE": users_table.table_name,
+                "SNS_TOPIC_ARN": alert_topic.topic_arn,
+                "METRICS_NAMESPACE": METRICS_NAMESPACE,
+                "REVOCATION_POLICY_ARNS_JSON": cdk.Fn.to_json_string(
+                    [
+                        policy.managed_policy_arn
+                        for policy in revocation_policies
+                    ]
                 ),
-                threshold=1,
-                evaluation_periods=1,
+                "REVOCATION_POLICY_MAX_CHARACTERS": "6144",
+            },
+        )
+        users_table.grant_read_data(revocation_fn)
+        alert_topic.grant_publish(revocation_fn)
+        revocation_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "iam:GetPolicy",
+                    "iam:GetPolicyVersion",
+                    "iam:ListPolicyVersions",
+                    "iam:CreatePolicyVersion",
+                    "iam:DeletePolicyVersion",
+                ],
+                resources=[
+                    policy.managed_policy_arn
+                    for policy in revocation_policies
+                ],
             )
-            revocation_failure_alarm.add_alarm_action(
-                cw_actions.SnsAction(alert_topic)
-            )
-            operations_alarms["revocation_failure"] = (
-                revocation_failure_alarm
-            )
-            revocation_overflow_alarm = cw.Alarm(
-                self,
-                "RevocationPolicyOverflowAlarm",
-                metric=cw.Metric(
-                    namespace=METRICS_NAMESPACE,
-                    metric_name="RevocationPolicyOverflow",
-                    statistic="Sum",
-                    period=Duration.minutes(5),
-                ),
-                threshold=1,
-                evaluation_periods=1,
-            )
-            revocation_overflow_alarm.add_alarm_action(
-                cw_actions.SnsAction(alert_topic)
-            )
-            operations_alarms["revocation_overflow"] = (
-                revocation_overflow_alarm
-            )
-            revocation_dlq_alarm = cw.Alarm(
-                self,
-                "RevocationDlqAlarm",
-                metric=revocation_dlq.metric_approximate_number_of_messages_visible(
-                    period=Duration.minutes(5)
-                ),
-                threshold=1,
-                evaluation_periods=1,
-            )
-            revocation_dlq_alarm.add_alarm_action(
-                cw_actions.SnsAction(alert_topic)
-            )
-            operations_alarms["revocation_dlq"] = revocation_dlq_alarm
-            revocation_iterator_age_alarm = cw.Alarm(
-                self,
-                "RevocationIteratorAgeAlarm",
-                metric=revocation_fn.metric(
-                    "IteratorAge",
-                    statistic="Maximum",
-                    period=Duration.minutes(5),
-                ),
-                threshold=300_000,
-                evaluation_periods=1,
-            )
-            revocation_iterator_age_alarm.add_alarm_action(
-                cw_actions.SnsAction(alert_topic)
-            )
-            operations_alarms["revocation_iterator_age"] = (
-                revocation_iterator_age_alarm
-            )
+        )
+        # Stream fast path arrives via the enforcement dispatcher (defined
+        # below): DynamoDB Streams supports at most two simultaneous
+        # consumers per shard, and the emergency processor holds the other
+        # slot. The schedule remains this function's repair loop.
+        events.Rule(
+            self,
+            "RevocationReconciliationSchedule",
+            schedule=events.Schedule.rate(
+                Duration.minutes(
+                    config.revocation_reconcile_minutes
+                )
+            ),
+            targets=[
+                events_targets.LambdaFunction(
+                    revocation_fn,
+                    event=events.RuleTargetInput.from_object(
+                        {"source": "aws.events"}
+                    ),
+                )
+            ],
+        )
+        revocation_failure_alarm = cw.Alarm(
+            self,
+            "RevocationSyncFailureAlarm",
+            metric=cw.Metric(
+                namespace=METRICS_NAMESPACE,
+                metric_name="RevocationSyncFailure",
+                statistic="Sum",
+                period=Duration.minutes(5),
+            ),
+            threshold=1,
+            evaluation_periods=1,
+        )
+        revocation_failure_alarm.add_alarm_action(
+            cw_actions.SnsAction(alert_topic)
+        )
+        operations_alarms["revocation_failure"] = (
+            revocation_failure_alarm
+        )
+        revocation_overflow_alarm = cw.Alarm(
+            self,
+            "RevocationPolicyOverflowAlarm",
+            metric=cw.Metric(
+                namespace=METRICS_NAMESPACE,
+                metric_name="RevocationPolicyOverflow",
+                statistic="Sum",
+                period=Duration.minutes(5),
+            ),
+            threshold=1,
+            evaluation_periods=1,
+        )
+        revocation_overflow_alarm.add_alarm_action(
+            cw_actions.SnsAction(alert_topic)
+        )
+        operations_alarms["revocation_overflow"] = (
+            revocation_overflow_alarm
+        )
 
         # ------------------------------------------------------------------
         # Workload enforcement: converge each workload row's status onto its
         # IAM principal. Blocked => attach an inline Deny on the workload
-        # role; active => remove it. Fast path is the users-table stream
-        # (status transitions written by the metering processor); the
-        # schedule repairs drift. PutRolePolicy is an idempotent upsert and
-        # DeleteRolePolicy tolerates absence, so repeats are safe.
+        # role; active => remove it. Fast path arrives via the enforcement
+        # dispatcher below; the schedule repairs drift. PutRolePolicy is an
+        # idempotent upsert and DeleteRolePolicy tolerates absence, so
+        # repeats are safe.
         # ------------------------------------------------------------------
+        workload_enforcer_fn: lambda_.Function | None = None
         if config.workloads:
-            workload_dlq = sqs.Queue(
-                self,
-                "WorkloadEnforcementDeadLetterQueue",
-                encryption=sqs.QueueEncryption.SQS_MANAGED,
-                retention_period=Duration.days(14),
-            )
             workload_enforcer_fn = lambda_.Function(
                 self,
                 "WorkloadEnforcerFn",
@@ -1653,32 +1586,6 @@ class SpendControlsStack(Stack):
                         resources=sorted(set(workload_role_arns)),
                     )
                 )
-            workload_enforcer_fn.add_event_source(
-                lambda_event_sources.DynamoEventSource(
-                    users_table,
-                    starting_position=lambda_.StartingPosition.LATEST,
-                    batch_size=100,
-                    max_batching_window=Duration.seconds(5),
-                    bisect_batch_on_error=True,
-                    retry_attempts=10,
-                    on_failure=lambda_event_sources.SqsDlq(workload_dlq),
-                    filters=[
-                        lambda_.FilterCriteria.filter(
-                            {
-                                "dynamodb": {
-                                    "Keys": {
-                                        "user_id": {
-                                            "S": [
-                                                {"prefix": "workload:"}
-                                            ]
-                                        }
-                                    }
-                                }
-                            }
-                        )
-                    ],
-                )
-            )
             events.Rule(
                 self,
                 "WorkloadEnforcementSchedule",
@@ -1711,21 +1618,107 @@ class SpendControlsStack(Stack):
             operations_alarms["workload_enforcement_failure"] = (
                 workload_failure_alarm
             )
-            workload_dlq_alarm = cw.Alarm(
-                self,
-                "WorkloadEnforcementDlqAlarm",
-                metric=workload_dlq.metric_approximate_number_of_messages_visible(
-                    period=Duration.minutes(5)
+
+        # ------------------------------------------------------------------
+        # Enforcement dispatcher: the single enforcement consumer of the
+        # users-table stream (the emergency processor holds the second and
+        # last well-supported reader slot). It fans stream events out to the
+        # revocation processor and the workload enforcer asynchronously;
+        # both are idempotent and repaired by their schedules, so a lost
+        # dispatch degrades latency, never correctness.
+        # ------------------------------------------------------------------
+        dispatch_dlq = sqs.Queue(
+            self,
+            "EnforcementDispatchDeadLetterQueue",
+            encryption=sqs.QueueEncryption.SQS_MANAGED,
+            retention_period=Duration.days(14),
+        )
+        dispatcher_fn = lambda_.Function(
+            self,
+            "EnforcementDispatcherFn",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            memory_size=128,
+            timeout=Duration.seconds(30),
+            reserved_concurrent_executions=1,
+            handler="handler.handler",
+            code=lambda_.Code.from_asset("../enforcement_dispatcher"),
+            environment={
+                "REVOCATION_FUNCTION_NAME": revocation_fn.function_name,
+                "WORKLOAD_ENFORCER_FUNCTION_NAME": (
+                    workload_enforcer_fn.function_name
+                    if workload_enforcer_fn is not None
+                    else ""
                 ),
-                threshold=1,
-                evaluation_periods=1,
+            },
+        )
+        revocation_fn.grant_invoke(dispatcher_fn)
+        if workload_enforcer_fn is not None:
+            workload_enforcer_fn.grant_invoke(dispatcher_fn)
+        dispatcher_fn.add_event_source(
+            lambda_event_sources.DynamoEventSource(
+                users_table,
+                starting_position=lambda_.StartingPosition.LATEST,
+                batch_size=100,
+                max_batching_window=Duration.seconds(5),
+                bisect_batch_on_error=True,
+                retry_attempts=10,
+                on_failure=lambda_event_sources.SqsDlq(dispatch_dlq),
+                filters=[
+                    lambda_.FilterCriteria.filter(
+                        {
+                            "dynamodb": {
+                                "Keys": {
+                                    "user_id": {
+                                        "S": [{"prefix": "REVOCATION#"}]
+                                    }
+                                }
+                            }
+                        }
+                    ),
+                    lambda_.FilterCriteria.filter(
+                        {
+                            "dynamodb": {
+                                "Keys": {
+                                    "user_id": {
+                                        "S": [{"prefix": "workload:"}]
+                                    }
+                                }
+                            }
+                        }
+                    ),
+                ],
             )
-            workload_dlq_alarm.add_alarm_action(
-                cw_actions.SnsAction(alert_topic)
-            )
-            operations_alarms["workload_enforcement_dlq"] = (
-                workload_dlq_alarm
-            )
+        )
+        dispatch_dlq_alarm = cw.Alarm(
+            self,
+            "EnforcementDispatchDlqAlarm",
+            metric=dispatch_dlq.metric_approximate_number_of_messages_visible(
+                period=Duration.minutes(5)
+            ),
+            threshold=1,
+            evaluation_periods=1,
+        )
+        dispatch_dlq_alarm.add_alarm_action(
+            cw_actions.SnsAction(alert_topic)
+        )
+        operations_alarms["enforcement_dispatch_dlq"] = dispatch_dlq_alarm
+        dispatch_iterator_age_alarm = cw.Alarm(
+            self,
+            "EnforcementDispatchIteratorAgeAlarm",
+            metric=dispatcher_fn.metric(
+                "IteratorAge",
+                statistic="Maximum",
+                period=Duration.minutes(5),
+            ),
+            threshold=300_000,
+            evaluation_periods=1,
+        )
+        dispatch_iterator_age_alarm.add_alarm_action(
+            cw_actions.SnsAction(alert_topic)
+        )
+        operations_alarms["enforcement_dispatch_iterator_age"] = (
+            dispatch_iterator_age_alarm
+        )
 
         # A fallback-priced request means an invocation was metered with the
         # synthetic conservative rate instead of a resolved model price.
@@ -1842,26 +1835,25 @@ class SpendControlsStack(Stack):
             ),
         )
 
-        if config.credential_enforcement_mode == "revocation":
-            dashboard.add_widgets(
-                cw.GraphWidget(
-                    title="Revocation reconciliation",
-                    width=12,
-                    left=[
-                        cw.Metric(
-                            namespace=METRICS_NAMESPACE,
-                            metric_name=metric_name,
-                            statistic="Sum",
-                            period=Duration.minutes(5),
-                        )
-                        for metric_name in (
-                            "RevocationSyncSuccess",
-                            "RevocationSyncFailure",
-                            "RevocationPolicyOverflow",
-                        )
-                    ],
-                )
+        dashboard.add_widgets(
+            cw.GraphWidget(
+                title="Revocation reconciliation",
+                width=12,
+                left=[
+                    cw.Metric(
+                        namespace=METRICS_NAMESPACE,
+                        metric_name=metric_name,
+                        statistic="Sum",
+                        period=Duration.minutes(5),
+                    )
+                    for metric_name in (
+                        "RevocationSyncSuccess",
+                        "RevocationSyncFailure",
+                        "RevocationPolicyOverflow",
+                    )
+                ],
             )
+        )
 
         # ------------------------------------------------------------------
         # Outputs

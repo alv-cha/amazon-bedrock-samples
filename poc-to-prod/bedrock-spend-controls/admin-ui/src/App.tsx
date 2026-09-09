@@ -585,7 +585,8 @@ function OperationsPanel({
         >
           <OperationsRow label="Qualification" value={formatOperationalLabel(operations.qualification.status)} />
           <OperationsRow label="STS / fallback" value={`${formatDuration(config.credential_ttl_seconds)} / ${formatDuration(config.post_detection_fallback_seconds)}`} />
-          <OperationsRow label="Permission lease" value={config.permission_lease_enabled && config.effective_permission_lease_seconds !== null ? formatDuration(config.effective_permission_lease_seconds) : "Not active"} />
+          <OperationsRow label="Permission lease" value={config.permission_lease_enabled && config.effective_permission_lease_seconds !== null ? `${formatDuration(config.effective_permission_lease_seconds)}${config.permission_lease_source === "runtime" ? " · runtime dial" : " · deployment default"}` : "Not active"} />
+          <OperationsRow label="Revocation layer" value={`Always on · ${config.revocation_policy_shards} shards`} />
           <OperationsRow label="Refresh / rate" value={`${config.refresh_overlap_seconds}s overlap · ${config.refresh_jitter_seconds}s jitter · ${config.vend_rate_limit_per_minute}/min`} />
         </OperationsCard>
 
@@ -1369,16 +1370,7 @@ export function statusEnforcementMessage(
     return "Unblocking allows new credentials to be issued. Configured daily limits continue to apply.";
   }
   const window = formatDuration(enforcement.post_detection_fallback_seconds);
-  if (enforcement.mode === "bounded_overspend") {
-    return `Blocking prevents new credentials from being issued. Existing credentials can remain usable for up to ${window}, so bounded overspend can continue during that window.`;
-  }
-  if (enforcement.mode === "permission_lease") {
-    return `Blocking prevents new credentials from being issued. Existing permissions can remain usable for up to ${window} after detection, so bounded overspend can continue until the lease expires.`;
-  }
-  if (enforcement.mode === "active_session_revocation") {
-    return "Blocking prevents new credentials and requests active-session revocation. Revocation is asynchronous, so bounded overspend can continue until reconciliation converges.";
-  }
-  return "Blocking prevents new credentials. Enforcement timing is not available in the current summary.";
+  return `Blocking prevents new credentials from being issued and requests active-session revocation. Existing permissions expire with their lease (up to ${window} after detection); revocation usually cuts them earlier, so bounded overspend is limited to whichever ends first.`;
 }
 
 function formatLimit(limit: number, format: (value: number) => string): string {

@@ -302,7 +302,7 @@ describe("status safety dialog", () => {
     await actor.click(opener);
     expect(screen.getByText("Current status").parentElement).toHaveTextContent("active");
     expect(screen.getByText("Next status").parentElement).toHaveTextContent("blocked");
-    expect(screen.getByText(/bounded overspend can continue/)).toHaveTextContent("15 min");
+    expect(screen.getByText(/bounded overspend is limited/)).toHaveTextContent("15 min");
     const reason = screen.getByLabelText(/Reason/);
     expect(reason).toHaveFocus();
     expect(screen.getByRole("button", { name: "Block user" })).toBeDisabled();

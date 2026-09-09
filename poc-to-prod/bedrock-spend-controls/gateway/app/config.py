@@ -63,11 +63,10 @@ class Settings:
     # user loses access at next refresh) but more AssumeRole calls.
     vended_credential_ttl_seconds: int = field(
         default_factory=lambda: int(_env("VENDED_CREDENTIAL_TTL_SECONDS", "900")))
-    # ``legacy`` preserves current behavior. ``lease`` adds an immutable,
-    # time-bounded STS session policy. ``revocation`` is reserved for the
-    # separately qualified SourceIdentity deny path.
-    credential_enforcement_mode: str = field(
-        default_factory=lambda: _env("CREDENTIAL_ENFORCEMENT_MODE", "legacy"))
+    # Deploy-time DEFAULT for the permission-lease window. The effective
+    # value is a runtime dial (CONFIG#ENFORCEMENT row) adjustable through
+    # the admin API without redeploying; this is the fallback when the row
+    # is absent.
     permission_lease_seconds: int = field(
         default_factory=lambda: int(_env("PERMISSION_LEASE_SECONDS", "300")))
     refresh_overlap_seconds: int = field(
@@ -92,7 +91,7 @@ class Settings:
     qualification_status_json: str = field(
         default_factory=lambda: _env(
             "QUALIFICATION_STATUS_JSON",
-            '{"legacy":"baseline_existing_behavior","lease":"pending_live_sandbox_probe",'
+            '{"lease":"pending_live_sandbox_probe",'
             '"revocation":"experimental_pending_propagation_isolation_probe",'
             '"emergency":"pending_live_activation_recovery_exercise"}',
         )

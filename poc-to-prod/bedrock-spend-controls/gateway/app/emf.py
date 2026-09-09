@@ -63,3 +63,15 @@ def record_lease_event(user_id: str, event: str, generation: int) -> None:
         properties={"UserId": user_id, "LeaseGeneration": generation},
         metrics={event: ("Count", 1)},
     )
+
+
+def record_enforcement_dial(actor: str, permission_lease_seconds: int) -> None:
+    """Emit one runtime enforcement-dial change (audited admin action)."""
+    _emit(
+        dimensions=[[]],
+        properties={
+            "Actor": actor,
+            "PermissionLeaseSeconds": permission_lease_seconds,
+        },
+        metrics={"EnforcementDialChanged": ("Count", 1)},
+    )
