@@ -62,17 +62,17 @@ agents-and-function-calling/bedrock-agents/agent-blueprint-templates/.package-lo
 agents-and-function-calling/bedrock-agents/agent-blueprint-templates/yarn.lock
 
 config.py
-!poc-to-prod/bedrock-per-user-quotas/gateway/app/config.py
+!poc-to-prod/bedrock-spend-controls/gateway/app/config.py
 
 # ignore hypothesis and pytest cache directories
 **/.pytest_cache/
 **/.hypothesis/
 
-# CDK synth output for bedrock-per-user-quotas sample
-poc-to-prod/bedrock-per-user-quotas/cdk/cdk.out/
+# CDK synth output for bedrock-spend-controls sample
+poc-to-prod/bedrock-spend-controls/cdk/cdk.out/
 
 # Local credentials/configuration for the per-user quota demo notebook
-poc-to-prod/bedrock-per-user-quotas/notebook/local-config.json
+poc-to-prod/bedrock-spend-controls/notebook/local-config.json
 
 # Private deployment overrides for the per-user quota sample
-poc-to-prod/bedrock-per-user-quotas/cdk/config/*.local.json
+poc-to-prod/bedrock-spend-controls/cdk/config/*.local.json

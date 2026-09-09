@@ -1,7 +1,0 @@
-{
-  "name": "bedrock-runtime-per-user-quotas-cdk",
-  "private": true,
-  "devDependencies": {
-    "aws-cdk": "2.1137.0"
-  }
-}
