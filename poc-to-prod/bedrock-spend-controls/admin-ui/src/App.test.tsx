@@ -37,7 +37,7 @@ const summary: Summary = {
     source: "dynamodb",
     as_of: "2026-09-02T10:00:00Z",
     window: "2026-09-02",
-    mode: "bounded_overspend",
+    mode: "layered",
     credential_ttl_seconds: 900,
     permission_lease_seconds: 300,
     post_detection_fallback_seconds: 900,
@@ -62,7 +62,7 @@ const summary: Summary = {
 const operations: Operations = {
   as_of: "2026-09-02T10:00:00Z",
   configuration: {
-    mode: "bounded_overspend",
+    mode: "layered",
     credential_ttl_seconds: 900,
     permission_lease_seconds: 300,
     permission_lease_enabled: false,

@@ -4,3 +4,6 @@ semantic-review/
 # Private deployment rosters (real account IDs / role ARNs).
 # Commit cdk/config/workloads.example.json instead.
 cdk/config/workloads.json
+
+# Personal demo assets (per-user presentation material, not part of the sample)
+notebook/capstone_*

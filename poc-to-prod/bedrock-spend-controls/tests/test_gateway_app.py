@@ -2030,7 +2030,7 @@ def test_enforcement_dial_validates_and_audits(client, fake_dynamodb):
     ok = api.put(
         "/admin/enforcement",
         headers=ADMIN,
-        json={"permission_lease_seconds": 60, "reason": "capstone demo"},
+        json={"permission_lease_seconds": 60, "reason": "live demo: tighter lease"},
     )
     assert ok.status_code == 200
     assert ok.json()["generation"] == 1
@@ -2058,7 +2058,7 @@ def test_enforcement_dial_validates_and_audits(client, fake_dynamodb):
     assert len(audit_rows) == 2
     assert audit_rows[0]["permission_lease_seconds"] == 60
     assert audit_rows[0]["previous_permission_lease_seconds"] == 300
-    assert audit_rows[0]["reason"] == "capstone demo"
+    assert audit_rows[0]["reason"] == "live demo: tighter lease"
 
 
 def test_vend_deadline_follows_the_runtime_dial(client):
