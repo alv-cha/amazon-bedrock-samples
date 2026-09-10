@@ -161,12 +161,6 @@ class SpendControlsStack(Stack):
         super().__init__(scope, construct_id, **kwargs)
 
         config = DeploymentConfig.from_node(self.node)
-        if config.deprecated_options:
-            cdk.Annotations.of(self).add_warning(
-                "The runtime-only architecture ignores deprecated dual-mode "
-                "options: " + ", ".join(config.deprecated_options) + ". "
-                "Remove them from deployment configuration."
-            )
         alert_email = config.alert_email
         jwt_issuer = config.jwt_issuer
         jwt_audience = config.jwt_audience

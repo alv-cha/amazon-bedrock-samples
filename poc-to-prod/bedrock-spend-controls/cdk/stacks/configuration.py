@@ -25,13 +25,6 @@ _DEPLOYMENT_KEYS = {
     "alert_email",
     "auto_provision_users",
     "default_limits",
-    # Accepted only to migrate pre-calendar-period deployment files.
-    "default_daily_input_tokens",
-    "default_daily_output_tokens",
-    "default_daily_usd",
-    # Accepted only as migration inputs from the former dual-mode design.
-    "default_mantle_project_id",
-    "experimental_native_session_deny",
     "invocation_log_group_name",
     "invoker_principal_arns",
     "jwt_audience",
@@ -39,11 +32,8 @@ _DEPLOYMENT_KEYS = {
     "jwt_jwks_url",
     "jwt_user_claim",
     "manage_invocation_logging",
-    "mode_a_allowed_model_arns",
-    "mode_b_allowed_model_ids",
     "model_config",
     "permission_lease_seconds",
-    "reconciler_interval_minutes",
     "refresh_jitter_seconds",
     "refresh_overlap_seconds",
     "retain_tables_on_delete",
@@ -155,7 +145,6 @@ class DeploymentConfig:
     default_daily_limits: QuotaLimitConfig
     default_weekly_limits: QuotaLimitConfig | None
     default_monthly_limits: QuotaLimitConfig | None
-    deprecated_options: tuple[str, ...]
     invocation_log_group_name: str
     invoker_principal_arns: tuple[str, ...]
     jwt_audience: str
@@ -254,26 +243,8 @@ class DeploymentConfig:
         )
         workloads = _workloads(value("workloads"), workloads_base)
 
-        new_allowlist_explicit = (
-            node.try_get_context("allowed_model_arns") is not None
-            or "allowed_model_arns" in deployment
-        )
-        legacy_allowlist_explicit = (
-            node.try_get_context("mode_a_allowed_model_arns") is not None
-            or "mode_a_allowed_model_arns" in deployment
-        )
-        if new_allowlist_explicit and legacy_allowlist_explicit:
-            raise ValueError(
-                "Use allowed_model_arns only; it replaces the legacy "
-                "mode_a_allowed_model_arns key."
-            )
         allowed_model_arns = _string_list(
-            "allowed_model_arns",
-            (
-                value("allowed_model_arns")
-                if new_allowlist_explicit or not legacy_allowlist_explicit
-                else value("mode_a_allowed_model_arns")
-            ),
+            "allowed_model_arns", value("allowed_model_arns")
         )
         if not allowed_model_arns:
             raise ValueError("allowed_model_arns must not be empty")
@@ -285,39 +256,6 @@ class DeploymentConfig:
                     "allowed_model_arns accepts Bedrock IAM resource "
                     f"ARNs (or '*'), not model IDs: {model_arn}"
                 )
-
-        deprecated_options = tuple(
-            name
-            for name in (
-                "default_mantle_project_id",
-                "experimental_native_session_deny",
-                "mode_b_allowed_model_ids",
-                "reconciler_interval_minutes",
-            )
-            if node.try_get_context(name) is not None or name in deployment
-        )
-        if legacy_allowlist_explicit:
-            deprecated_options += ("mode_a_allowed_model_arns",)
-
-        legacy_limit_keys = (
-            "default_daily_usd",
-            "default_daily_input_tokens",
-            "default_daily_output_tokens",
-        )
-        legacy_limit_explicit = tuple(
-            name
-            for name in legacy_limit_keys
-            if node.try_get_context(name) is not None or name in deployment
-        )
-        nested_limits_explicit = (
-            node.try_get_context("default_limits") is not None
-            or "default_limits" in deployment
-        )
-        if legacy_limit_explicit and nested_limits_explicit:
-            raise ValueError(
-                "default_limits is incompatible with legacy default_daily_* keys"
-            )
-        deprecated_options += legacy_limit_explicit
 
         invoker_arns = _string_list(
             "invoker_principal_arns", value("invoker_principal_arns")
@@ -444,25 +382,7 @@ class DeploymentConfig:
                 "shared admin secret"
             )
 
-        if legacy_limit_explicit:
-            daily_defaults = _DEFAULTS["default_limits"]["daily"]
-            default_limits_raw = {
-                "daily": {
-                    "usd": value("default_daily_usd")
-                    if "default_daily_usd" in legacy_limit_explicit
-                    else daily_defaults["usd"],
-                    "input_tokens": value("default_daily_input_tokens")
-                    if "default_daily_input_tokens" in legacy_limit_explicit
-                    else daily_defaults["input_tokens"],
-                    "output_tokens": value("default_daily_output_tokens")
-                    if "default_daily_output_tokens" in legacy_limit_explicit
-                    else daily_defaults["output_tokens"],
-                },
-                "weekly": None,
-                "monthly": None,
-            }
-        else:
-            default_limits_raw = value("default_limits")
+        default_limits_raw = value("default_limits")
         default_limits = _quota_default_limits(default_limits_raw)
         usage_retention_days = _positive_int(
             "usage_retention_days", value("usage_retention_days")
@@ -490,7 +410,6 @@ class DeploymentConfig:
             default_daily_limits=default_limits["daily"],
             default_weekly_limits=default_limits["weekly"],
             default_monthly_limits=default_limits["monthly"],
-            deprecated_options=deprecated_options,
             invocation_log_group_name=existing_log_group,
             invoker_principal_arns=tuple(invoker_arns),
             jwt_audience=jwt_audience,

@@ -80,7 +80,7 @@ def test_invocation_logging_requires_explicit_ownership_choice():
         _template({"manage_invocation_logging": False})
 
 
-def test_runtime_only_stack_is_event_driven_and_has_no_mantle_permissions():
+def test_stack_is_event_driven_with_iam_authenticated_function_url():
     template = _template({"manage_invocation_logging": True})
 
     # Emergency reconciliation (1 minute), the daily model price refresh,
@@ -98,10 +98,6 @@ def test_runtime_only_stack_is_event_driven_and_has_no_mantle_permissions():
     rendered = json.dumps(template.to_json())
     assert "assumed-role/" in rendered
     assert "BedrockUserRole" in rendered
-    assert "bedrock-mantle" not in rendered
-    assert "RECONCILER_INTERVAL_MINUTES" not in rendered
-    assert "MODE_B_ALLOWED_MODEL_IDS_JSON" not in rendered
-    assert "CREDENTIAL_ENFORCEMENT_MODE" not in rendered
     assert "RevocationProcessorFn" in rendered
     assert "EnforcementDispatcherFn" in rendered
     assert any(
@@ -381,7 +377,6 @@ def test_refresh_timing_must_fit_inside_permission_lease():
             }
         )
 
-
 def test_vended_role_uses_runtime_iam_allowlist_without_bearer_permission():
     arns = [
         "arn:aws:bedrock:us-east-1::foundation-model/openai.gpt-oss-120b-1:0",
@@ -424,33 +419,6 @@ def test_vended_role_uses_runtime_iam_allowlist_without_bearer_permission():
             if "Allow" in json.dumps(policy)
         ]
     )
-
-
-def test_legacy_runtime_allowlist_alias_still_synthesizes():
-    arn = (
-        "arn:aws:bedrock:us-east-1::foundation-model/"
-        "openai.gpt-oss-20b-1:0"
-    )
-    template = _template(
-        {
-            "manage_invocation_logging": True,
-            "mode_a_allowed_model_arns": [arn],
-            "mode_b_allowed_model_ids": ["ignored-after-migration"],
-            "reconciler_interval_minutes": 1,
-        }
-    )
-    assert arn in json.dumps(template.to_json())
-
-
-def test_new_and_legacy_allowlist_cannot_be_combined():
-    with pytest.raises(ValueError, match="allowed_model_arns only"):
-        _template(
-            {
-                "manage_invocation_logging": True,
-                "allowed_model_arns": ["*"],
-                "mode_a_allowed_model_arns": ["*"],
-            }
-        )
 
 
 def test_existing_log_group_does_not_change_account_wide_configuration():
@@ -649,7 +617,6 @@ def test_invalid_deployment_values_fail_synth(key, value, message):
     with pytest.raises(ValueError, match=message):
         _template({"manage_invocation_logging": True, key: value})
 
-
 @pytest.mark.parametrize(
     ("limits", "message"),
     [
@@ -681,40 +648,6 @@ def test_invalid_default_limits_fail_synth(limits, message):
             {
                 "manage_invocation_logging": True,
                 "default_limits": limits,
-            }
-        )
-
-
-def test_legacy_daily_defaults_migrate_to_daily_period_only():
-    template = _template(
-        {
-            "manage_invocation_logging": True,
-            "default_daily_usd": 7,
-            "default_daily_input_tokens": 700,
-            "default_daily_output_tokens": 70,
-        }
-    )
-    defaults = json.loads(
-        _environment_with(template, "BEDROCK_USER_ROLE_ARN")[
-            "DEFAULT_LIMITS_JSON"
-        ]
-    )
-    assert defaults == {
-        "daily": {"usd": 7.0, "input_tokens": 700, "output_tokens": 70},
-        "weekly": None,
-        "monthly": None,
-    }
-
-
-def test_nested_and_legacy_default_limits_cannot_be_mixed():
-    with pytest.raises(ValueError, match="incompatible"):
-        _template(
-            {
-                "manage_invocation_logging": True,
-                "default_limits": {
-                    "daily": {"usd": 1, "input_tokens": 1, "output_tokens": 1},
-                },
-                "default_daily_usd": 2,
             }
         )
 

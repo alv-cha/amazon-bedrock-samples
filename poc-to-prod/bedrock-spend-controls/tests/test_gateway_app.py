@@ -477,7 +477,6 @@ def test_admin_create_list_update_block_and_usage(client):
 
     listing = api.get("/admin/users", headers=ADMIN).json()
     assert listing["users"][0]["user_id"] == "tenant/acme"
-    assert "mantle_project_id" not in listing["users"][0]
     usage = api.get(
         "/admin/users/tenant%2Facme/usage", headers=ADMIN
     ).json()
@@ -506,7 +505,6 @@ def test_admin_summary_exposes_single_guarantee(client):
         "metrics_namespace": "BedrockSpendControls",
         "detection_lag_metric": "DetectionLagMilliseconds",
     }
-    assert "reconciler_interval_minutes" not in body
 
 
 def test_operations_is_read_only_safe_and_reports_revocation_health(

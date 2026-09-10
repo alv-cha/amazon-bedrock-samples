@@ -111,12 +111,6 @@ already expired; a deployment previously below 31 days must wait for a clean
 month boundary or backfill from retained invocation logs before enabling a
 monthly cap.
 
-Pre-period deployment files containing `default_daily_usd`,
-`default_daily_input_tokens`, and `default_daily_output_tokens` are accepted as
-deprecated migration input and become the daily object with weekly/monthly
-disabled. Do not combine those keys with `default_limits`; update the file to
-the nested shape before public deployment.
-
 ### Safe routine administration
 
 The routine API remains behind the `AWS_IAM` Function URL. Browser requests are
@@ -224,32 +218,6 @@ instead of failing, and the UI explains the gap.
 Qualification shown in the panel is reviewed deployment metadata, not
 inferred from alarm health. Lease, revocation, and emergency live
 qualification remain pending until recorded in `spikes/QUALIFICATION.md`.
-
-Legacy `mode_a_allowed_model_arns` is accepted as an alias for
-`allowed_model_arns`. Former dual-mode keys synthesize only for migration and
-are ignored with a warning. Remove them.
-
-### Upgrading the former dual-mode stack
-
-The runtime-only update preserves the existing `GatewayFn` construct,
-Function URL, `GatewayUrl`, `GatewayRoleArn`, and CloudWatch dashboard name.
-`BrokerApiUrl` and `BrokerApiRoleArn` are the canonical output names after the
-update.
-
-The update deliberately removes the inference proxy routes, Mantle
-permissions, scheduled reconciler, and its EventBridge rule. Existing
-DynamoDB tables and daily rows remain compatible. Review the CloudFormation
-change set before deployment and update clients to:
-
-1. Call `POST /v1/credentials`.
-2. Build a normal `bedrock-runtime` client from the returned credentials.
-3. Stop using the old OpenAI/Anthropic proxy base URLs.
-
-There is no hard pre-spend cap after this migration; enforcement remains
-bounded overspend. The guarded sandbox probe in
-`spikes/lease_revocation_probe.py` validates lease expiration and targeted
-revocation propagation for the selected models/Region; record results in
-`spikes/QUALIFICATION.md`.
 
 ### Runtime enforcement dial
 
