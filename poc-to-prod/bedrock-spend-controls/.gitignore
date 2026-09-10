@@ -7,3 +7,6 @@ cdk/config/workloads.json
 
 # Personal demo assets (per-user presentation material, not part of the sample)
 notebook/capstone_*
+
+# Internal architecture decision records (kept locally, not part of the sample)
+ADR-*.md
