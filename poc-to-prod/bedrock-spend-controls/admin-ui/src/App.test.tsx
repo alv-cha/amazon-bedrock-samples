@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   Dashboard,
   LimitsDialog,
@@ -11,7 +11,7 @@ import {
   StatusDialog,
   UsersPanel,
 } from "./App";
-import { ApiError, api, type AdminUser, type AuditEvent, type CurrentUsage, type Operations, type QuotaPeriod, type Summary, type UserRow } from "./api";
+import { ApiError, api, type AdminUser, type AuditEvent, type CurrentUsage, type Operations, type QuotaPeriod, type Summary, type UsageMetrics, type UserRow } from "./api";
 import type { Session } from "./auth";
 import type { AdminConfig } from "./config";
 
@@ -31,6 +31,24 @@ const session: Session = {
   reauthenticate: vi.fn(),
   logout: vi.fn(),
 };
+
+const emptyUsageMetrics: UsageMetrics = {
+  status: "available",
+  as_of: "2026-09-02T10:00:00Z",
+  start: "2026-08-31",
+  end: "2026-09-02",
+  period: "daily",
+  days: ["2026-08-31", "2026-09-01", "2026-09-02"],
+  models: [],
+  totals: { cost_usd: 0, requests: 0, input_tokens: 0, output_tokens: 0 },
+  top_users: [],
+};
+
+// Every Dashboard render mounts the Overview usage charts; keep their fetch
+// deterministic by default. restoreMocks unwinds this spy after each test.
+beforeEach(() => {
+  vi.spyOn(api, "usageMetrics").mockResolvedValue(emptyUsageMetrics);
+});
 
 const summary: Summary = {
   enforcement: {

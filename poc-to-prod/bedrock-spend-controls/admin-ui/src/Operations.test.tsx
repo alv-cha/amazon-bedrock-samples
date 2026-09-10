@@ -1,6 +1,6 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { EmergencyStopCard, EnforcementDialCard, OperationsView, leaseWindowLabel } from "./Operations";
 import { ApiError, api, type EnforcementConfig, type Operations } from "./api";
 import type { Session } from "./auth";
@@ -288,6 +288,12 @@ describe("emergency stop", () => {
 });
 
 describe("operations view", () => {
+  // OperationsView hosts LiveLeases, which polls the lease snapshot; keep it
+  // deterministic in every operations-view test.
+  beforeEach(() => {
+    vi.spyOn(api, "leaseSnapshot").mockResolvedValue({ users: [], next_cursor: null });
+  });
+
   it("renders controls, health cards, and alarms together", async () => {
     vi.spyOn(api, "getEnforcement").mockResolvedValue(enforcement);
     render(
@@ -308,6 +314,53 @@ describe("operations view", () => {
     expect(screen.getByText("Always on · 19 shards")).toBeInTheDocument();
     expect(screen.getByText("5 min · runtime dial")).toBeInTheDocument();
     expect(within(screen.getByLabelText("Operational alarms")).getByText(/enforcement dispatch dlq/)).toBeInTheDocument();
+  });
+
+  it("shows live leases on the operations panel", async () => {
+    vi.spyOn(api, "getEnforcement").mockResolvedValue(enforcement);
+    const expiresAt = new Date(Date.now() + 240_000).toISOString();
+    vi.spyOn(api, "leaseSnapshot").mockResolvedValue({
+      users: [
+        {
+          user_id: "lease-holder",
+          name: "Lease Holder",
+          status: "active",
+          status_reason: "",
+          status_origin: "admin",
+          version: 3,
+          created_at: "2026-09-09T09:00:00Z",
+          updated_at: "2026-09-09T10:00:00Z",
+          limits: {
+            daily: { usd: 1, input_tokens: 100, output_tokens: 50 },
+            weekly: null,
+            monthly: null,
+          },
+          lease: {
+            active: true,
+            expires_at: expiresAt,
+            refresh_after: null,
+            generation: 1,
+            granted_at: new Date(Date.now() - 60_000).toISOString(),
+            lease_seconds: 300,
+          },
+        },
+      ],
+      next_cursor: null,
+    });
+    render(
+      <OperationsView
+        cfg={cfg}
+        error=""
+        loading={false}
+        onChanged={vi.fn()}
+        operations={operations}
+        session={session}
+        stale={false}
+      />,
+    );
+
+    const leases = await screen.findByLabelText("Live leases");
+    expect(await within(leases).findByText(/Lease Holder · granted/)).toBeInTheDocument();
   });
 
   it("keeps the controls reachable when operational telemetry is unavailable", async () => {

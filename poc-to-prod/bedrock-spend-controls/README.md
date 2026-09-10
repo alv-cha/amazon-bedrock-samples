@@ -118,7 +118,7 @@ outside this direct-to-Runtime architecture.
 | Revocation processor | Always-on sharded `SourceIdentity` deny reconciliation |
 | Emergency processor | Operator-controlled role-wide deny state machine |
 | CloudWatch/SNS | Operational metrics, alarms, warnings, and block notifications |
-| Admin UI | Overview, user management, runtime enforcement controls, emergency stop, alarms, and audit history |
+| Admin UI | Overview with per-model usage charts, user management, runtime enforcement controls, live leases, emergency stop, alarms, and audit history |
 
 The admin UI uses Cognito managed login with authorization-code + PKCE, then
 exchanges the current ID token through the Identity Pool for temporary AWS

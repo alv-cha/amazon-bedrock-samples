@@ -176,7 +176,10 @@ MVP.
 GUI status panel. It combines deployed credential configuration, normalized
 emergency convergence state, conservative qualification metadata, p95
 `DetectionLagMilliseconds`, revocation freshness/failure/overflow metrics, and
-CloudWatch alarm states—including the emergency/revocation DLQ alarms.
+CloudWatch alarm states—including the emergency/revocation DLQ alarms. The
+same panel shows the live-lease timeline: the first page of vended logical
+leases, polled every five seconds from
+`GET /admin/users?include_usage=false`.
 
 The same tab exposes two explicit controls:
 
@@ -189,13 +192,40 @@ The same tab exposes two explicit controls:
   and is never persisted by the console.
 
 CloudWatch reads are performed by the broker role using only
-`cloudwatch:GetMetricData` and `cloudwatch:DescribeAlarms`. The browser still
+`cloudwatch:GetMetricData`, `cloudwatch:DescribeAlarms`, and
+`cloudwatch:ListMetrics`. The browser still
 has only Function URL invocation permission. API responses and generated UI
 configuration never include the emergency key, secret ARN/value, or IAM policy
 ARNs. If CloudWatch is denied or has no data, the endpoint returns local state
 with `unavailable`, `unknown`, `not_applicable`, or
 `INSUFFICIENT_DATA`; it does not label missing telemetry healthy and does not
 break user quota administration.
+
+### Overview usage charts
+
+`GET /admin/usage/metrics?days=N` (default 14, maximum 30) powers the
+Overview tab's per-model usage charts and the top-users-by-spend list. It
+reads the EMF metrics the usage processor emits (`EstimatedCostUSD`,
+`Requests`, `InputTokens`, `OutputTokens` in the deployed metrics namespace)
+in daily UTC buckets that match the quota calendar windows. Quota accounting
+is unaffected: the DynamoDB daily ledger remains the canonical enforcement
+source; these charts are observability only. Model and user dimension values
+are discovered with `cloudwatch:ListMetrics`, which only lists metrics that
+received data points in roughly the last two weeks, so a 30-day range can
+omit identities idle since then. Discovery is capped at 20 models and 100
+users per response. Top-user entries resolve the display name from the users
+table server-side; identities that metered usage but were since removed fall
+back to the raw quota key. When CloudWatch is denied or degraded the endpoint
+returns `status: unavailable` or `partial` with empty or partial series
+instead of failing, and the UI explains the gap.
+
+Qualification shown in the panel is reviewed deployment metadata, not
+inferred from alarm health. Lease, revocation, and emergency live
+qualification remain pending until recorded in `spikes/QUALIFICATION.md`.
+
+Legacy `mode_a_allowed_model_arns` is accepted as an alias for
+`allowed_model_arns`. Former dual-mode keys synthesize only for migration and
+are ignored with a warning. Remove them.
 
 ### Upgrading the former dual-mode stack
 
@@ -710,7 +740,9 @@ limits. The client automatically adds UUID idempotency and calls
 supplied as raw query values and encoded once by the signed HTTP client. Do not
 treat duplicate, version, or idempotency conflicts as success.
 
-In the UI, verify the Overview, Users, Operations, and Audit tabs; 25-row
+In the UI, verify the Overview, Users, Operations, and Audit tabs; the
+Overview per-model usage charts with their metric and range selectors; the
+live-lease timeline on Operations; 25-row
 server pagination/search; explicit Unlimited confirmation; required reasons
 for period enable/disable, Unlimited, and finite-below-current-period changes;
 optional reasons for ordinary limit increases; reasoned status changes; and

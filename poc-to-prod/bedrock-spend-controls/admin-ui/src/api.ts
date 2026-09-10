@@ -411,6 +411,34 @@ export interface Operations {
   cloudwatch: { status: string; error_code?: string };
 }
 
+export const USAGE_METRIC_KEYS = ["cost_usd", "requests", "input_tokens", "output_tokens"] as const;
+export type UsageMetricKey = (typeof USAGE_METRIC_KEYS)[number];
+
+export interface UsageModelMetrics {
+  model: string;
+  series: Record<UsageMetricKey, number[]>;
+  totals: Record<UsageMetricKey, number>;
+}
+
+export interface UsageTopUser {
+  user_id: string;
+  name?: string;
+  cost_usd: number;
+  requests: number;
+}
+
+export interface UsageMetrics {
+  status: "available" | "partial" | "unavailable";
+  error_code?: string;
+  as_of: string;
+  start: string;
+  end: string;
+  period: "daily";
+  days: string[];
+  models: UsageModelMetrics[];
+  totals: Record<UsageMetricKey, number>;
+  top_users: UsageTopUser[];
+}
 
 export interface SetLimitsRequest {
   limits: QuotaLimits;
@@ -700,6 +728,33 @@ function isOperations(value: unknown): value is Operations {
     (value.cloudwatch.error_code === undefined || typeof value.cloudwatch.error_code === "string");
 }
 
+function isUsageMetricRecord(value: unknown, arrays: boolean): boolean {
+  return isObject(value) && USAGE_METRIC_KEYS.every((key) => (
+    arrays
+      ? Array.isArray(value[key]) && (value[key] as unknown[]).every((item) => typeof item === "number")
+      : hasNumber(value, key)
+  ));
+}
+
+function isUsageMetrics(value: unknown): value is UsageMetrics {
+  return isObject(value) &&
+    (value.status === "available" || value.status === "partial" || value.status === "unavailable") &&
+    (value.error_code === undefined || typeof value.error_code === "string") &&
+    hasString(value, "as_of") && hasString(value, "start") && hasString(value, "end") &&
+    value.period === "daily" &&
+    Array.isArray(value.days) && value.days.every((day) => typeof day === "string") &&
+    isUsageMetricRecord(value.totals, false) &&
+    Array.isArray(value.models) && value.models.every((entry) => (
+      isObject(entry) && hasString(entry, "model") &&
+      isUsageMetricRecord(entry.series, true) && isUsageMetricRecord(entry.totals, false)
+    )) &&
+    Array.isArray(value.top_users) && value.top_users.every((entry) => (
+      isObject(entry) && hasString(entry, "user_id") &&
+      (entry.name === undefined || typeof entry.name === "string") &&
+      hasNumber(entry, "cost_usd") && hasNumber(entry, "requests")
+    ));
+}
+
 function isSetLimitsResponse(value: unknown): value is SetLimitsResponse {
   return isObject(value) && hasString(value, "user_id") && value.updated === true &&
     isQuotaLimits(value.limits) && isAdminUser(value.user);
@@ -791,6 +846,11 @@ export const api = {
 
   operations: async (cfg: AdminConfig, session: Session): Promise<Operations> =>
     (await transport<Operations>(cfg, session, "GET", "/admin/operations", { validate: isOperations })).data,
+
+  usageMetrics: async (cfg: AdminConfig, session: Session, days: number): Promise<UsageMetrics> =>
+    (await transport<UsageMetrics>(cfg, session, "GET", `/admin/usage/metrics?days=${days}`, {
+      validate: isUsageMetrics,
+    })).data,
 
   getEnforcement: async (cfg: AdminConfig, session: Session): Promise<EnforcementConfig> =>
     (await transport<EnforcementConfig>(cfg, session, "GET", "/admin/enforcement", {

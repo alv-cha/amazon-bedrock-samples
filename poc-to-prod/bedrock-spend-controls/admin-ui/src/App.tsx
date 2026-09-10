@@ -37,7 +37,8 @@ import {
   type UserRow,
   type UserStatus,
 } from "./api";
-import { CreateUserWizard, GlobalAuditView, LiveLeases, UserDetailDrawer } from "./OperationalUi";
+import { CreateUserWizard, GlobalAuditView, UserDetailDrawer } from "./OperationalUi";
+import { OverviewCharts } from "./OverviewCharts";
 import { OperationsView } from "./Operations";
 import { useModalLifecycle } from "./modal";
 
@@ -419,7 +420,7 @@ export function Dashboard({
             )}
             {summary ? <SummaryPanel summary={summary} /> : summaryLoading ? <SummarySkeleton /> : <UnavailableState label="Summary unavailable" />}
 
-            {operations && <LiveLeases cfg={cfg} configuration={operations.configuration} session={session} />}
+            <OverviewCharts cfg={cfg} refreshKey={summary?.enforcement.as_of} session={session} users={users} />
           </>
         )}
 

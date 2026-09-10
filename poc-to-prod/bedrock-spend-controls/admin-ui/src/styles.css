@@ -2738,3 +2738,177 @@ tbody tr:hover {
     gap: 4px;
   }
 }
+
+/* --- Overview usage charts ------------------------------------------- */
+
+.usage-panel {
+  margin-top: 26px;
+  padding: 22px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+}
+
+.usage-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+
+.usage-heading h2 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 4px;
+  font-size: 17px;
+}
+
+.usage-heading p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.usage-controls {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.usage-controls select {
+  padding: 7px 10px;
+  font-size: 13px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--ink);
+}
+
+.usage-status {
+  margin-bottom: 10px;
+}
+
+.usage-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 2.2fr) minmax(220px, 1fr);
+  gap: 20px;
+}
+
+@media (max-width: 900px) {
+  .usage-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+.usage-chart-card {
+  min-width: 0;
+}
+
+.usage-chart-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.usage-chart-axis {
+  stroke: var(--line);
+  stroke-width: 1;
+}
+
+.usage-chart-label,
+.usage-chart-max {
+  fill: var(--muted);
+  font-size: 10px;
+  font-family: inherit;
+}
+
+.usage-chart-empty {
+  margin: 12px 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.usage-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.usage-legend li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.usage-swatch {
+  width: 10px;
+  height: 10px;
+  flex-shrink: 0;
+  border-radius: 3px;
+}
+
+.usage-legend-name {
+  color: var(--ink);
+}
+
+.usage-legend-value {
+  color: var(--muted);
+}
+
+.usage-totals {
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.usage-top-users h3 {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0 0 12px;
+  font-size: 14px;
+}
+
+.usage-top-users ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.usage-user-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 4px;
+  font-size: 13px;
+}
+
+.usage-user-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.usage-user-cost {
+  flex-shrink: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.usage-user-track {
+  height: 6px;
+  border-radius: 3px;
+}

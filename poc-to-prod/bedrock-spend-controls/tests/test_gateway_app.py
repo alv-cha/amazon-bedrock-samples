@@ -54,12 +54,15 @@ class FakeBroker:
 
 
 class FakeCloudWatch:
-    def __init__(self, *, results=None, alarms=None, error=None):
+    def __init__(self, *, results=None, alarms=None, metrics=None,
+                 error=None):
         self.results = results or []
         self.alarms = alarms or []
+        self.metrics = metrics or []
         self.error = error
         self.metric_calls = []
         self.alarm_calls = []
+        self.list_calls = []
 
     def get_metric_data(self, **kwargs):
         self.metric_calls.append(kwargs)
@@ -72,6 +75,22 @@ class FakeCloudWatch:
         if self.error is not None:
             raise self.error
         return {"MetricAlarms": self.alarms}
+
+    def list_metrics(self, **kwargs):
+        self.list_calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        wanted = {
+            dimension["Name"] for dimension in kwargs.get("Dimensions", [])
+        }
+        matches = [
+            metric for metric in self.metrics
+            if wanted <= {
+                dimension["Name"]
+                for dimension in metric.get("Dimensions", [])
+            }
+        ]
+        return {"Metrics": matches}
 
 
 @pytest.fixture
@@ -732,6 +751,144 @@ def test_operations_gracefully_reports_unavailable_cloudwatch(
     # Revocation is always on: unavailable telemetry is unknown, never N/A.
     assert body["metrics"]["reconciliation_status"] == "unknown"
     assert all(alarm["state"] == "UNAVAILABLE" for alarm in body["alarms"])
+
+
+def _usage_metric(name: str, value: str) -> dict:
+    return {
+        "MetricName": "Requests",
+        "Dimensions": [{"Name": name, "Value": value}],
+    }
+
+
+def test_usage_metrics_requires_admin_and_validates_days(client):
+    api, _, _ = client
+    assert api.get("/admin/usage/metrics").status_code == 403
+    for days in (0, 31):
+        response = api.get(
+            f"/admin/usage/metrics?days={days}", headers=ADMIN
+        )
+        assert response.status_code == 400
+        assert "days must be between 1 and 30" in (
+            response.json()["error"]["message"]
+        )
+
+
+def test_usage_metrics_aggregates_models_and_top_users(client, monkeypatch):
+    api, store, _ = client
+    # Only user-a still exists in the users table; user-b metered and was
+    # deleted, so its top-user entry must fall back to the raw quota key.
+    store.put_user(
+        user_id="user-a",
+        name="Ada Lovelace",
+        daily_usd=1.0,
+        daily_input_tokens=100,
+        daily_output_tokens=50,
+    )
+    now = datetime.now(timezone.utc)
+    today = datetime.combine(
+        now.date(), datetime.min.time(), tzinfo=timezone.utc
+    )
+    yesterday = today - timedelta(days=1)
+    results = [
+        {"Id": "t_cost_usd", "StatusCode": "Complete",
+         "Timestamps": [today, yesterday], "Values": [0.25, 0.5]},
+        {"Id": "t_requests", "StatusCode": "Complete",
+         "Timestamps": [today, yesterday], "Values": [3.0, 5.0]},
+        {"Id": "t_input_tokens", "StatusCode": "Complete",
+         "Timestamps": [today], "Values": [120.0]},
+        {"Id": "t_output_tokens", "StatusCode": "Complete",
+         "Timestamps": [today], "Values": [40.0]},
+        {"Id": "m0_cost_usd", "StatusCode": "Complete",
+         "Timestamps": [today, yesterday], "Values": [0.05, 0.5]},
+        {"Id": "m0_requests", "StatusCode": "Complete",
+         "Timestamps": [today, yesterday], "Values": [1.0, 5.0]},
+        {"Id": "m1_cost_usd", "StatusCode": "Complete",
+         "Timestamps": [today], "Values": [0.2]},
+        {"Id": "m1_requests", "StatusCode": "Complete",
+         "Timestamps": [today], "Values": [2.0]},
+        {"Id": "u0_cost", "StatusCode": "Complete",
+         "Timestamps": [today], "Values": [0.05]},
+        {"Id": "u0_requests", "StatusCode": "Complete",
+         "Timestamps": [today], "Values": [1.0]},
+        {"Id": "u1_cost", "StatusCode": "Complete",
+         "Timestamps": [today, yesterday], "Values": [0.2, 0.5]},
+        {"Id": "u1_requests", "StatusCode": "Complete",
+         "Timestamps": [today, yesterday], "Values": [2.0, 5.0]},
+    ]
+    cloudwatch = FakeCloudWatch(
+        results=results,
+        metrics=[
+            _usage_metric("Model", "amazon.nova-micro-v1:0"),
+            _usage_metric("Model", "anthropic.claude-haiku"),
+            _usage_metric("UserId", "user-a"),
+            _usage_metric("UserId", "user-b"),
+        ],
+    )
+    monkeypatch.setattr(gateway, "_cloudwatch", cloudwatch)
+
+    response = api.get("/admin/usage/metrics?days=7", headers=ADMIN)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "available"
+    assert body["period"] == "daily"
+    assert len(body["days"]) == 7
+    assert body["days"][-1] == now.date().isoformat()
+    assert body["totals"]["cost_usd"] == 0.75
+    assert body["totals"]["requests"] == 8.0
+    # Models are discovered via ListMetrics and reported alphabetically.
+    assert [entry["model"] for entry in body["models"]] == [
+        "amazon.nova-micro-v1:0",
+        "anthropic.claude-haiku",
+    ]
+    nova = body["models"][0]
+    assert nova["totals"]["cost_usd"] == 0.55
+    assert nova["series"]["cost_usd"][-1] == 0.05
+    assert nova["series"]["cost_usd"][-2] == 0.5
+    assert sum(nova["series"]["requests"]) == 6.0
+    # Top users are ordered by range cost; names resolve from the users
+    # table and deleted identities fall back to the raw key.
+    assert body["top_users"] == [
+        {"user_id": "user-b", "name": "user-b", "cost_usd": 0.7,
+         "requests": 7},
+        {"user_id": "user-a", "name": "Ada Lovelace", "cost_usd": 0.05,
+         "requests": 1},
+    ]
+    # One batched GetMetricData: totals + 2 models x 4 + 2 users x 2.
+    queries = cloudwatch.metric_calls[0]["MetricDataQueries"]
+    assert len(queries) == 4 + 8 + 4
+    assert all(query["MetricStat"]["Period"] == 86400 for query in queries)
+    dimension_filters = [
+        call["Dimensions"][0]["Name"] for call in cloudwatch.list_calls
+    ]
+    assert dimension_filters == ["Model", "UserId"]
+
+
+def test_usage_metrics_marks_partial_and_unavailable(client, monkeypatch):
+    api, _, _ = client
+    incomplete = FakeCloudWatch(
+        results=[
+            {"Id": "t_cost_usd", "StatusCode": "InternalError",
+             "Timestamps": [], "Values": []},
+        ],
+        metrics=[_usage_metric("Model", "amazon.nova-micro-v1:0")],
+    )
+    monkeypatch.setattr(gateway, "_cloudwatch", incomplete)
+    body = api.get("/admin/usage/metrics", headers=ADMIN).json()
+    assert body["status"] == "partial"
+    assert len(body["days"]) == 14
+
+    error = ClientError(
+        {"Error": {"Code": "AccessDenied", "Message": "denied"}},
+        "ListMetrics",
+    )
+    monkeypatch.setattr(gateway, "_cloudwatch", FakeCloudWatch(error=error))
+    body = api.get("/admin/usage/metrics?days=7", headers=ADMIN).json()
+    assert body["status"] == "unavailable"
+    assert body["error_code"] == "AccessDenied"
+    assert body["models"] == []
+    assert body["top_users"] == []
+    assert len(body["days"]) == 7
 
 
 def test_admin_summary_and_operations_follow_the_runtime_dial(

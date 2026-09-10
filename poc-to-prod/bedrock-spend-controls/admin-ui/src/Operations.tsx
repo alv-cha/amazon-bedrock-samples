@@ -23,6 +23,7 @@ import {
   type Operations,
 } from "./api";
 import { useModalLifecycle } from "./modal";
+import { LiveLeases } from "./OperationalUi";
 
 const EMERGENCY_CONFIRMATIONS: Record<EmergencyAction, string> = {
   activate: "STOP_ALL_BEDROCK_SESSIONS",
@@ -609,6 +610,8 @@ export function OperationsView({
       {error && <ErrorMessage message={error} />}
 
       {controls}
+
+      <LiveLeases cfg={cfg} configuration={config} session={session} />
 
       <div className="operations-grid">
         <OperationsCard

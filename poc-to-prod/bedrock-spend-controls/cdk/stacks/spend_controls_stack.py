@@ -1760,6 +1760,9 @@ class SpendControlsStack(Stack):
                 actions=[
                     "cloudwatch:GetMetricData",
                     "cloudwatch:DescribeAlarms",
+                    # /admin/usage/metrics discovers Model/UserId dimension
+                    # values before charting the EMF usage roll-ups.
+                    "cloudwatch:ListMetrics",
                 ],
                 resources=["*"],
             )

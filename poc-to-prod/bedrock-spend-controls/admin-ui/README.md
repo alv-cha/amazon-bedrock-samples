@@ -19,6 +19,12 @@ It provides:
   period-qualified Changes (per-user routine audit).
 - A global Audit log for routine create, limit, and status changes, with an
   explicit refresh and its own last-successful freshness/error state.
+- Overview usage charts: daily per-model spend/requests/tokens stacked bars
+  with metric and 7/14/30-day range selectors, plus a top-users-by-spend
+  list. Data comes from `GET /admin/usage/metrics` (CloudWatch EMF metrics,
+  observability only); the DynamoDB daily ledger remains the quota source.
+- A live-lease timeline on the Operations tab showing currently vended
+  logical leases, polled every five seconds.
 - Independent stale/error states, so one failed panel retains its last
   successful timestamp without presenting unrelated data as fresh.
 - Runtime-only bounded-overspend guarantee and layered enforcement status.

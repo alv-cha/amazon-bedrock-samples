@@ -1162,6 +1162,230 @@ def _read_operations_cloudwatch(
         }
 
 
+# Usage graphs read the EMF metrics the usage processor emits, because only
+# CloudWatch carries the per-Model dimension; the DynamoDB daily ledger stays
+# the canonical quota source and has no model breakdown.
+USAGE_METRIC_SPECS = (
+    ("cost_usd", "EstimatedCostUSD"),
+    ("requests", "Requests"),
+    ("input_tokens", "InputTokens"),
+    ("output_tokens", "OutputTokens"),
+)
+USAGE_METRICS_MAX_DAYS = 30
+USAGE_METRICS_MAX_MODELS = 20
+USAGE_METRICS_MAX_USERS = 100
+USAGE_METRICS_TOP_USERS = 5
+
+
+def _list_dimension_values(client, dimension: str, limit: int) -> list[str]:
+    """Distinct values of one EMF dimension via ListMetrics.
+
+    CloudWatch only lists metrics that received data points in roughly the
+    last two weeks, so a 30-day range can omit identities idle since then.
+    """
+    values: list[str] = []
+    seen: set[str] = set()
+    kwargs = {
+        "Namespace": settings.metrics_namespace,
+        "MetricName": "Requests",
+        "Dimensions": [{"Name": dimension}],
+    }
+    while True:
+        response = client.list_metrics(**kwargs)
+        for metric in response.get("Metrics", []):
+            for dim in metric.get("Dimensions", []):
+                if dim.get("Name") != dimension:
+                    continue
+                value = str(dim.get("Value", ""))
+                if value and value not in seen:
+                    seen.add(value)
+                    values.append(value)
+        token = response.get("NextToken")
+        if not token or len(values) >= limit:
+            break
+        kwargs["NextToken"] = token
+    return sorted(values)[:limit]
+
+
+def _usage_metric_query(query_id: str, metric_name: str,
+                        dimensions: list[dict]) -> dict:
+    return {
+        "Id": query_id,
+        "MetricStat": {
+            "Metric": {
+                "Namespace": settings.metrics_namespace,
+                "MetricName": metric_name,
+                "Dimensions": dimensions,
+            },
+            # Daily buckets; CloudWatch aligns 86400-second periods to UTC
+            # midnight, matching the quota calendar windows.
+            "Period": 86400,
+            "Stat": "Sum",
+        },
+        "ReturnData": True,
+    }
+
+
+def _usage_series(result: dict, day_index: dict[str, int],
+                  bucket_count: int) -> list[float]:
+    series = [0.0] * bucket_count
+    for timestamp, value in _metric_points(result):
+        index = day_index.get(timestamp.date().isoformat())
+        if index is not None:
+            series[index] = float(value)
+    return series
+
+
+@app.get("/admin/usage/metrics")
+async def admin_usage_metrics(request: Request, days: int = 14) -> Response:
+    if (denied := _require_admin(request)) is not None:
+        return denied
+    if days < 1 or days > USAGE_METRICS_MAX_DAYS:
+        return _error(
+            400,
+            f"days must be between 1 and {USAGE_METRICS_MAX_DAYS}.",
+            "invalid_request_error",
+        )
+    now = datetime.now(timezone.utc)
+    start_date = now.date() - timedelta(days=days - 1)
+    day_keys = [
+        (start_date + timedelta(days=offset)).isoformat()
+        for offset in range(days)
+    ]
+    day_index = {key: index for index, key in enumerate(day_keys)}
+    start_time = datetime.combine(
+        start_date, datetime.min.time(), tzinfo=timezone.utc
+    )
+    payload: dict = {
+        "as_of": now.isoformat(),
+        "start": day_keys[0],
+        "end": day_keys[-1],
+        "period": "daily",
+        "days": day_keys,
+        "models": [],
+        "totals": {key: 0.0 for key, _ in USAGE_METRIC_SPECS},
+        "top_users": [],
+    }
+    try:
+        client = cloudwatch_client()
+        models = _list_dimension_values(
+            client, "Model", USAGE_METRICS_MAX_MODELS
+        )
+        user_ids = _list_dimension_values(
+            client, "UserId", USAGE_METRICS_MAX_USERS
+        )
+        queries = [
+            _usage_metric_query(f"t_{key}", metric_name, [])
+            for key, metric_name in USAGE_METRIC_SPECS
+        ]
+        for model_index, model in enumerate(models):
+            dimensions = [{"Name": "Model", "Value": model}]
+            queries.extend(
+                _usage_metric_query(
+                    f"m{model_index}_{key}", metric_name, dimensions
+                )
+                for key, metric_name in USAGE_METRIC_SPECS
+            )
+        for user_index, user_id in enumerate(user_ids):
+            dimensions = [{"Name": "UserId", "Value": user_id}]
+            queries.append(
+                _usage_metric_query(
+                    f"u{user_index}_cost", "EstimatedCostUSD", dimensions
+                )
+            )
+            queries.append(
+                _usage_metric_query(
+                    f"u{user_index}_requests", "Requests", dimensions
+                )
+            )
+        results: dict[str, dict] = {}
+        incomplete = False
+        if queries:
+            response = client.get_metric_data(
+                MetricDataQueries=queries,
+                StartTime=start_time,
+                EndTime=now,
+                ScanBy="TimestampDescending",
+            )
+            for result in response.get("MetricDataResults", []):
+                query_id = str(result.get("Id", ""))
+                results[query_id] = result
+                if result.get("StatusCode") != "Complete":
+                    incomplete = True
+        for key, _ in USAGE_METRIC_SPECS:
+            series = _usage_series(
+                results.get(f"t_{key}", {}), day_index, days
+            )
+            payload["totals"][key] = round(sum(series), 6)
+        for model_index, model in enumerate(models):
+            series = {
+                key: _usage_series(
+                    results.get(f"m{model_index}_{key}", {}),
+                    day_index,
+                    days,
+                )
+                for key, _ in USAGE_METRIC_SPECS
+            }
+            payload["models"].append(
+                {
+                    "model": model,
+                    "series": series,
+                    "totals": {
+                        key: round(sum(values), 6)
+                        for key, values in series.items()
+                    },
+                }
+            )
+        user_totals = []
+        for user_index, user_id in enumerate(user_ids):
+            cost = sum(
+                value
+                for _, value in _metric_points(
+                    results.get(f"u{user_index}_cost", {})
+                )
+            )
+            requests = sum(
+                value
+                for _, value in _metric_points(
+                    results.get(f"u{user_index}_requests", {})
+                )
+            )
+            if cost or requests:
+                user_totals.append(
+                    {
+                        "user_id": user_id,
+                        "cost_usd": round(cost, 6),
+                        "requests": int(requests),
+                    }
+                )
+        user_totals.sort(
+            key=lambda item: (-item["cost_usd"], -item["requests"])
+        )
+        top_users = user_totals[:USAGE_METRICS_TOP_USERS]
+        # CloudWatch dimensions carry only the raw quota key. Resolve the
+        # display name from the users table for the handful of entries shown;
+        # identities deleted since they metered fall back to the raw key.
+        for entry in top_users:
+            try:
+                user = store().get_user(entry["user_id"])
+            except (ValueError, ClientError):
+                user = None
+            entry["name"] = (
+                user.name if user is not None and user.name
+                else entry["user_id"]
+            )
+        payload["top_users"] = top_users
+        payload["status"] = "partial" if incomplete else "available"
+    except (BotoCoreError, ClientError) as exc:
+        payload["status"] = "unavailable"
+        payload["error_code"] = (
+            exc.response.get("Error", {}).get("Code", "ClientError")
+            if isinstance(exc, ClientError)
+            else type(exc).__name__
+        )
+    return JSONResponse(payload)
+
+
 @app.get("/admin/audit")
 async def admin_audit(
     request: Request,
