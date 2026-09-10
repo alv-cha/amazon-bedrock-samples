@@ -1138,3 +1138,91 @@ def test_vended_session_via_workload_profile_bills_the_workload(
     )
     assert workload_usage is not None
     assert alice_usage is None
+
+
+def test_responses_api_profile_arn_is_priced_by_base_model(
+    fake_dynamodb, fake_sns, monkeypatch, capsys
+):
+    """The Responses API logs the resolved system inference-profile ARN as
+    modelId; the processor reduces it to the profile ID so cross-region
+    base-model pricing applies instead of the conservative fallback."""
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    monkeypatch.setenv(
+        "MODEL_PRICES_JSON",
+        json.dumps({
+            "openai.gpt-5.6-luna": {
+                "input_per_mtok": 5.0,
+                "output_per_mtok": 25.0,
+            }
+        }),
+    )
+    monkeypatch.setenv(
+        "MODEL_FALLBACK_PRICE_JSON",
+        '{"input_per_mtok":15,"output_per_mtok":75}',
+    )
+    _seed_user(fake_dynamodb, "alice", usd=1000)
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+
+    _run(
+        _subscription([
+            _record(
+                model=(
+                    "arn:aws:bedrock:us-east-1:111122223333:"
+                    "inference-profile/us.openai.gpt-5.6-luna"
+                ),
+                input_tokens=1_000_000,
+                output_tokens=1_000_000,
+            )
+        ]),
+        fake_dynamodb,
+        fake_sns,
+    )
+
+    row = fake_dynamodb.Table(os.environ["USAGE_TABLE"]).get_item(
+        Key={
+            "user_id": "alice",
+            "window": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        }
+    )["Item"]
+    # Base model price (5 + 25), not the 90 USD fallback.
+    assert row["cost_micro"] == 30 * processor.MICRO
+    emf = _emf_records(capsys)[0]
+    assert emf["PriceSource"] == "base-model"
+    assert emf["FallbackPricedRequests"] == 0
+
+
+def test_metadata_less_duplicate_record_is_not_metered(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    """Alongside the token-bearing record, the Responses API emits a second
+    record whose input/output metadata is empty. It must not inflate the
+    request count or create a ledger row."""
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    monkeypatch.setenv(
+        "MODEL_PRICES_JSON",
+        '{"openai.gpt-oss-20b":{"input_per_mtok":1,"output_per_mtok":2}}',
+    )
+    _seed_user(fake_dynamodb, "alice")
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+
+    empty = _record(request_id="responses-empty")
+    message = json.loads(empty["message"])
+    message["input"] = {}
+    message["output"] = {}
+    empty["message"] = json.dumps(message)
+
+    result = _run(
+        _subscription([empty, _record(request_id="responses-rich")]),
+        fake_dynamodb,
+        fake_sns,
+    )
+
+    assert result["processed"] == 1
+    row = fake_dynamodb.Table(os.environ["USAGE_TABLE"]).get_item(
+        Key={
+            "user_id": "alice",
+            "window": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        }
+    )["Item"]
+    assert row["requests"] == 1
+    assert row["input_tokens"] == 100

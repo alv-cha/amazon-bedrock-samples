@@ -52,13 +52,17 @@ Bedrock invocation logs -> CloudWatch Logs subscription -> usage processor
 
 The solution supports the Runtime APIs authorized by
 `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream`, including
-Converse, InvokeModel, token counting, and streaming where supported by the
-selected model. Runtime API/model compatibility remains model- and
-Region-specific.
+Converse, InvokeModel, the OpenAI-compatible Chat Completions and Responses
+APIs on the `bedrock-runtime` endpoint, token counting, and streaming where
+supported by the selected model. Runtime API/model compatibility remains
+model- and Region-specific.
 
 **Metering coverage caveat.** Model invocation logging — the metering
-source — captures only `InvokeModel`, `InvokeModelWithResponseStream`,
-`Converse`, and `ConverseStream`. Two Runtime APIs authorize under the same
+source — captures `InvokeModel`, `InvokeModelWithResponseStream`,
+`Converse`, and `ConverseStream`, plus the OpenAI-compatible APIs on the
+same endpoint (the Responses API logs the resolved inference-profile ARN
+and an extra metadata-less record; the usage processor normalizes the
+former and skips the latter). Two Runtime APIs authorize under the same
 IAM actions but are **not** logged: `StartAsyncInvoke` (async video/image
 generation) and `InvokeModelWithBidirectionalStream` (speech-to-speech).
 Vended credentials can call them, and that spend never reaches the ledger.

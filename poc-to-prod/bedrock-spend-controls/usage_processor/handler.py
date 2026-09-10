@@ -160,6 +160,17 @@ def _parse_invocation(
     output_data = record.get("output")
     input_data = input_data if isinstance(input_data, dict) else {}
     output_data = output_data if isinstance(output_data, dict) else {}
+    if not (
+        "inputTokenCount" in input_data
+        or "inputBodyTokenCount" in input_data
+        or "outputTokenCount" in output_data
+        or "outputBodyTokenCount" in output_data
+    ):
+        # The Responses API logs a second, metadata-less record for the
+        # same invocation alongside the token-bearing one. A record with
+        # no token metadata on either side has nothing to meter; skipping
+        # it also keeps request counts honest.
+        return None
     input_tokens = _non_negative_int(
         input_data.get(
             "inputTokenCount", input_data.get("inputBodyTokenCount", 0)
@@ -205,11 +216,27 @@ def _parse_invocation(
     return InvocationUsage(
         request_id=request_id,
         session_name=match.group("session"),
-        model_id=model_id,
+        model_id=_normalized_model_id(model_id),
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         occurred_at=_timestamp(record, log_event),
     )
+
+
+def _normalized_model_id(model_id: str) -> str:
+    """Reduce a Bedrock resource ARN in ``modelId`` to its trailing ID.
+
+    Converse and InvokeModel log whatever identifier the caller passed,
+    but the Responses API logs the resolved system inference-profile ARN
+    (``arn:...:inference-profile/us.openai....``). Application inference
+    profiles are attributed to workloads before this runs, so only system
+    profiles and foundation-model ARNs reach here; reducing them to the
+    trailing ID lets pricing and per-model reporting reuse the plain-ID
+    paths (including the cross-region ``us.``/``eu.`` base-model lookup).
+    """
+    if model_id.startswith("arn:") and "/" in model_id:
+        return model_id.rsplit("/", 1)[1]
+    return model_id
 
 
 def _prices() -> dict[str, tuple[float, float]]:
