@@ -1395,3 +1395,77 @@ def test_workloads_config_validation_errors():
                 ),
             }
         )
+
+
+def test_gateway_local_bundling_avoids_container_runtime(
+    tmp_path, monkeypatch
+):
+    """Host pip bundling replaces Docker/Finch; the image is only a fallback."""
+    source = tmp_path / "gateway"
+    (source / "app").mkdir(parents=True)
+    (source / "app" / "main.py").write_text("app = object()\n")
+    (source / "requirements.txt").write_text("fastapi\n")
+    (source / "run.sh").write_text("#!/bin/bash\n")
+    output = tmp_path / "asset-output"
+    output.mkdir()
+
+    commands = []
+
+    def fake_run(command, check):
+        assert check is True
+        commands.append(command)
+
+    monkeypatch.setattr(stack_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        stack_module.GatewayLocalBundling,
+        "_pip_launcher",
+        staticmethod(lambda: [stack_module.sys.executable, "-m", "pip"]),
+    )
+    bundler = stack_module.GatewayLocalBundling(str(source))
+
+    assert bundler.try_bundle(str(output), image=None) is True
+    # Pinned to the Lambda target, not the host: x86_64 manylinux wheels
+    # for CPython 3.12 into the asset output.
+    (pip_command,) = commands
+    assert pip_command[:4] == [
+        stack_module.sys.executable, "-m", "pip", "install"
+    ]
+    for flag in (
+        "manylinux2014_x86_64", "3.12", "--only-binary=:all:", str(output)
+    ):
+        assert flag in pip_command
+    assert (output / "app" / "main.py").read_text() == "app = object()\n"
+    assert os.access(output / "run.sh", os.X_OK)
+
+
+def test_gateway_local_bundling_falls_back_when_host_pip_fails(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "gateway"
+    source.mkdir()
+
+    def failing_run(command, check):
+        raise stack_module.subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(stack_module.subprocess, "run", failing_run)
+    monkeypatch.setattr(
+        stack_module.GatewayLocalBundling,
+        "_pip_launcher",
+        staticmethod(lambda: ["pip3"]),
+    )
+    bundler = stack_module.GatewayLocalBundling(str(source))
+
+    assert bundler.try_bundle(str(tmp_path / "out"), image=None) is False
+
+
+def test_gateway_local_bundling_falls_back_without_any_host_pip(
+    tmp_path, monkeypatch
+):
+    """pip-less hosts (for example bare uv venvs) defer to the container."""
+    monkeypatch.setattr(
+        stack_module.importlib.util, "find_spec", lambda name: None
+    )
+    monkeypatch.setattr(stack_module.shutil, "which", lambda name: None)
+    bundler = stack_module.GatewayLocalBundling(str(tmp_path))
+
+    assert bundler.try_bundle(str(tmp_path / "out"), image=None) is False

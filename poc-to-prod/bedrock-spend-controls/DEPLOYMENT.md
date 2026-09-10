@@ -574,8 +574,10 @@ blocked identity is never automatically reactivated.
 
 - AWS CLI and an authorized profile.
 - Node.js and npm.
-- Python 3.12 or later.
-- Finch. Docker is not required.
+- Python 3.12 or later, with `pip` available (interpreter module or PATH).
+- No container runtime is required: the broker bundles on the host with
+  pinned manylinux wheels. Docker or Finch is used only as an automatic
+  fallback if host pip bundling fails (set `CDK_DOCKER=finch` for Finch).
 - Bedrock model access in the selected Region.
 
 ```bash
@@ -584,13 +586,10 @@ cd poc-to-prod/bedrock-spend-controls
 export AWS_PROFILE=your-profile
 export AWS_REGION=us-east-1
 export AWS_DEFAULT_REGION=$AWS_REGION
-export CDK_DOCKER=finch
 export ALERT_EMAIL=you@example.com
 
 aws sso login --profile "$AWS_PROFILE"   # omit for non-SSO credentials
 aws sts get-caller-identity
-finch vm start
-finch info
 ```
 
 ### 2. Build dependencies
@@ -887,12 +886,10 @@ cd poc-to-prod/bedrock-spend-controls
 export AWS_PROFILE=your-production-profile
 export AWS_REGION=us-east-1
 export AWS_DEFAULT_REGION=$AWS_REGION
-export CDK_DOCKER=finch
 export DEPLOYMENT_CONFIG=config/production.local.json
 
 aws sso login --profile "$AWS_PROFILE"
 aws sts get-caller-identity
-finch vm start
 
 cd cdk
 python3 -m venv .venv

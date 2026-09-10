@@ -364,10 +364,8 @@ npm ci
 export AWS_PROFILE=your-profile
 export AWS_REGION=us-east-1
 export AWS_DEFAULT_REGION=$AWS_REGION
-export CDK_DOCKER=finch
 
 aws sso login --profile "$AWS_PROFILE"       # only for SSO profiles
-finch vm start
 npx cdk bootstrap
 npx cdk synth -c deployment_config=config/demo.json
 npx cdk deploy -c deployment_config=config/demo.json

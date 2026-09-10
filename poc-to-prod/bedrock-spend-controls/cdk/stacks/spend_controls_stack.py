@@ -13,10 +13,15 @@ Resources:
 """
 
 import hashlib
+import importlib.util
 import json
 import os
+import shutil
+import subprocess
+import sys
 
 import aws_cdk as cdk
+import jsii
 from aws_cdk import (
     Duration,
     RemovalPolicy,
@@ -62,6 +67,75 @@ WORKLOAD_TAG_KEY = "bedrock-spend-controls-workload"
 _CR_PROFILE_PREFIXES = {
     "us", "eu", "apac", "jp", "au", "ca", "sa", "global", "us-gov",
 }
+
+
+@jsii.implements(cdk.ILocalBundling)
+class GatewayLocalBundling:
+    """Bundle the broker on the host so no container runtime is required.
+
+    CDK tries this first and only falls back to the Docker/Finch image when
+    it returns False. The pip flags force x86_64 manylinux wheels for the
+    Lambda's Python 3.12 runtime regardless of the host OS, architecture,
+    or interpreter version, so host bundling and container bundling produce
+    equivalent assets.
+    """
+
+    def __init__(self, source_dir: str):
+        self._source_dir = source_dir
+
+    @staticmethod
+    def _pip_launcher() -> list[str] | None:
+        """Locate a host pip: this interpreter's module, then the PATH.
+
+        The --platform/--python-version pins below make the produced wheels
+        independent of whichever host interpreter runs pip (including
+        pip-less uv/venv setups where only a PATH pip3 exists).
+        """
+        if importlib.util.find_spec("pip") is not None:
+            return [sys.executable, "-m", "pip"]
+        for name in ("pip3", "pip"):
+            executable = shutil.which(name)
+            if executable:
+                return [executable]
+        return None
+
+    def try_bundle(self, output_dir: str, *, image, **_kwargs) -> bool:
+        del image  # The container image is only the fallback path.
+        launcher = self._pip_launcher()
+        if launcher is None:
+            print(
+                "No host pip found; falling back to container bundling.",
+                file=sys.stderr,
+            )
+            return False
+        command = [
+            *launcher, "install",
+            "-r", os.path.join(self._source_dir, "requirements.txt"),
+            "--platform", "manylinux2014_x86_64",
+            "--implementation", "cp",
+            "--python-version", "3.12",
+            "--only-binary=:all:",
+            "--target", output_dir,
+            "--quiet", "--disable-pip-version-check",
+        ]
+        try:
+            subprocess.run(command, check=True)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            print(
+                "Host bundling of the gateway failed "
+                f"({exc}); falling back to container bundling.",
+                file=sys.stderr,
+            )
+            return False
+        shutil.copytree(
+            os.path.join(self._source_dir, "app"),
+            os.path.join(output_dir, "app"),
+            dirs_exist_ok=True,
+        )
+        run_sh = os.path.join(output_dir, "run.sh")
+        shutil.copy2(os.path.join(self._source_dir, "run.sh"), run_sh)
+        os.chmod(run_sh, 0o755)
+        return True
 
 
 def _model_source_arn(
@@ -527,6 +601,12 @@ class SpendControlsStack(Stack):
             code=lambda_.Code.from_asset(
                 "../gateway",
                 bundling=cdk.BundlingOptions(
+                    # Host-first bundling: no Docker/Finch needed when the
+                    # local pip can resolve the pinned manylinux wheels. The
+                    # container image below is only the automatic fallback.
+                    local=GatewayLocalBundling(
+                        os.path.join(PROJECT_DIR, "gateway")
+                    ),
                     image=lambda_.Runtime.PYTHON_3_12.bundling_image,
                     command=[
                         "bash", "-c",
