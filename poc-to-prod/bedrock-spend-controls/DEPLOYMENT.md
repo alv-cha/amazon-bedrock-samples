@@ -11,7 +11,7 @@ sample.
 | IdP | Stack-created Cognito | Existing OIDC IdP |
 | Enforcement | Layered (lease + revocation + emergency, always on); 300 s default lease | Same layers; pick the default lease window and tune the runtime dial per incident |
 | Credential lifetime | 900-second STS; optional 60/300/900-second permission lease | 900–3600-second STS; no role-chained session above one hour |
-| Runtime models | `*` for exploration | Explicit model and inference-profile ARNs |
+| Runtime models | `*` for exploration | Explicit model and inference-profile ARNs; exclude models used via unmetered APIs (async invoke, bidirectional streaming) |
 | Invocation logging | Stack managed | Reuse centrally managed logging |
 | Log subscription | Dedicated demo group | Confirm subscription-filter capacity and ownership |
 | Auto-provisioning | Enabled | Usually disabled |
@@ -78,7 +78,7 @@ Direct `-c key=value` values override the file.
 | `vend_rate_limit_per_minute` | `6` | Positive per-user attempts, including retries |
 | `revocation_policy_shards` | `19` | Immutable layout; plus emergency policy = 20 role attachments |
 | `revocation_reconcile_minutes` | `5` | Positive periodic repair interval for the revocation layer |
-| `allowed_model_arns` | `["*"]` | Non-empty Bedrock resource ARN list or `*` |
+| `allowed_model_arns` | `["*"]` | Non-empty Bedrock resource ARN list or `*`; see the metering coverage caveat in the README |
 | `invoker_principal_arns` | `[]` | IAM principals allowed to invoke the Function URL |
 | `manage_invocation_logging` | none | Explicit `true` or `false` required |
 | `invocation_log_group_name` | empty | Required when logging is externally managed |

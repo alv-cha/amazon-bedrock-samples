@@ -56,6 +56,16 @@ Converse, InvokeModel, token counting, and streaming where supported by the
 selected model. Runtime API/model compatibility remains model- and
 Region-specific.
 
+**Metering coverage caveat.** Model invocation logging — the metering
+source — captures only `InvokeModel`, `InvokeModelWithResponseStream`,
+`Converse`, and `ConverseStream`. Two Runtime APIs authorize under the same
+IAM actions but are **not** logged: `StartAsyncInvoke` (async video/image
+generation) and `InvokeModelWithBidirectionalStream` (speech-to-speech).
+Vended credentials can call them, and that spend never reaches the ledger.
+If strict accounting matters, do not include models that are used through
+those APIs (for example, video-generation or speech-to-speech models) in
+`allowed_model_arns`.
+
 ## Enforcement guarantee
 
 This remains **bounded-overspend enforcement**, not a synchronous hard cap.
