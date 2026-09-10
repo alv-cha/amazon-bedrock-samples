@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from spikes.lease_revocation_probe import (
+from qualification.lease_revocation_probe import (
     BEDROCK_ACTIONS,
     ProbeConfig,
     ProbeResult,

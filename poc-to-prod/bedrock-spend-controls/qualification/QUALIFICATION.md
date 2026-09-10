@@ -38,7 +38,7 @@ production role.
 
 ## Required live measurements
 
-Run `spikes/lease_revocation_probe.py` against the sandbox role, attach its
+Run `qualification/lease_revocation_probe.py` against the sandbox role, attach its
 JSON output, and fill in:
 
 | Check | Samples | p50 | p95 | Maximum | Pass criterion | Result |

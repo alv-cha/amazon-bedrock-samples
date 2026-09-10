@@ -118,8 +118,8 @@ SigV4-signed with temporary Identity Pool credentials and carry the current ID
 token in `X-Quota-User-Token`; trusted programmatic clients may use the shared
 routine key. The demo browser authenticates with Cognito managed login using an
 authorization-code + PKCE flow. Its secretless app client still enables
-`USER_SRP_AUTH` and `USER_PASSWORD_AUTH` for the notebook/CLI and keeps the
-same client ID as the gateway JWT audience.
+`USER_SRP_AUTH` and `USER_PASSWORD_AUTH` for programmatic CLI clients and
+keeps the same client ID as the gateway JWT audience.
 
 Routine create is conditional. `POST /admin/users` returns `409
 user_already_exists`, the current user, and its ETag rather than overwriting an
@@ -217,7 +217,7 @@ instead of failing, and the UI explains the gap.
 
 Qualification shown in the panel is reviewed deployment metadata, not
 inferred from alarm health. Lease, revocation, and emergency live
-qualification remain pending until recorded in `spikes/QUALIFICATION.md`.
+qualification remain pending until recorded in `qualification/QUALIFICATION.md`.
 
 ### Runtime enforcement dial
 
@@ -261,7 +261,7 @@ limits, load testing, and actual account quota measurements.
 The guarded probe is dry-run by default:
 
 ```bash
-cdk/.venv/bin/python spikes/lease_revocation_probe.py \
+cdk/.venv/bin/python qualification/lease_revocation_probe.py \
   --profile YOUR_SANDBOX_PROFILE \
   --role-arn arn:aws:iam::111122223333:role/YOUR_DEDICATED_SANDBOX_ROLE \
   --managed-policy-arn arn:aws:iam::111122223333:policy/YOUR_PREATTACHED_SANDBOX_DENY \
@@ -271,7 +271,7 @@ cdk/.venv/bin/python spikes/lease_revocation_probe.py \
 
 Live mode temporarily versions IAM policy and invokes Bedrock. Run it only
 after reviewing the printed account/role and explicitly approving those exact
-non-production resources. Record results in `spikes/QUALIFICATION.md`.
+non-production resources. Record results in `qualification/QUALIFICATION.md`.
 
 The current broker's caller is a Lambda execution-role session, so
 `AssumeRole` is role chaining and cannot exceed 3,600 seconds. Eight-hour
@@ -721,21 +721,40 @@ activate/recover cycle with the break-glass key.
 
 ### 7. Runtime smoke test
 
-Obtain a JWT for the Cognito test user or use the notebook, then:
+Obtain a JWT for a quota user from your IdP (for the demo Cognito pool, an
+`InitiateAuth` call with `USER_PASSWORD_AUTH` against the deployed app client
+returns an ID token), then run the integration path an application would use:
+the lazy credential provider from `examples/refreshable_bedrock.py` vends
+short-lived credentials from the broker and hands them to an ordinary boto3
+Bedrock Runtime client.
 
 ```bash
 export GATEWAY_URL="$BROKER_API_URL"
-export USER_JWT='your-test-user-jwt'
-export USER_ID='value-of-the-configured-jwt-claim'
+export USER_JWT='your-quota-user-jwt'
 
-cdk/.venv/bin/python examples/demo_native_calls.py \
-  --model openai.gpt-oss-20b-1:0 \
-  --api converse \
-  --prompt "Reply with exactly: runtime quota demo"
+cdk/.venv/bin/python - <<'PY'
+import os, sys
+sys.path.insert(0, "examples")
+from refreshable_bedrock import QuotaBrokerCredentialProvider
+
+provider = QuotaBrokerCredentialProvider(
+    os.environ["GATEWAY_URL"], os.environ["USER_JWT"],
+    region=os.environ.get("AWS_REGION", "us-east-1"),
+)
+runtime = provider.bedrock_client()
+response = runtime.converse(
+    modelId="openai.gpt-oss-20b-1:0",
+    messages=[{"role": "user", "content": [{"text": "Reply with exactly: runtime quota smoke"}]}],
+)
+print(response["output"]["message"]["content"][0]["text"])
+print("usage:", response["usage"])
+PY
 ```
 
-The inference goes directly to `bedrock-runtime`. Allow invocation-log
-delivery time before checking usage:
+The vend happens on the first signed request; the inference itself goes
+directly to `bedrock-runtime`. A blocked or over-budget user fails here with a
+`BrokerCredentialError` instead of reaching Bedrock. Allow invocation-log
+delivery time (typically one to two minutes) before checking usage:
 
 ```bash
 cdk/.venv/bin/python examples/sigv4_gateway.py \
@@ -746,31 +765,15 @@ cdk/.venv/bin/python examples/sigv4_gateway.py \
   get-usage "$USER_ID" --period weekly
 ```
 
-For the complete enforcement smoke test, run
-[`notebook/spend_controls_demo.ipynb`](notebook/spend_controls_demo.ipynb).
-The notebook intentionally uses `USER_PASSWORD_AUTH` with the same secretless
-app client/audience used by managed login. It reads exact quota users through
-`GET /admin/user?user_id=...`, so reruns load an existing user and only POST on
-an explicit 404. Limit/status writes and usage reads use the canonical singular
-query routes with raw identities supplied through request parameters. Every
-routine write uses UUID idempotency, and each PUT refreshes ETag/version before
-sending `If-Match`. Its baseline, low-quota, recovery, and controlled stress
-limit writes include explicit audit reasons.
+`USER_ID` is the value of the configured JWT identity claim (`sub` by
+default). The ledger row should show one request with the same input/output
+token counts the `Converse` response reported.
 
-Its main path:
-
-1. Reads the identity's current daily aggregate.
-2. Sets each token limit to current usage plus one token.
-3. Vends an STS session and invokes GPT OSS 20B with `Converse`.
-4. Displays the actual `Converse` response `usage`.
-5. Polls until invocation logging updates DynamoDB.
-6. Proves that a new credential request is rejected.
-7. Raises all limits through the admin API and proves vending recovers.
-8. Locates the matching request ID in the per-user CloudWatch EMF event.
-
-The notebook does not depend on `CountTokens`; support varies by model and it
-does not participate in enforcement. A separate optional diagnostic cell is
-disabled by default and reports a skip for unsupported models.
+To smoke-test enforcement end to end: set the user's daily token limits to
+the current usage plus one token (`update-user`), repeat the call above and
+confirm the credential request is rejected, then raise the limits and confirm
+vending recovers. Each step is visible in the Admin UI audit log and in the
+per-user CloudWatch EMF events.
 
 ## Production/shared account
 
@@ -1002,7 +1005,8 @@ Verify all of the following:
 14. Unknown models use the configured conservative fallback.
 15. Destroy testing confirms production tables are retained.
 16. Managed login completes authorization-code + PKCE while the same app
-    client still issues the notebook's `USER_PASSWORD_AUTH` token/audience.
+    client still issues `USER_PASSWORD_AUTH` tokens for programmatic clients
+    with the gateway JWT audience.
 17. Duplicate create preserves the existing user; stale `If-Match` and changed
     idempotency reuse return distinct `409` errors; an exact replay is stable.
 18. Successful routine writes return the complete canonical user/new ETag and

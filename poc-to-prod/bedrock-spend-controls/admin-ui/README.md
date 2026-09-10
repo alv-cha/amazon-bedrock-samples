@@ -68,7 +68,7 @@ deployment it:
    state when signing out.
 
 The User Pool client remains secretless and continues to allow
-`USER_SRP_AUTH` and `USER_PASSWORD_AUTH` for the notebook/CLI flows. The same
+`USER_SRP_AUTH` and `USER_PASSWORD_AUTH` for programmatic CLI clients. The same
 client ID remains the gateway JWT audience.
 
 First-party exact-user requests use the canonical query-route family:

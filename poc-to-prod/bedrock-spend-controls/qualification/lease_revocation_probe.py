@@ -7,7 +7,7 @@ permissions. It never creates or deletes the target role.
 
 Example dry run:
 
-    python spikes/lease_revocation_probe.py \
+    python qualification/lease_revocation_probe.py \
       --role-arn arn:aws:iam::111122223333:role/quota-sandbox-role \
       --model-id anthropic.claude-3-haiku-20240307-v1:0
 

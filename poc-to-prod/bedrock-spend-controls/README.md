@@ -143,8 +143,8 @@ credentials. It remains an `AWS_IAM`/SigV4 client; the browser never receives
 the shared routine admin secret. The break-glass key is entered by an operator
 only when confirming an emergency action, is sent with that one request, and
 is never persisted by the console. The same secretless User Pool client and
-JWT audience retain `USER_SRP_AUTH` and `USER_PASSWORD_AUTH` for the
-notebook/CLI programmatic flows.
+JWT audience retain `USER_SRP_AUTH` and `USER_PASSWORD_AUTH` for
+programmatic CLI clients.
 
 The Users view uses 25-row server pagination and server-side search/status
 filters. It includes a conditional-create wizard, reasoned block/unblock,
@@ -392,14 +392,6 @@ Use [DEPLOYMENT.md](DEPLOYMENT.md) for the complete demo and production
 workflows, logging ownership, IdP configuration, UI setup, IAM/SCP decision,
 smoke tests, and cleanup.
 
-Use [DEMO.md](DEMO.md) as the presentation runbook and
-[`notebook/spend_controls_demo.ipynb`](notebook/spend_controls_demo.ipynb) for
-the executable capability walkthrough. The notebook uses GPT OSS 20B
-`Converse`, displays actual response usage, waits for invocation-log metering,
-proves automatic quota rejection, raises the limits, and proves credential
-vending recovers. `CountTokens` is only an optional model-dependent
-diagnostic; it is not part of enforcement.
-
 ## Administrative client
 
 The SigV4 client manages every period/dimension limit. Routine writes generate a UUID
@@ -425,10 +417,10 @@ python examples/sigv4_gateway.py \
   --weekly-output-tokens 1000000
 ```
 
-The notebook uses the same safe routine-write flow and performs an exact GET
-before deciding whether to create, so rerunning it does not rely on duplicate
-POST upsert behavior. Status changes and the baseline, low-quota, recovery,
-and controlled stress limit writes carry explicit reasons. Limit reasons are
+Scripted clients should follow the same safe routine-write flow: perform an
+exact GET before deciding whether to create, so reruns do not rely on
+duplicate POST upsert behavior, and carry explicit reasons on status and
+limit writes. Limit reasons are
 optional for compatible API and CLI clients; omitted or blank values use the
 standardized legacy audit fallback.
 
@@ -474,10 +466,9 @@ decision.
 | `revocation_processor/` | Optional sharded per-user IAM deny reconciler |
 | `emergency_processor/` | Operator-controlled shared-role deny controller |
 | `admin-ui/` | Static React administration console |
-| `examples/` | SigV4 admin, lazy credential provider, and Runtime examples |
-| `spikes/` | Guarded non-production qualification probes and results |
-| `notebook/` | Complete deployed capability walkthrough |
-| `tests/` | Unit, API, infrastructure, notebook, and pricing tests |
+| `examples/` | SigV4 admin client and lazy credential provider for application code |
+| `qualification/` | Guarded probes to measure enforcement latency in your own account before trusting an overspend bound |
+| `tests/` | Unit, API, infrastructure, qualification-probe, and pricing tests |
 
 ## Verification and security scanning
 

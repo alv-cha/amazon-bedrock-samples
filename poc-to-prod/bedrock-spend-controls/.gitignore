@@ -10,3 +10,9 @@ notebook/capstone_*
 
 # Internal architecture decision records (kept locally, not part of the sample)
 ADR-*.md
+
+# Presentation material and internal demo tooling (kept locally, not part of the sample)
+DEMO.md
+notebook/
+examples/demo_native_calls.py
+tests/test_notebook.py

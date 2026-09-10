@@ -426,7 +426,7 @@ class SpendControlsStack(Stack):
                     f"{domain_suffix}"
                 )
 
-            # Preserve this scope and construct ID: the notebook, broker JWT
+            # Preserve this scope and construct ID: CLI clients, the broker JWT
             # audience, Identity Pool, and browser all reuse this public client.
             user_pool_client = user_pool.add_client(
                 "DemoAppClient",
@@ -2024,7 +2024,7 @@ class SpendControlsStack(Stack):
             value=fn_url.url,
             description="AWS_IAM Function URL for credential vending and administration",
         )
-        # Backwards-compatible output name for existing scripts and notebooks.
+        # Backwards-compatible output name for existing scripts.
         cdk.CfnOutput(
             self,
             "GatewayUrl",
@@ -2081,4 +2081,4 @@ class SpendControlsStack(Stack):
             cdk.CfnOutput(self, "DemoUserPoolId", value=user_pool.user_pool_id)
             cdk.CfnOutput(self, "DemoUserPoolClientId",
                           value=user_pool_client.user_pool_client_id,
-                          description="App client for the demo notebook to obtain JWTs")
+                          description="Secretless app client that programmatic clients use to obtain JWTs")
