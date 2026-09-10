@@ -35,6 +35,10 @@ function response(body: BodyInit | null, status = 200, headers: Record<string, s
   return new Response(body, { status, headers });
 }
 
+function jsonResponse(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
+  return response(JSON.stringify(body), status, { "Content-Type": "application/json", ...headers });
+}
+
 const limits: QuotaLimits = {
   daily: { usd: 10, input_tokens: 100, output_tokens: 50 },
   weekly: null,
@@ -84,16 +88,13 @@ describe("transport", () => {
   });
 
   it("preserves structured error status, code, details, and request ID", async () => {
-    const fetch = vi.fn().mockResolvedValue(response(JSON.stringify({
+    const fetch = vi.fn().mockResolvedValue(jsonResponse({
       error: {
         type: "version_conflict",
         message: "Changed",
         details: { current_user: { ...user, version: 8 } },
       },
-    }), 409, {
-      "Content-Type": "application/json",
-      "X-Request-Id": "conflict-request",
-    }));
+    }, 409, { "X-Request-Id": "conflict-request" }));
 
     const caught = await transport(cfg, sessionWith(fetch), "PUT", "/conflict").catch((error) => error);
 
@@ -117,9 +118,9 @@ describe("transport", () => {
       .rejects.toMatchObject({ status: 0, code: "network_error", message: "Failed to fetch" });
   });
   it("triggers managed reauthentication on a 401 response", async () => {
-    const fetch = vi.fn().mockResolvedValue(response(JSON.stringify({
+    const fetch = vi.fn().mockResolvedValue(jsonResponse({
       error: { type: "unauthorized", message: "Expired" },
-    }), 401, { "Content-Type": "application/json" }));
+    }, 401));
     const session = sessionWith(fetch);
 
     await expect(transport(cfg, session, "GET", "/expired"))
@@ -136,21 +137,21 @@ describe("endpoint response validation", () => {
     await expect(api.summary(cfg, sessionWith(emptyFetch)))
       .rejects.toMatchObject({ status: 200, code: "invalid_response" });
 
-    const invalidMutationFetch = vi.fn().mockResolvedValue(response(JSON.stringify({
+    const invalidMutationFetch = vi.fn().mockResolvedValue(jsonResponse({
       user_id: user.user_id,
       status: "blocked",
       reason: "policy request",
-    }), 200, { "Content-Type": "application/json", "X-Request-Id": "invalid-body" }));
+    }, 200, { "X-Request-Id": "invalid-body" }));
     await expect(api.setStatus(cfg, sessionWith(invalidMutationFetch), user, "blocked", "policy request"))
       .rejects.toMatchObject({ status: 200, code: "invalid_response", requestId: "invalid-body" });
 
     const wrongIdentity = { ...user, user_id: "tenant/bob", status: "blocked" as const, status_reason: "policy request", version: 8 };
-    const mismatchedFetch = vi.fn().mockResolvedValue(response(JSON.stringify({
+    const mismatchedFetch = vi.fn().mockResolvedValue(jsonResponse({
       user_id: "tenant/bob",
       status: "blocked",
       reason: "policy request",
       user: wrongIdentity,
-    }), 200, { "Content-Type": "application/json" }));
+    }, 200));
     await expect(api.setStatus(cfg, sessionWith(mismatchedFetch), user, "blocked", "policy request"))
       .rejects.toMatchObject({ status: 200, code: "invalid_response" });
   });
@@ -162,12 +163,12 @@ describe("mutation requests", () => {
       "00000000-0000-4000-8000-000000000001",
     );
     const canonical = { ...user, version: 8, status: "blocked" as const, status_reason: "policy request" };
-    const fetch = vi.fn().mockResolvedValue(response(JSON.stringify({
+    const fetch = vi.fn().mockResolvedValue(jsonResponse({
       user_id: user.user_id,
       status: "blocked",
       reason: "policy request",
       user: canonical,
-    }), 200, { "Content-Type": "application/json" }));
+    }, 200));
 
     await api.setStatus(cfg, sessionWith(fetch), user, "blocked", "  policy request  ");
 
@@ -194,27 +195,27 @@ describe("mutation requests", () => {
       monthly: null,
     };
     const fetch = vi.fn()
-      .mockResolvedValueOnce(response(JSON.stringify({ user: canonical, current_usage: currentUsage }), 200, { "Content-Type": "application/json", ETag: '"7"' }))
-      .mockResolvedValueOnce(response(JSON.stringify({
+      .mockResolvedValueOnce(jsonResponse({ user: canonical, current_usage: currentUsage }, 200, { ETag: '"7"' }))
+      .mockResolvedValueOnce(jsonResponse({
         user_id: routeUser.user_id,
         period: "daily",
         start: "2026-09-01",
         end: "2026-09-02",
         usage: [],
         next_cursor: null,
-      }), 200, { "Content-Type": "application/json" }))
-      .mockResolvedValueOnce(response(JSON.stringify({
+      }, 200))
+      .mockResolvedValueOnce(jsonResponse({
         user_id: routeUser.user_id,
         events: [],
         next_cursor: null,
-      }), 200, { "Content-Type": "application/json" }))
-      .mockResolvedValueOnce(response(JSON.stringify({
+      }, 200))
+      .mockResolvedValueOnce(jsonResponse({
         user_id: routeUser.user_id,
         updated: true,
         limits: updatedLimits,
         user: { ...canonical, limits: updatedLimits, version: 8 },
-      }), 200, { "Content-Type": "application/json", ETag: '"8"' }))
-      .mockResolvedValueOnce(response(JSON.stringify({
+      }, 200, { ETag: '"8"' }))
+      .mockResolvedValueOnce(jsonResponse({
         user_id: routeUser.user_id,
         status: "blocked",
         reason: "policy request",
@@ -224,7 +225,7 @@ describe("mutation requests", () => {
           status_reason: "policy request",
           version: 8,
         },
-      }), 200, { "Content-Type": "application/json", ETag: '"8"' }));
+      }, 200, { ETag: '"8"' }));
     const clientSession = sessionWith(fetch);
 
     await api.getUser(cfg, clientSession, routeUser.user_id);
@@ -269,14 +270,14 @@ describe("mutation requests", () => {
   });
 
   it("changes the runtime lease dial without redeploying", async () => {
-    const fetch = vi.fn().mockResolvedValue(response(JSON.stringify({
+    const fetch = vi.fn().mockResolvedValue(jsonResponse({
       permission_lease_seconds: 60,
       source: "runtime",
       generation: 3,
       actor: "admin@example.test",
       reason: "incident response",
       updated_at: "2026-09-09T10:00:00Z",
-    }), 200, { "Content-Type": "application/json" }));
+    }, 200));
 
     await api.setEnforcement(
       cfg,
@@ -300,14 +301,14 @@ describe("mutation requests", () => {
   });
 
   it("sends the break-glass key only in the emergency request header", async () => {
-    const fetch = vi.fn().mockResolvedValue(response(JSON.stringify({
+    const fetch = vi.fn().mockResolvedValue(jsonResponse({
       state: "activating",
       desired_active: true,
       generation: 1,
       requested_at: "2026-09-09T10:00:00Z",
       idempotent: false,
       retry: false,
-    }), 202, { "Content-Type": "application/json" }));
+    }, 202));
 
     await api.setEmergencyStop(cfg, sessionWith(fetch), {
       action: "activate",
@@ -337,8 +338,8 @@ describe("mutation requests", () => {
 describe("paginated operational endpoints", () => {
   it("loads exactly one 25-user page and passes opaque cursor, status, and query server-side", async () => {
     const fetch = vi.fn()
-      .mockResolvedValueOnce(response(JSON.stringify({ users: [user], next_cursor: "opaque {cursor}" }), 200, { "Content-Type": "application/json" }))
-      .mockResolvedValueOnce(response(JSON.stringify({ users: [], next_cursor: null }), 200, { "Content-Type": "application/json" }));
+      .mockResolvedValueOnce(jsonResponse({ users: [user], next_cursor: "opaque {cursor}" }, 200))
+      .mockResolvedValueOnce(jsonResponse({ users: [], next_cursor: null }, 200));
     const session = sessionWith(fetch);
 
     const first = await api.listUsersPage(cfg, session);
@@ -361,12 +362,12 @@ describe("paginated operational endpoints", () => {
   it("creates with a UUID idempotency key and rejects a mismatched canonical identity", async () => {
     vi.spyOn(globalThis.crypto, "randomUUID").mockReturnValue("00000000-0000-4000-8000-000000000002");
     const { today: _today, current_usage: _currentUsage, ...canonical } = user;
-    const fetch = vi.fn().mockResolvedValue(response(JSON.stringify({
+    const fetch = vi.fn().mockResolvedValue(jsonResponse({
       user_id: user.user_id,
       provisioned: true,
       limits: canonical.limits,
       user: { ...canonical, version: 1 },
-    }), 200, { "Content-Type": "application/json", ETag: '"1"' }));
+    }, 200, { ETag: '"1"' }));
 
     const result = await api.createUser(cfg, sessionWith(fetch), {
       user_id: `  ${user.user_id}  `,
@@ -379,12 +380,12 @@ describe("paginated operational endpoints", () => {
     expect(init.headers).toMatchObject({ "Idempotency-Key": "00000000-0000-4000-8000-000000000002" });
     expect(JSON.parse(String(init.body))).toMatchObject({ user_id: user.user_id, name: "Alice" });
 
-    const mismatched = vi.fn().mockResolvedValue(response(JSON.stringify({
+    const mismatched = vi.fn().mockResolvedValue(jsonResponse({
       user_id: user.user_id,
       provisioned: true,
       limits: canonical.limits,
       user: { ...canonical, user_id: "tenant/bob", version: 1 },
-    }), 200, { "Content-Type": "application/json" }));
+    }, 200));
     await expect(api.createUser(cfg, sessionWith(mismatched), {
       user_id: user.user_id,
       name: "Alice",
@@ -394,18 +395,18 @@ describe("paginated operational endpoints", () => {
 
   it("validates detail and usage response identity consistency", async () => {
     const { today: _today, current_usage: _currentUsage, ...canonical } = user;
-    const detailFetch = vi.fn().mockResolvedValue(response(JSON.stringify({ user: canonical, current_usage: currentUsage }), 200, { "Content-Type": "application/json" }));
+    const detailFetch = vi.fn().mockResolvedValue(jsonResponse({ user: canonical, current_usage: currentUsage }, 200));
     await expect(api.getUser(cfg, sessionWith(detailFetch), "tenant/bob"))
       .rejects.toMatchObject({ code: "invalid_response" });
 
-    const usageFetch = vi.fn().mockResolvedValue(response(JSON.stringify({
+    const usageFetch = vi.fn().mockResolvedValue(jsonResponse({
       user_id: user.user_id,
       period: "daily",
       start: "2026-08-04",
       end: "2026-09-02",
       usage: [{ user_id: "tenant/bob", period: "daily", window: "2026-09-02", window_start: "2026-09-02T00:00:00+00:00", window_end: "2026-09-03T00:00:00+00:00", resets_at: "2026-09-03T00:00:00+00:00", cost_usd: 1, input_tokens: 2, output_tokens: 3, requests: 4 }],
       next_cursor: null,
-    }), 200, { "Content-Type": "application/json" }));
+    }, 200));
     await expect(api.usageHistory(cfg, sessionWith(usageFetch), user.user_id, {
       start: "2026-08-04",
       end: "2026-09-02",
@@ -436,10 +437,10 @@ describe("paginated operational endpoints", () => {
       before: null,
       after: snapshot,
     };
-    const globalFetch = vi.fn().mockResolvedValue(response(JSON.stringify({ events: [event], next_cursor: "next" }), 200, { "Content-Type": "application/json" }));
+    const globalFetch = vi.fn().mockResolvedValue(jsonResponse({ events: [event], next_cursor: "next" }, 200));
     await expect(api.listAuditPage(cfg, sessionWith(globalFetch))).resolves.toEqual({ events: [event], next_cursor: "next" });
 
-    const wrongUserFetch = vi.fn().mockResolvedValue(response(JSON.stringify({ user_id: "tenant/bob", events: [event], next_cursor: null }), 200, { "Content-Type": "application/json" }));
+    const wrongUserFetch = vi.fn().mockResolvedValue(jsonResponse({ user_id: "tenant/bob", events: [event], next_cursor: null }, 200));
     await expect(api.listUserAuditPage(cfg, sessionWith(wrongUserFetch), user.user_id))
       .rejects.toMatchObject({ code: "invalid_response" });
   });
@@ -455,12 +456,12 @@ describe("USD normalization", () => {
       monthly: { usd: 0.345679, input_tokens: 300, output_tokens: 150 },
     };
     const created = { ...base, version: 1, limits: normalizedLimits };
-    const createFetch = vi.fn().mockResolvedValue(response(JSON.stringify({
+    const createFetch = vi.fn().mockResolvedValue(jsonResponse({
       user_id: base.user_id,
       provisioned: true,
       limits: normalizedLimits,
       user: created,
-    }), 200, { "Content-Type": "application/json" }));
+    }, 200));
 
     await expect(api.createUser(cfg, sessionWith(createFetch), {
       user_id: base.user_id,
@@ -477,12 +478,12 @@ describe("USD normalization", () => {
     expect(createBody.limits.monthly.usd).toBe(0.345679);
 
     const updated = { ...base, version: base.version + 1, limits: normalizedLimits };
-    const limitsFetch = vi.fn().mockImplementation(() => Promise.resolve(response(JSON.stringify({
+    const limitsFetch = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse({
       user_id: base.user_id,
       updated: true,
       limits: normalizedLimits,
       user: updated,
-    }), 200, { "Content-Type": "application/json" })));
+    }, 200)));
     await expect(api.setLimits(cfg, sessionWith(limitsFetch), base, {
       limits: {
         daily: { ...base.limits.daily!, usd: 0.1234567 },

@@ -1365,8 +1365,9 @@ def test_gateway_local_bundling_avoids_container_runtime(
 
     commands = []
 
-    def fake_run(command, check):
+    def fake_run(command, check, shell):
         assert check is True
+        assert shell is False  # argv list, never a shell string
         commands.append(command)
 
     monkeypatch.setattr(stack_module.subprocess, "run", fake_run)
@@ -1398,7 +1399,7 @@ def test_gateway_local_bundling_falls_back_when_host_pip_fails(
     source = tmp_path / "gateway"
     source.mkdir()
 
-    def failing_run(command, check):
+    def failing_run(command, check, shell):
         raise stack_module.subprocess.CalledProcessError(1, command)
 
     monkeypatch.setattr(stack_module.subprocess, "run", failing_run)

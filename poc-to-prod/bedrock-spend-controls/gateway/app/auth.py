@@ -19,13 +19,14 @@ Two verification modes:
 import json
 from dataclasses import dataclass
 from urllib.error import URLError
+from urllib.parse import urlparse
 from urllib.request import urlopen
 
 import jwt as pyjwt
 
 from .config import settings
 
-USER_TOKEN_HEADER = "x-quota-user-token"
+USER_TOKEN_HEADER = "x-quota-user-token"  # nosec B105  # header name, not a credential
 
 
 class JwtError(Exception):
@@ -79,18 +80,34 @@ def extract_user_token(headers) -> str | None:
     return None
 
 
+def _require_https(url: str, what: str) -> str:
+    """Reject anything but an ``https://`` URL with a host.
+
+    ``urlopen`` also understands ``file://`` and ``ftp://``; the issuer and
+    JWKS locations are operator configuration, so an https-only check keeps
+    a misconfigured or tampered setting from turning key discovery into a
+    local file read or a plaintext fetch.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise JwtError(f"{what} must be an https:// URL")
+    return url
+
+
 def discover_jwks_url(issuer: str) -> str:
     """Resolve ``jwks_uri`` from the issuer's OIDC discovery document."""
-    discovery_url = issuer.rstrip("/") + "/.well-known/openid-configuration"
+    discovery_url = _require_https(
+        issuer.rstrip("/") + "/.well-known/openid-configuration", "JWT issuer"
+    )
     try:
-        with urlopen(discovery_url, timeout=5) as response:  # noqa: S310 (operator-configured URL)
+        with urlopen(discovery_url, timeout=5) as response:  # nosec B310  # nosemgrep
             document = json.load(response)
     except (OSError, URLError, ValueError, TypeError) as exc:
         raise JwtError(f"could not load OIDC discovery document: {exc}") from exc
     jwks_uri = document.get("jwks_uri") if isinstance(document, dict) else None
     if not isinstance(jwks_uri, str) or not jwks_uri:
         raise JwtError("OIDC discovery document does not contain a valid jwks_uri")
-    return jwks_uri
+    return _require_https(jwks_uri, "OIDC discovery jwks_uri")
 
 
 class JwtVerifier:
@@ -106,6 +123,7 @@ class JwtVerifier:
                 raise JwtError(
                     "gateway is not configured with a JWT issuer/JWKS URL or shared secret"
                 )
+            _require_https(jwks_url, "JWT JWKS URL")
             self._jwks_client = pyjwt.PyJWKClient(jwks_url, cache_keys=True)
         return self._jwks_client.get_signing_key_from_jwt(token).key
 

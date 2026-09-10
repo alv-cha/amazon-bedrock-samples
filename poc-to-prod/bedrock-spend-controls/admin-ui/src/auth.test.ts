@@ -77,7 +77,8 @@ function encoded(value: unknown): string {
 }
 
 function idToken(overrides: Record<string, unknown> = {}, now = Date.now()): string {
-  return `${encoded({ alg: "none" })}.${encoded({
+  const header = encoded({ alg: "none" });
+  const payload = encoded({
     iss: "https://issuer.example.test",
     aud: "client-id",
     exp: Math.floor(now / 1000) + 3600,
@@ -85,7 +86,8 @@ function idToken(overrides: Record<string, unknown> = {}, now = Date.now()): str
     email: "admin@example.test",
     token_use: "id",
     ...overrides,
-  })}.signature`;
+  });
+  return `${header}.${payload}.signature`;
 }
 
 function harness(

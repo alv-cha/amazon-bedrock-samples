@@ -478,3 +478,36 @@ decision.
 | `spikes/` | Guarded non-production qualification probes and results |
 | `notebook/` | Complete deployed capability walkthrough |
 | `tests/` | Unit, API, infrastructure, notebook, and pricing tests |
+
+## Verification and security scanning
+
+The change gate is the unit and infrastructure suite plus a synth of both
+reference configurations:
+
+```bash
+python -m pytest tests/ -q
+(cd admin-ui && npm ci && npm test && npm run build)
+(cd cdk && for c in demo production; do
+  npx cdk synth --app "python app.py" -c deployment_config=config/$c.json --quiet
+done)
+```
+
+The same static analysis that runs on the hosted repository can be
+reproduced locally; the sample is kept clean against it:
+
+```bash
+semgrep scan --config r/python --config r/typescript --config r/javascript \
+  --config r/generic --config p/security-audit --config p/gitleaks \
+  --exclude cdk.out --exclude node_modules --exclude dist .
+bandit -r gateway usage_processor cdk/stacks tools examples tests \
+  enforcement_dispatcher emergency_processor revocation_processor \
+  workload_enforcer quota_periods_layer --skip B101
+gitleaks git .   # tracked history; build artifacts are git-ignored
+```
+
+Remaining findings are intentional and documented inline: the few `nosec`
+and `nosemgrep` markers each carry a justification (host-side `pip` argv
+for asset bundling, the Lambda entrypoint's `0o755` mode, `https`-only
+`urlopen` calls, and test-only fixture secrets). The React
+`jsx-not-internationalized` advisories are accepted — the administration
+console is a single-locale sample and is not internationalized.

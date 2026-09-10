@@ -17,7 +17,7 @@ import importlib.util
 import json
 import os
 import shutil
-import subprocess
+import subprocess  # nosec B404  # host-side pip invocation for asset bundling, no shell
 import sys
 from urllib.parse import urlparse
 
@@ -119,8 +119,13 @@ class GatewayLocalBundling:
             "--target", output_dir,
             "--quiet", "--disable-pip-version-check",
         ]
+        # argv is fully static apart from paths derived from this file's
+        # location and the CDK-provided asset output directory; there is no
+        # shell and no operator- or network-controlled input.
         try:
-            subprocess.run(command, check=True)
+            subprocess.run(  # nosec B603  # nosemgrep
+                command, check=True, shell=False,
+            )
         except (OSError, subprocess.CalledProcessError) as exc:
             print(
                 "Host bundling of the gateway failed "
@@ -135,7 +140,11 @@ class GatewayLocalBundling:
         )
         run_sh = os.path.join(output_dir, "run.sh")
         shutil.copy2(os.path.join(self._source_dir, "run.sh"), run_sh)
-        os.chmod(run_sh, 0o755)
+        # Lambda unpacks the deployment package as root and executes the
+        # handler as a separate unprivileged user, so the entrypoint must be
+        # world-readable and world-executable (rwxr-xr-x). This mirrors the
+        # container path's `chmod +x` and the script contains no secrets.
+        os.chmod(run_sh, 0o755)  # nosec B103  # nosemgrep
         return True
 
 
@@ -652,12 +661,15 @@ class SpendControlsStack(Stack):
                         # Force x86_64 manylinux wheels so bundling on
                         # arm64 hosts (Apple Silicon) can't produce
                         # aarch64 native deps for this x86_64 function.
-                        "pip install -r requirements.txt "
-                        "--platform manylinux2014_x86_64 --implementation cp "
-                        "--python-version 3.12 --only-binary=:all: "
-                        "--target /asset-output "
-                        "&& cp -r app run.sh /asset-output/ "
-                        "&& chmod +x /asset-output/run.sh",
+                        " ".join([
+                            "pip install -r requirements.txt",
+                            "--platform manylinux2014_x86_64",
+                            "--implementation cp",
+                            "--python-version 3.12 --only-binary=:all:",
+                            "--target /asset-output",
+                            "&& cp -r app run.sh /asset-output/",
+                            "&& chmod +x /asset-output/run.sh",
+                        ]),
                     ],
                 ),
             ),
@@ -1295,10 +1307,7 @@ class SpendControlsStack(Stack):
                     ],
                     resources=[
                         f"arn:{self.partition}:bedrock:*::foundation-model/*",
-                        (
-                            f"arn:{self.partition}:bedrock:*:{self.account}:"
-                            "inference-profile/*"
-                        ),
+                        f"arn:{self.partition}:bedrock:*:{self.account}:inference-profile/*",
                     ],
                     conditions={
                         "StringEquals": {
@@ -1929,7 +1938,7 @@ class SpendControlsStack(Stack):
                 left=[cw.MathExpression(
                     expression=(
                         f"SEARCH('{{{METRICS_NAMESPACE},UserId}} "
-                        f"MetricName=\"{metric}\"', '{stat}')"
+                        + f"MetricName=\"{metric}\"', '{stat}')"
                     ),
                     using_metrics={},
                     label="",

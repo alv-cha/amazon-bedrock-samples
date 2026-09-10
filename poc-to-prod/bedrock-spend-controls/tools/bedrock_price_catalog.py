@@ -90,7 +90,7 @@ def load_offer(source_url: str, timeout_seconds: int = 120) -> dict[str, Any]:
         source_url,
         headers={"User-Agent": "bedrock-spend-controls-price-exporter/1"},
     )
-    with urlopen(  # nosec B310
+    with urlopen(  # nosec B310  # nosemgrep -- scheme enforced to https above and after redirects
         request,
         timeout=timeout_seconds,
         context=_tls_context(),

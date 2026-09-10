@@ -530,7 +530,7 @@ function SummaryPanel({ summary }: { summary: Summary }) {
           <span className="status-dot" aria-hidden="true" />
           <div>
             <strong>Enforcement active</strong>
-            <span>{enforcement.mode.replaceAll("_", " ")}</span>
+            <span>{enforcement.mode.replace(/_/g, " ")}</span>
           </div>
         </div>
         <SystemDetail label="Source" value={enforcement.source} />
@@ -558,7 +558,7 @@ function SummaryPanel({ summary }: { summary: Summary }) {
 }
 
 function formatOperationalLabel(value: string): string {
-  return value.replaceAll("_", " ");
+  return value.replace(/_/g, " ");
 }
 
 function formatDuration(seconds: number): string {
@@ -979,7 +979,9 @@ export function LimitsDialog({
   onSave: (limits: SetLimitsRequest) => void;
   user: UserRow;
 }) {
-  const [draft, setDraft] = useState<LimitDraft>(() => limitDraft(user.limits));
+  // Editable snapshot of the user's limits. The parent keys this dialog by
+  // user id and version, so a changed prop remounts it with a fresh draft.
+  const [draft, setDraft] = useState<LimitDraft>(() => limitDraft(user.limits)); // nosemgrep
   const [reason, setReason] = useState("");
   const [unlimitedConfirmed, setUnlimitedConfirmed] = useState(false);
   const [error, setError] = useState("");
@@ -998,9 +1000,9 @@ export function LimitsDialog({
       if (!next) continue;
       const usage = user.current_usage[period];
       for (const dimension of ["usd", "input_tokens", "output_tokens"] as const) {
-        if ((!previous || previous[dimension] > 0) && next[dimension] === 0) unlimitedFields.push(`${period} ${dimension.replaceAll("_", " ")}`);
+        if ((!previous || previous[dimension] > 0) && next[dimension] === 0) unlimitedFields.push(`${period} ${dimension.replace(/_/g, " ")}`);
         const current = dimension === "usd" ? usage.cost_usd : usage[dimension];
-        if (next[dimension] > 0 && next[dimension] < current) belowUsageFields.push(`${period} ${dimension.replaceAll("_", " ")}`);
+        if (next[dimension] > 0 && next[dimension] < current) belowUsageFields.push(`${period} ${dimension.replace(/_/g, " ")}`);
       }
     }
   }

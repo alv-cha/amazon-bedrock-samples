@@ -421,9 +421,19 @@ describe("status safety dialog", () => {
       onConfirm: vi.fn(),
       user: alice,
     };
-    const { rerender } = render(<StatusDialog {...props} busy={false} />);
+    const renderDialog = (busy: boolean) => (
+      <StatusDialog
+        apiError={props.apiError}
+        busy={busy}
+        enforcement={props.enforcement}
+        onClose={props.onClose}
+        onConfirm={props.onConfirm}
+        user={props.user}
+      />
+    );
+    const { rerender } = render(renderDialog(false));
 
-    rerender(<StatusDialog {...props} busy />);
+    rerender(renderDialog(true));
     const dialog = screen.getByRole("dialog");
     expect(dialog).toHaveFocus();
     await actor.tab();

@@ -39,7 +39,7 @@ export function leaseWindowLabel(seconds: number): string {
 }
 
 function formatOperationalLabel(value: string): string {
-  return value.replaceAll("_", " ");
+  return value.replace(/_/g, " ");
 }
 
 function formatDuration(seconds: number): string {

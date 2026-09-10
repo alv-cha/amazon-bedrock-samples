@@ -19,7 +19,7 @@ from app.auth import Identity
 from app.broker import BrokerError, CredentialBroker, session_name_for
 from app.quota import QuotaStore
 
-SECRET = "test-jwt-secret"
+SECRET = "test-jwt-secret"  # nosec B105  # test-only HS256 key, matches conftest
 ROLE_ARN = "arn:aws:iam::111122223333:role/BedrockUserRole"
 
 

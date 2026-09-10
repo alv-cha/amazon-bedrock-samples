@@ -14,7 +14,7 @@ import app.main as gateway
 from app.broker import BrokerError, VendedCredentials, session_name_for
 from app.quota import MICRO, QuotaStore, current_window
 
-SECRET = "test-jwt-secret"
+SECRET = "test-jwt-secret"  # nosec B105  # test-only HS256 key, matches conftest
 ADMIN = {"Authorization": "Bearer admin-secret"}
 EMERGENCY = {"X-Quota-Emergency-Key": "emergency-secret"}
 
@@ -44,7 +44,7 @@ class FakeBroker:
         )
         return VendedCredentials(
             access_key_id="ASIAFAKE",
-            secret_access_key="secret",
+            secret_access_key="secret",  # nosec B106  # fake STS response
             session_token="token",
             expiration=effective_expiration,
             sts_expiration="2026-08-18T12:15:00+00:00",
@@ -1794,7 +1794,7 @@ def test_admin_principal_is_derived_from_one_verified_jwt(client, monkeypatch):
 
         def verify(self, token):
             self.calls += 1
-            assert token == "verified-admin-token"
+            assert token == "verified-admin-token"  # nosec B105  # placeholder
             return gateway.Identity(
                 user_id="verified-admin",
                 claims={"groups": ["quota-admins"]},

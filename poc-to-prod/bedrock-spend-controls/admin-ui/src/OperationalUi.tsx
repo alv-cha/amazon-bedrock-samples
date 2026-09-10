@@ -493,7 +493,10 @@ export function UserDetailDrawer({
   const [tab, setTab] = useState<DrawerTab>("overview");
   const [detailError, setDetailError] = useState("");
   const [detailLoading, setDetailLoading] = useState(true);
-  const [detailUsage, setDetailUsage] = useState<CurrentUsage>(user.current_usage);
+  // Freshly fetched usage for this drawer; until it lands, render the
+  // list row's snapshot so prop updates keep flowing through.
+  const [fetchedUsage, setFetchedUsage] = useState<CurrentUsage | null>(null);
+  const detailUsage = fetchedUsage ?? user.current_usage;
   const drawerRef = useRef<HTMLElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
@@ -511,7 +514,7 @@ export function UserDetailDrawer({
     void api.getUser(cfg, session, user.user_id).then((result) => {
       if (active) {
         onCanonical(result.data.user);
-        setDetailUsage(result.data.current_usage);
+        setFetchedUsage(result.data.current_usage);
       }
     }).catch((caught) => {
       if (active) setDetailError(apiErrorMessage(caught));

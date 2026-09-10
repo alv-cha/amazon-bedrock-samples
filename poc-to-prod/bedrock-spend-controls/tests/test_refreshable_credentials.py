@@ -21,8 +21,8 @@ class Clock:
 def _response(clock: Clock, key: str, lease_id: str) -> dict:
     return {
         "aws_access_key_id": key,
-        "aws_secret_access_key": "secret",
-        "aws_session_token": "token",
+        "aws_secret_access_key": "secret",  # nosec B105  # fake vend response
+        "aws_session_token": "token",  # nosec B105
         "expiration": (clock.now + timedelta(seconds=60)).isoformat(),
         "sts_expiration": (clock.now + timedelta(minutes=15)).isoformat(),
         "refresh_after": (clock.now + timedelta(seconds=50)).isoformat(),
@@ -140,8 +140,8 @@ def test_provider_rejects_expired_or_malformed_broker_response():
         {},
         {
             "aws_access_key_id": "ASIA",
-            "aws_secret_access_key": "secret",
-            "aws_session_token": "token",
+            "aws_secret_access_key": "secret",  # nosec B105  # fake vend response
+            "aws_session_token": "token",  # nosec B105
             "expiration": (clock.now - timedelta(seconds=1)).isoformat(),
         },
     ):
