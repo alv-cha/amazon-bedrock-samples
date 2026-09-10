@@ -19,6 +19,8 @@ _DEPLOYMENT_KEYS = {
     "admin_jwt_claim",
     "admin_jwt_value",
     "admin_ui",
+    "admin_ui_client_id",
+    "admin_ui_connect_origins",
     "allowed_model_arns",
     "alert_email",
     "auto_provision_users",
@@ -60,6 +62,8 @@ _DEFAULTS = {
     "admin_jwt_claim": "",
     "admin_jwt_value": "",
     "admin_ui": False,
+    "admin_ui_client_id": "",
+    "admin_ui_connect_origins": [],
     "allowed_model_arns": ["*"],
     "alert_email": "",
     "auto_provision_users": True,
@@ -143,6 +147,8 @@ class DeploymentConfig:
     admin_jwt_claim: str
     admin_jwt_value: str
     admin_ui: bool
+    admin_ui_client_id: str
+    admin_ui_connect_origins: tuple[str, ...]
     allowed_model_arns: tuple[str, ...]
     alert_email: str
     auto_provision_users: bool
@@ -395,6 +401,7 @@ class DeploymentConfig:
         if not jwt_user_claim:
             raise ValueError("jwt_user_claim must not be empty")
         jwt_issuer = _string("jwt_issuer", value("jwt_issuer"))
+        jwt_audience = _string("jwt_audience", value("jwt_audience"))
         admin_ui = _boolean("admin_ui", value("admin_ui"))
         admin_jwt_claim = _string(
             "admin_jwt_claim", value("admin_jwt_claim")
@@ -407,11 +414,28 @@ class DeploymentConfig:
                 "admin_jwt_claim and admin_jwt_value must be configured "
                 "together"
             )
-        if admin_ui and jwt_issuer:
+        admin_ui_client_id = _string(
+            "admin_ui_client_id", value("admin_ui_client_id")
+        )
+        admin_ui_connect_origins = _string_list(
+            "admin_ui_connect_origins", value("admin_ui_connect_origins")
+        )
+        for origin in admin_ui_connect_origins:
+            if not origin.startswith("https://") or origin.endswith("/"):
+                raise ValueError(
+                    "admin_ui_connect_origins entries must be HTTPS origins "
+                    f"without a trailing slash, got '{origin}'"
+                )
+        if admin_ui_client_id and not (admin_ui and jwt_issuer):
             raise ValueError(
-                "admin_ui=true currently supports only the stack-created "
-                "demo Cognito pool; host and integrate the UI separately "
-                "when jwt_issuer is configured"
+                "admin_ui_client_id applies only when admin_ui=true is "
+                "combined with a bring-your-own jwt_issuer"
+            )
+        if admin_ui and jwt_issuer and not (admin_ui_client_id or jwt_audience):
+            raise ValueError(
+                "admin_ui=true with a bring-your-own jwt_issuer needs the "
+                "SPA's public OAuth client id: set admin_ui_client_id (or "
+                "jwt_audience when the UI shares the data-plane client)"
             )
         if admin_ui and not admin_jwt_claim:
             raise ValueError(
@@ -456,6 +480,8 @@ class DeploymentConfig:
             admin_jwt_claim=admin_jwt_claim,
             admin_jwt_value=admin_jwt_value,
             admin_ui=admin_ui,
+            admin_ui_client_id=admin_ui_client_id,
+            admin_ui_connect_origins=tuple(admin_ui_connect_origins),
             allowed_model_arns=tuple(allowed_model_arns),
             alert_email=_string("alert_email", value("alert_email")),
             auto_provision_users=_boolean(
@@ -467,7 +493,7 @@ class DeploymentConfig:
             deprecated_options=deprecated_options,
             invocation_log_group_name=existing_log_group,
             invoker_principal_arns=tuple(invoker_arns),
-            jwt_audience=_string("jwt_audience", value("jwt_audience")),
+            jwt_audience=jwt_audience,
             jwt_issuer=jwt_issuer,
             jwt_jwks_url=_string("jwt_jwks_url", value("jwt_jwks_url")),
             jwt_user_claim=jwt_user_claim,

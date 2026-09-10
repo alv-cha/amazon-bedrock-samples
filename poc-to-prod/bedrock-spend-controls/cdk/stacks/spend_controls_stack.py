@@ -19,6 +19,7 @@ import os
 import shutil
 import subprocess
 import sys
+from urllib.parse import urlparse
 
 import aws_cdk as cdk
 import jsii
@@ -285,9 +286,122 @@ class SpendControlsStack(Stack):
         # Identity: BYO OIDC issuer, or a demo Cognito User Pool
         # ------------------------------------------------------------------
         user_pool = None
+        user_pool_client = None
         ui_bucket = None
         ui_distribution = None
-        cognito_domain_url = None
+        ui_callback_url = None
+        ui_logout_url = None
+        ui_client_id = None
+
+        # ------------------------------------------------------------------
+        # Admin UI hosting (S3 + CloudFront) is identity-agnostic; only the
+        # CSP connect-src depends on where the browser talks: the issuer's
+        # OIDC discovery + token endpoints, and cognito-identity for the
+        # Identity Pool credential exchange in both identity branches.
+        # ------------------------------------------------------------------
+        if config.admin_ui:
+            ui_connect_sources = [
+                "connect-src 'self'",
+                f"https://*.lambda-url.{self.region}.on.aws",
+                f"https://cognito-identity.{self.region}.{self.url_suffix}",
+            ]
+            if jwt_issuer:
+                issuer_parts = urlparse(jwt_issuer)
+                ui_connect_sources.append(
+                    f"{issuer_parts.scheme}://{issuer_parts.netloc}"
+                )
+                # Providers that serve their token endpoint from a different
+                # origin than the issuer (Cognito-style) list it here.
+                ui_connect_sources.extend(config.admin_ui_connect_origins)
+            else:
+                # Demo Cognito: discovery on cognito-idp, token endpoint on
+                # the managed-login domain.
+                ui_connect_sources.extend(
+                    [
+                        f"https://cognito-idp.{self.region}.{self.url_suffix}",
+                        f"https://*.auth.{self.region}.amazoncognito.com",
+                        f"https://*.auth.{self.region}.amazoncognito.com.cn",
+                    ]
+                )
+            ui_bucket = s3.Bucket(
+                self, "AdminUiBucket",
+                block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+                encryption=s3.BucketEncryption.S3_MANAGED,
+                enforce_ssl=True,
+                removal_policy=RemovalPolicy.DESTROY,
+                auto_delete_objects=True,
+            )
+            ui_security_headers = cloudfront.ResponseHeadersPolicy(
+                self,
+                "AdminUiSecurityHeaders",
+                comment="Security headers for the Bedrock quota admin UI",
+                security_headers_behavior=cloudfront.ResponseSecurityHeadersBehavior(
+                    content_security_policy=cloudfront.ResponseHeadersContentSecurityPolicy(
+                        content_security_policy="; ".join(
+                            [
+                                "default-src 'self'",
+                                "base-uri 'none'",
+                                "object-src 'none'",
+                                "frame-ancestors 'none'",
+                                "form-action 'self'",
+                                "img-src 'self' data:",
+                                " ".join(ui_connect_sources),
+                            ]
+                        ),
+                        override=True,
+                    ),
+                    content_type_options=cloudfront.ResponseHeadersContentTypeOptions(
+                        override=True
+                    ),
+                    frame_options=cloudfront.ResponseHeadersFrameOptions(
+                        frame_option=cloudfront.HeadersFrameOption.DENY,
+                        override=True,
+                    ),
+                    referrer_policy=cloudfront.ResponseHeadersReferrerPolicy(
+                        referrer_policy=(
+                            cloudfront.HeadersReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN
+                        ),
+                        override=True,
+                    ),
+                    strict_transport_security=cloudfront.ResponseHeadersStrictTransportSecurity(
+                        access_control_max_age=Duration.days(365),
+                        include_subdomains=True,
+                        preload=True,
+                        override=True,
+                    ),
+                ),
+            )
+            ui_distribution = cloudfront.Distribution(
+                self, "AdminUiDistribution",
+                default_root_object="index.html",
+                default_behavior=cloudfront.BehaviorOptions(
+                    origin=cloudfront_origins.S3BucketOrigin.with_origin_access_control(
+                        ui_bucket
+                    ),
+                    viewer_protocol_policy=(
+                        cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS
+                    ),
+                    response_headers_policy=ui_security_headers,
+                ),
+                # SPA: client-side routes resolve to index.html.
+                error_responses=[
+                    cloudfront.ErrorResponse(
+                        http_status=403,
+                        response_http_status=200,
+                        response_page_path="/index.html",
+                    ),
+                    cloudfront.ErrorResponse(
+                        http_status=404,
+                        response_http_status=200,
+                        response_page_path="/index.html",
+                    ),
+                ],
+            )
+            ui_origin = (
+                f"https://{ui_distribution.distribution_domain_name}"
+            )
+            ui_callback_url = f"{ui_origin}/auth/callback"
+            ui_logout_url = f"{ui_origin}/"
         if not jwt_issuer:
             user_pool = cognito.UserPool(
                 self, "DemoUserPool",
@@ -296,9 +410,10 @@ class SpendControlsStack(Stack):
                 removal_policy=RemovalPolicy.DESTROY,
             )
 
-            # Build the UI origin before adding OAuth URLs to the existing app
-            # client. The dependency direction is AppClient -> Distribution;
-            # CloudFront must not reference the app client or Function URL.
+            # The UI origin (hoisted hosting above) is known before the app
+            # client adds its OAuth URLs. The dependency direction is
+            # AppClient -> Distribution; CloudFront must not reference the
+            # app client or Function URL.
             if config.admin_ui:
                 domain_suffix = hashlib.sha256(
                     self.stack_name.encode("utf-8")
@@ -307,93 +422,6 @@ class SpendControlsStack(Stack):
                     f"bedrock-spend-admin-{self.account}-{self.region}-"
                     f"{domain_suffix}"
                 )
-                ui_callback_url = None
-                ui_logout_url = None
-                ui_bucket = s3.Bucket(
-                    self, "AdminUiBucket",
-                    block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
-                    encryption=s3.BucketEncryption.S3_MANAGED,
-                    enforce_ssl=True,
-                    removal_policy=RemovalPolicy.DESTROY,
-                    auto_delete_objects=True,
-                )
-                ui_security_headers = cloudfront.ResponseHeadersPolicy(
-                    self,
-                    "AdminUiSecurityHeaders",
-                    comment="Security headers for the Bedrock quota admin UI",
-                    security_headers_behavior=cloudfront.ResponseSecurityHeadersBehavior(
-                        content_security_policy=cloudfront.ResponseHeadersContentSecurityPolicy(
-                            content_security_policy="; ".join(
-                                [
-                                    "default-src 'self'",
-                                    "base-uri 'none'",
-                                    "object-src 'none'",
-                                    "frame-ancestors 'none'",
-                                    "form-action 'self'",
-                                    "img-src 'self' data:",
-                                    (
-                                        "connect-src 'self' "
-                                        f"https://*.lambda-url.{self.region}.on.aws "
-                                        f"https://cognito-identity.{self.region}.{self.url_suffix} "
-                                        f"https://*.auth.{self.region}.amazoncognito.com "
-                                        f"https://*.auth.{self.region}.amazoncognito.com.cn"
-                                    ),
-                                ]
-                            ),
-                            override=True,
-                        ),
-                        content_type_options=cloudfront.ResponseHeadersContentTypeOptions(
-                            override=True
-                        ),
-                        frame_options=cloudfront.ResponseHeadersFrameOptions(
-                            frame_option=cloudfront.HeadersFrameOption.DENY,
-                            override=True,
-                        ),
-                        referrer_policy=cloudfront.ResponseHeadersReferrerPolicy(
-                            referrer_policy=(
-                                cloudfront.HeadersReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN
-                            ),
-                            override=True,
-                        ),
-                        strict_transport_security=cloudfront.ResponseHeadersStrictTransportSecurity(
-                            access_control_max_age=Duration.days(365),
-                            include_subdomains=True,
-                            preload=True,
-                            override=True,
-                        ),
-                    ),
-                )
-                ui_distribution = cloudfront.Distribution(
-                    self, "AdminUiDistribution",
-                    default_root_object="index.html",
-                    default_behavior=cloudfront.BehaviorOptions(
-                        origin=cloudfront_origins.S3BucketOrigin.with_origin_access_control(
-                            ui_bucket
-                        ),
-                        viewer_protocol_policy=(
-                            cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS
-                        ),
-                        response_headers_policy=ui_security_headers,
-                    ),
-                    # SPA: client-side routes resolve to index.html.
-                    error_responses=[
-                        cloudfront.ErrorResponse(
-                            http_status=403,
-                            response_http_status=200,
-                            response_page_path="/index.html",
-                        ),
-                        cloudfront.ErrorResponse(
-                            http_status=404,
-                            response_http_status=200,
-                            response_page_path="/index.html",
-                        ),
-                    ],
-                )
-                ui_origin = (
-                    f"https://{ui_distribution.distribution_domain_name}"
-                )
-                ui_callback_url = f"{ui_origin}/auth/callback"
-                ui_logout_url = f"{ui_origin}/"
 
             # Preserve this scope and construct ID: the notebook, broker JWT
             # audience, Identity Pool, and browser all reuse this public client.
@@ -432,7 +460,6 @@ class SpendControlsStack(Stack):
                         cognito.ManagedLoginVersion.NEWER_MANAGED_LOGIN
                     ),
                 )
-                cognito_domain_url = login_domain.base_url()
                 managed_login_branding = cognito.CfnManagedLoginBranding(
                     self,
                     "AdminManagedLoginBranding",
@@ -453,6 +480,7 @@ class SpendControlsStack(Stack):
             )
             # ID tokens carry the app client id as `aud`.
             jwt_audience = user_pool_client.user_pool_client_id
+            ui_client_id = user_pool_client.user_pool_client_id
             if config.admin_jwt_claim == "cognito:groups":
                 group_parameters = {
                     "GroupName": config.admin_jwt_value,
@@ -491,6 +519,23 @@ class SpendControlsStack(Stack):
                     install_latest_aws_sdk=False,
                 )
                 ensure_admin_group.node.add_dependency(user_pool)
+
+        if config.admin_ui and user_pool is None:
+            # BYO issuer: the SPA's public client, falling back to the shared
+            # data-plane audience (validated non-empty in configuration).
+            ui_client_id = config.admin_ui_client_id or jwt_audience
+
+        # The broker accepts the data-plane audience and, with a BYO issuer,
+        # the admin UI's public client id (comma-separated: any match).
+        broker_jwt_audiences = [jwt_audience] if jwt_audience else []
+        if (
+            config.admin_ui
+            and user_pool is None
+            and ui_client_id
+            and ui_client_id != jwt_audience
+        ):
+            broker_jwt_audiences.append(ui_client_id)
+        jwt_audience_env = ",".join(broker_jwt_audiences)
 
         # ------------------------------------------------------------------
         # DynamoDB
@@ -686,7 +731,7 @@ class SpendControlsStack(Stack):
                 ),
                 # JWT auth
                 "JWT_ISSUER": jwt_issuer,
-                "JWT_AUDIENCE": jwt_audience,
+                "JWT_AUDIENCE": jwt_audience_env,
                 "JWT_JWKS_URL": jwt_jwks_url,
                 "JWT_USER_CLAIM": jwt_user_claim,
                 # Admin-by-JWT (empty claim = shared key only)
@@ -975,16 +1020,17 @@ class SpendControlsStack(Stack):
 
         # ------------------------------------------------------------------
         # Admin UI (opt-in: -c admin_ui=true). Static React on S3 + CloudFront,
-        # authenticated with the demo Cognito pool via a Cognito Identity Pool.
-        # The browser gets temporary AWS creds from the Identity Pool's
+        # authenticated against the deployment's OIDC issuer (the demo Cognito
+        # pool, or a bring-your-own corporate IdP) via a Cognito Identity
+        # Pool. The browser gets temporary AWS creds from the Identity Pool's
         # authenticated role and SigV4-signs its calls to the AWS_IAM Function
-        # URL — no admin secret ever reaches the browser (admin-by-JWT does the
-        # /admin authorization; see ADMIN_JWT_CLAIM). Only wired when the stack
-        # created the demo pool; with a BYO issuer, see DEPLOYMENT.md for the
-        # manual Identity Pool + OIDC-provider path.
+        # URL — no admin secret ever reaches the browser (admin-by-JWT does
+        # the /admin authorization; see ADMIN_JWT_CLAIM). With a BYO issuer,
+        # register AdminUiCallbackUrl as a redirect URI on the SPA's public
+        # client after the first deploy.
         # ------------------------------------------------------------------
-        if config.admin_ui and user_pool is not None:
-            if ui_bucket is None or ui_distribution is None or cognito_domain_url is None:
+        if config.admin_ui:
+            if ui_bucket is None or ui_distribution is None or ui_client_id is None:
                 raise RuntimeError("Admin UI resources were not initialized")
             # The browser calls the IAM-authenticated Function URL from the
             # CloudFront origin. Configure CORS at the Function URL so Lambda
@@ -1022,15 +1068,33 @@ class SpendControlsStack(Stack):
                 ],
                 max_age=3600,
             )
+            if user_pool is not None:
+                ui_authentication_providers = (
+                    idpool.IdentityPoolAuthenticationProviders(
+                        user_pools=[idpool.UserPoolAuthenticationProvider(
+                            user_pool=user_pool,
+                            user_pool_client=user_pool_client,
+                        )],
+                    )
+                )
+            else:
+                # BYO issuer: the Identity Pool trusts the corporate IdP
+                # through an IAM OIDC provider scoped to the SPA's client id.
+                admin_ui_oidc_provider = iam.OpenIdConnectProvider(
+                    self,
+                    "AdminUiOidcProvider",
+                    url=config.jwt_issuer,
+                    client_ids=[ui_client_id],
+                )
+                ui_authentication_providers = (
+                    idpool.IdentityPoolAuthenticationProviders(
+                        open_id_connect_providers=[admin_ui_oidc_provider],
+                    )
+                )
             admin_identity_pool = idpool.IdentityPool(
                 self, "AdminIdentityPool",
                 allow_unauthenticated_identities=False,
-                authentication_providers=idpool.IdentityPoolAuthenticationProviders(
-                    user_pools=[idpool.UserPoolAuthenticationProvider(
-                        user_pool=user_pool,
-                        user_pool_client=user_pool_client,
-                    )],
-                ),
+                authentication_providers=ui_authentication_providers,
             )
             # The authenticated browser identity may invoke the Function URL;
             # the JWT it presents (admin group) authorizes the /admin routes.
@@ -1068,11 +1132,9 @@ class SpendControlsStack(Stack):
                 {
                     "gatewayUrl": fn_url.url,
                     "region": self.region,
-                    "userPoolId": user_pool.user_pool_id,
-                    "userPoolClientId": user_pool_client.user_pool_client_id,
+                    "issuer": jwt_issuer,
+                    "clientId": ui_client_id,
                     "identityPoolId": admin_identity_pool.identity_pool_id,
-                    "cognitoDomain": cognito_domain_url,
-                    "cognitoIssuer": jwt_issuer,
                 }
             )
             ui_config_writer = cr.AwsCustomResource(
@@ -1133,7 +1195,15 @@ class SpendControlsStack(Stack):
             ui_config_writer.node.add_dependency(ui_deployment)
             cdk.CfnOutput(self, "AdminUiUrl",
                           value=f"https://{ui_distribution.distribution_domain_name}",
-                          description="Admin console (CloudFront). Sign in with the demo Cognito pool.")
+                          description=("Admin console (CloudFront). Sign in with "
+                                       + ("the configured OIDC issuer."
+                                          if user_pool is None
+                                          else "the demo Cognito pool.")))
+            cdk.CfnOutput(self, "AdminUiCallbackUrl",
+                          value=ui_callback_url,
+                          description=("OAuth redirect URI of the admin UI. Demo: "
+                                       "registered automatically. BYO issuer: register "
+                                       "it on the SPA's public client in your IdP."))
             cdk.CfnOutput(self, "AdminIdentityPoolId",
                           value=admin_identity_pool.identity_pool_id,
                           description="Cognito Identity Pool the admin UI exchanges tokens with.")

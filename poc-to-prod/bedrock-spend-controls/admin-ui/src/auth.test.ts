@@ -3,6 +3,7 @@ import {
   beginSignIn,
   createSessionFromIdToken,
   handleAuthCallback,
+  resetProviderMetadataCache,
   type AuthDependencyOverrides,
   type Signer,
 } from "./auth";
@@ -11,12 +12,25 @@ import type { AdminConfig } from "./config";
 const cfg: AdminConfig = {
   gatewayUrl: "https://gateway.example.test",
   region: "us-east-1",
-  userPoolId: "us-east-1_pool",
-  userPoolClientId: "client-id",
+  issuer: "https://issuer.example.test",
+  clientId: "client-id",
   identityPoolId: "us-east-1:identity",
-  cognitoDomain: "https://login.example.test",
-  cognitoIssuer: "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_pool",
+  scopes: "openid email profile",
 };
+
+/**
+ * Discovery document for the fixture issuer. Endpoints live on a different
+ * origin than the issuer, as with Cognito managed login.
+ */
+const discoveryDocument = {
+  issuer: "https://issuer.example.test",
+  authorization_endpoint: "https://login.example.test/oauth2/authorize",
+  token_endpoint: "https://login.example.test/oauth2/token",
+  end_session_endpoint: "https://login.example.test/logout",
+};
+
+const DISCOVERY_URL =
+  "https://issuer.example.test/.well-known/openid-configuration";
 
 class MemoryStorage {
   private readonly values = new Map<string, string>();
@@ -64,7 +78,7 @@ function encoded(value: unknown): string {
 
 function idToken(overrides: Record<string, unknown> = {}, now = Date.now()): string {
   return `${encoded({ alg: "none" })}.${encoded({
-    iss: "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_pool",
+    iss: "https://issuer.example.test",
     aud: "client-id",
     exp: Math.floor(now / 1000) + 3600,
     nonce: "unused",
@@ -74,11 +88,26 @@ function idToken(overrides: Record<string, unknown> = {}, now = Date.now()): str
   })}.signature`;
 }
 
-function harness(now = Date.now()) {
+function harness(
+  now = Date.now(),
+  discoveryOverrides: Record<string, unknown> = {},
+) {
   const storage = new MemoryStorage();
   const navigate = vi.fn();
   const replaceUrl = vi.fn();
   const fetchMock = vi.fn();
+  const discovery = { ...discoveryDocument, ...discoveryOverrides };
+  const fetchWithDiscovery = vi.fn(
+    (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === DISCOVERY_URL) {
+        return Promise.resolve(new Response(JSON.stringify(discovery), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }));
+      }
+      return fetchMock(input, init) as Promise<Response>;
+    },
+  );
   const createCredentialsProvider = vi.fn().mockReturnValue(
     vi.fn().mockResolvedValue({
       accessKeyId: "access",
@@ -90,7 +119,7 @@ function harness(now = Date.now()) {
   const createSigner = vi.fn().mockReturnValue({ fetch: vi.fn() } satisfies Signer);
   const deps: AuthDependencyOverrides = {
     crypto: testCrypto(),
-    fetch: fetchMock as typeof fetch,
+    fetch: fetchWithDiscovery as unknown as typeof fetch,
     storage,
     now: () => now,
     navigate,
@@ -130,6 +159,7 @@ async function pendingCallback(
 
 beforeEach(() => {
   vi.restoreAllMocks();
+  resetProviderMetadataCache();
 });
 
 describe("managed-login PKCE", () => {
@@ -280,7 +310,7 @@ describe("managed-login PKCE", () => {
 
   it.each([
     ["nonce", { nonce: "wrong" }, "nonce"],
-    ["issuer", { iss: "https://issuer.example.test" }, "issuer"],
+    ["issuer", { iss: "https://evil.example.test" }, "issuer"],
     ["audience", { aud: "another-client" }, "audience"],
     ["expiry", { exp: 1 }, "expired"],
   ])("rejects an ID token with invalid %s", async (suffix, overrides, message) => {
@@ -387,17 +417,102 @@ describe("session renewal and logout", () => {
     expect(transientHarness.navigate).not.toHaveBeenCalled();
   });
 
-  it("clears local state and redirects through Cognito logout", () => {
+  it("clears local state and redirects through the provider's end-session endpoint", async () => {
     const now = 4_000_000;
     const testHarness = harness(now);
+    const token = idToken({}, now);
+    const session = createSessionFromIdToken(cfg, token, "refresh", testHarness.deps);
+
+    session.logout();
+
+    await vi.waitFor(() => expect(testHarness.navigate).toHaveBeenCalledOnce());
+    const url = new URL(String(testHarness.navigate.mock.calls[0][0]));
+    expect(`${url.origin}${url.pathname}`).toBe("https://login.example.test/logout");
+    expect(url.searchParams.get("client_id")).toBe("client-id");
+    // Cognito's parameter and the OIDC-standard one are sent together.
+    expect(url.searchParams.get("logout_uri")).toBe("https://admin.example.test/");
+    expect(url.searchParams.get("post_logout_redirect_uri")).toBe("https://admin.example.test/");
+    expect(url.searchParams.get("id_token_hint")).toBe(token);
+    expect(testHarness.storage.size).toBe(0);
+  });
+
+  it("logs out locally when the provider has no end-session endpoint", async () => {
+    const now = 4_100_000;
+    const testHarness = harness(now, { end_session_endpoint: undefined });
     const session = createSessionFromIdToken(cfg, idToken({}, now), "refresh", testHarness.deps);
 
     session.logout();
 
-    const url = new URL(String(testHarness.navigate.mock.calls[0][0]));
-    expect(`${url.origin}${url.pathname}`).toBe("https://login.example.test/logout");
-    expect(url.searchParams.get("client_id")).toBe("client-id");
-    expect(url.searchParams.get("logout_uri")).toBe("https://admin.example.test/");
+    await vi.waitFor(() => expect(testHarness.navigate).toHaveBeenCalledOnce());
+    expect(String(testHarness.navigate.mock.calls[0][0])).toBe("https://admin.example.test/");
     expect(testHarness.storage.size).toBe(0);
+  });
+});
+
+describe("OIDC discovery", () => {
+  it("signs in through the discovered authorization endpoint exactly once per issuer", async () => {
+    const testHarness = harness();
+
+    await beginSignIn(cfg, testHarness.deps);
+    await beginSignIn(cfg, testHarness.deps);
+
+    const discoveryCalls = (testHarness.deps.fetch as ReturnType<typeof vi.fn>)
+      .mock.calls.filter(([input]) => String(input) === DISCOVERY_URL);
+    expect(discoveryCalls).toHaveLength(1);
+  });
+
+  it("rejects a discovery document whose issuer does not match", async () => {
+    const testHarness = harness(Date.now(), { issuer: "https://evil.example.test" });
+
+    await expect(beginSignIn(cfg, testHarness.deps))
+      .rejects.toThrow("discovery document issuer");
+    expect(testHarness.navigate).not.toHaveBeenCalled();
+  });
+
+  it("rejects discovery endpoints that are not HTTPS", async () => {
+    const testHarness = harness(Date.now(), {
+      token_endpoint: "http://login.example.test/oauth2/token",
+    });
+
+    await expect(beginSignIn(cfg, testHarness.deps))
+      .rejects.toThrow("token_endpoint");
+  });
+
+  it("accepts an ID token whose issuer differs only by a trailing slash", async () => {
+    // Auth0-style issuers carry a trailing slash in the `iss` claim.
+    const now = Date.now();
+    const testHarness = harness(now);
+
+    const session = createSessionFromIdToken(
+      cfg,
+      idToken({ iss: "https://issuer.example.test/" }, now),
+      undefined,
+      testHarness.deps,
+    );
+
+    expect(session.email).toBe("admin@example.test");
+  });
+
+  it("identifies the session by preferred_username when email is absent", () => {
+    const now = Date.now();
+    const testHarness = harness(now);
+
+    const session = createSessionFromIdToken(
+      cfg,
+      idToken({ email: undefined, preferred_username: "corp-admin" }, now),
+      undefined,
+      testHarness.deps,
+    );
+
+    expect(session.email).toBe("corp-admin");
+  });
+
+  it("surfaces a discovery outage as a sign-in failure", async () => {
+    const testHarness = harness();
+    const failingFetch = vi.fn().mockResolvedValue(new Response("", { status: 503 }));
+    testHarness.deps.fetch = failingFetch as unknown as typeof fetch;
+
+    await expect(beginSignIn(cfg, testHarness.deps))
+      .rejects.toThrow("OIDC discovery failed (503)");
   });
 });

@@ -58,6 +58,19 @@ def test_audience_enforced_when_configured(monkeypatch):
     assert identity.user_id == "alice"
 
 
+def test_any_configured_audience_accepted(monkeypatch):
+    """Comma-separated audiences: data-plane and admin-UI clients coexist."""
+    monkeypatch.setenv("JWT_AUDIENCE", "data-plane-client, admin-ui-client")
+    monkeypatch.setattr(auth_module, "settings", Settings())
+
+    for audience in ("data-plane-client", "admin-ui-client"):
+        identity = JwtVerifier().verify(make_jwt(extra={"aud": audience}))
+        assert identity.user_id == "alice"
+
+    with pytest.raises(JwtError, match="audience"):
+        JwtVerifier().verify(make_jwt(extra={"aud": "another-app"}))
+
+
 def test_issuer_enforced_when_configured(monkeypatch):
     monkeypatch.setenv("JWT_ISSUER", "https://idp.example.com")
     monkeypatch.setattr(auth_module, "settings", Settings())

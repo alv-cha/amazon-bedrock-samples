@@ -20,7 +20,7 @@ sample.
 | Routine admin audit | Fixed 365 days from deployment; no backfill | Fixed 365 days from deployment; no backfill |
 | DynamoDB deletion | `DESTROY` | `RETAIN` |
 | Alerts | Personal email | Operations topic/email |
-| Admin UI | Stack-created Cognito path | Integrate corporate IdP and Identity Pool |
+| Admin UI | Stack-created Cognito path | `admin_ui=true` + `admin_ui_client_id` against the corporate IdP |
 | Direct Bedrock access | Optional demo deny policy | Required SCP, boundary, or equivalent deny |
 | Price fallback | Conservative default | Review against most expensive allowed model |
 
@@ -84,12 +84,14 @@ Direct `-c key=value` values override the file.
 | `invocation_log_group_name` | empty | Required when logging is externally managed |
 | `model_config` | `config/model-pricing.json` | Validated catalog, overrides, and fallback |
 | `jwt_issuer` | empty | Empty creates demo Cognito |
-| `jwt_audience` | empty | Required value depends on the IdP |
+| `jwt_audience` | empty | Comma-separated audiences accepted by the broker |
 | `jwt_jwks_url` | discovery | Explicit JWKS URL when discovery is unavailable |
 | `jwt_user_claim` | `sub` | Claim used as the quota key |
 | `admin_jwt_claim` | empty | Claim used for browser admin authorization |
 | `admin_jwt_value` | empty | Required claim value or group |
-| `admin_ui` | `false` | Demo Cognito only; requires both admin JWT fields |
+| `admin_ui` | `false` | Hosts the UI; works with demo Cognito or a BYO issuer; requires both admin JWT fields |
+| `admin_ui_client_id` | empty | BYO issuer only: the SPA's public OAuth client id (defaults to `jwt_audience`) |
+| `admin_ui_connect_origins` | `[]` | BYO issuer only: extra HTTPS origins for the UI CSP (token endpoint on a different origin) |
 | `alert_email` | empty | Creates an SNS email subscription |
 | `snapstart` | `false` | Enable Python Lambda SnapStart for the broker |
 | `adapter_layer_arn` | regional default | Override Lambda Web Adapter layer |
@@ -907,37 +909,67 @@ deployment system.
 
 ### 4. Corporate IdP and UI
 
-The backend accepts any OIDC issuer/JWKS configuration. The browser UI must
-also obtain temporary AWS credentials to SigV4-sign the `AWS_IAM` Function
-URL. The sample automatically creates that Identity Pool only for its demo
-Cognito pool.
+Both the backend and the browser UI federate with any OIDC-compliant issuer.
+The UI resolves its endpoints from the issuer's discovery document
+(`/.well-known/openid-configuration`), signs in with authorization-code +
+PKCE against a public (no-secret) client, and exchanges the ID token for
+temporary AWS credentials at a Cognito Identity Pool to SigV4-sign the
+`AWS_IAM` Function URL.
 
-Keep `admin_ui=false` in this stack when `jwt_issuer` is configured. For a
-corporate IdP, build and host `admin-ui/` separately, create or reuse a Cognito
-Identity Pool that trusts the OIDC provider, grant its authenticated admin role
-`lambda:InvokeFunctionUrl`, and provide a deployment-specific `config.js`:
+Set `admin_ui=true` together with your issuer, and the stack hosts and wires
+everything — including an IAM OIDC provider and the Identity Pool that
+trusts it:
+
+```json
+{
+  "jwt_issuer": "https://your-idp.example.com",
+  "jwt_audience": "bedrock-runtime-quota-broker",
+  "admin_ui": true,
+  "admin_ui_client_id": "spa-public-client-id",
+  "admin_jwt_claim": "groups",
+  "admin_jwt_value": "bedrock-quota-admins"
+}
+```
+
+- `admin_ui_client_id` is the SPA's public OAuth client registered in the
+  corporate IdP (omit it when the UI shares the data-plane `jwt_audience`
+  client). The broker then accepts both audiences.
+- After the first deploy, register the `AdminUiCallbackUrl` stack output as
+  the redirect URI on that client. This is the only chicken-and-egg step:
+  the CloudFront URL exists only after deployment.
+- The client must allow browser (CORS) calls to the token endpoint. In
+  Microsoft Entra ID register the redirect URI under the *Single-page
+  application* platform; in Okta/Auth0 use a public SPA client. If the IdP
+  requires a scope for refresh tokens (Entra: `offline_access`), the UI
+  session re-authenticates silently on expiry without it.
+- If the IdP serves its token endpoint from a different origin than the
+  issuer (as Cognito does), list that origin in
+  `admin_ui_connect_origins` so the UI's Content-Security-Policy allows it.
+- Sign-out uses the discovered `end_session_endpoint` with both the OIDC
+  standard and Cognito parameter names; providers ignore the name they do
+  not use.
+
+Hosting the UI elsewhere (own domain, existing web platform) remains
+possible: build `admin-ui/`, serve it with a `config.js` like the one the
+stack writes, and allow the exact HTTPS origin on the Function URL CORS
+policy — the stack configures CORS automatically only for its own CloudFront
+distribution. Do not use a wildcard production origin.
 
 ```javascript
 window.QUOTA_ADMIN_CONFIG = {
   gatewayUrl: "BROKER_API_URL",
   region: "us-east-1",
-  userPoolId: "YOUR_COGNITO_USER_POOL_ID",
-  userPoolClientId: "YOUR_CLIENT_ID",
-  identityPoolId: "YOUR_IDENTITY_POOL_ID",
-  cognitoDomain: "https://YOUR_DOMAIN.auth.us-east-1.amazoncognito.com",
-  cognitoIssuer: "https://cognito-idp.us-east-1.amazonaws.com/YOUR_USER_POOL_ID"
+  issuer: "https://your-idp.example.com",
+  clientId: "spa-public-client-id",
+  identityPoolId: "IDENTITY_POOL_ID",
+  scopes: "openid email profile"
 };
 ```
 
-The current React login implementation targets Cognito User Pools managed
-login with authorization-code + PKCE and requires exact HTTPS callback/logout
-URLs. Its public `config.js` must contain the Cognito domain and issuer shown
-above, but no client secret or other secret. Replacing `admin-ui/src/auth.ts`
-with the customer's OIDC login is an integration task, not a change to quota
-enforcement. The separately hosted UI also requires the Function URL CORS policy to allow its exact HTTPS origin and the SigV4 headers;
-the stack configures this automatically only for its own demo CloudFront
-distribution. Do not use a wildcard production origin. The shared admin key is
-for trusted CLI or backend use and must never be embedded in the browser.
+`config.js` contains public identifiers only. The shared admin key is for
+trusted CLI or backend use and must never be embedded in the browser;
+browser admins are authorized by their JWT claim (`admin_jwt_claim` /
+`admin_jwt_value`).
 
 ### 5. Prevent bypass
 

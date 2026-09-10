@@ -120,7 +120,10 @@ outside this direct-to-Runtime architecture.
 | CloudWatch/SNS | Operational metrics, alarms, warnings, and block notifications |
 | Admin UI | Overview with per-model usage charts, user management, runtime enforcement controls, live leases, emergency stop, alarms, and audit history |
 
-The admin UI uses Cognito managed login with authorization-code + PKCE, then
+The admin UI signs in with authorization-code + PKCE against the
+deployment's OIDC issuer — the demo Cognito pool, or a corporate IdP (Okta,
+Entra ID, Auth0, Keycloak, ...) when `jwt_issuer` and `admin_ui_client_id`
+are configured — resolving all endpoints from OIDC discovery. It then
 exchanges the current ID token through the Identity Pool for temporary AWS
 credentials. It remains an `AWS_IAM`/SigV4 client; the browser never receives
 the shared routine admin secret. The break-glass key is entered by an operator

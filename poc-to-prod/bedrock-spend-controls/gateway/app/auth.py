@@ -110,14 +110,22 @@ class JwtVerifier:
         return self._jwks_client.get_signing_key_from_jwt(token).key
 
     def verify(self, token: str) -> Identity:
-        options = {"require": ["exp"], "verify_aud": bool(settings.jwt_audience)}
+        # Comma-separated audiences: the token must match any one of them.
+        # A deployment may accept both the data-plane audience and the
+        # admin UI's public client id from the same corporate IdP.
+        audiences = [
+            audience.strip()
+            for audience in settings.jwt_audience.split(",")
+            if audience.strip()
+        ]
+        options = {"require": ["exp"], "verify_aud": bool(audiences)}
         try:
             if settings.jwt_shared_secret:
                 claims = pyjwt.decode(
                     token,
                     settings.jwt_shared_secret,
                     algorithms=["HS256"],
-                    audience=settings.jwt_audience or None,
+                    audience=audiences or None,
                     issuer=settings.jwt_issuer or None,
                     options=options,
                 )
@@ -126,7 +134,7 @@ class JwtVerifier:
                     token,
                     self._signing_key(token),
                     algorithms=["RS256", "ES256", "RS384", "ES384", "RS512"],
-                    audience=settings.jwt_audience or None,
+                    audience=audiences or None,
                     issuer=settings.jwt_issuer or None,
                     options=options,
                 )

@@ -585,7 +585,8 @@ def test_admin_jwt_claim_and_value_must_be_configured_together(context):
 
 
 def test_admin_ui_rejects_unsupported_or_unauthorized_identity_setup():
-    with pytest.raises(ValueError, match="stack-created demo Cognito"):
+    # BYO issuer needs the SPA's public client id from the corporate IdP.
+    with pytest.raises(ValueError, match="public OAuth client id"):
         _template(
             {
                 "manage_invocation_logging": True,
@@ -593,6 +594,21 @@ def test_admin_ui_rejects_unsupported_or_unauthorized_identity_setup():
                 "jwt_issuer": "https://idp.example.com",
                 "admin_jwt_claim": "groups",
                 "admin_jwt_value": "quota-admins",
+            }
+        )
+    # ...and that client id is meaningless without the BYO UI.
+    with pytest.raises(ValueError, match="applies only when"):
+        _template(
+            {
+                "manage_invocation_logging": True,
+                "admin_ui_client_id": "spa-client",
+            }
+        )
+    with pytest.raises(ValueError, match="HTTPS origins"):
+        _template(
+            {
+                "manage_invocation_logging": True,
+                "admin_ui_connect_origins": ["http://plain.example.com"],
             }
         )
     with pytest.raises(ValueError, match="browser never receives"):
@@ -1014,9 +1030,12 @@ def test_admin_runtime_config_security_headers_and_cors_have_no_secrets_or_cycle
     resources = template.to_json()["Resources"]
     runtime_config = resources["AdminUiRuntimeConfigFB2880AD"]
     runtime_config_json = json.dumps(runtime_config["Properties"])
-    assert "cognitoDomain" in runtime_config_json
-    assert "amazoncognito.com" in runtime_config_json
-    assert "cognitoIssuer" in runtime_config_json
+    assert "issuer" in runtime_config_json
+    assert "clientId" in runtime_config_json
+    assert "identityPoolId" in runtime_config_json
+    # Obsolete keys from the Cognito-coupled UI must not come back.
+    assert "cognitoDomain" not in runtime_config_json
+    assert "userPoolId" not in runtime_config_json
     assert "AdminKey" not in runtime_config_json
     assert "EmergencyKey" not in runtime_config_json
     assert "SecretArn" not in runtime_config_json
@@ -1044,6 +1063,8 @@ def test_admin_runtime_config_security_headers_and_cors_have_no_secrets_or_cycle
     assert "frame-ancestors 'none'" in csp
     assert "https://*.lambda-url.us-east-1.on.aws" in csp
     assert "cognito-identity.us-east-1." in csp
+    # The SPA fetches the OIDC discovery document from the pool issuer.
+    assert "cognito-idp.us-east-1." in csp
     assert "amazoncognito.com" in csp
     assert "GatewayFnFunctionUrl" not in csp
     csp_parts = security["ContentSecurityPolicy"]["ContentSecurityPolicy"][
@@ -1469,3 +1490,112 @@ def test_gateway_local_bundling_falls_back_without_any_host_pip(
     bundler = stack_module.GatewayLocalBundling(str(tmp_path))
 
     assert bundler.try_bundle(str(tmp_path / "out"), image=None) is False
+
+
+def test_admin_ui_with_byo_issuer_federates_through_an_oidc_provider():
+    """admin_ui=true + jwt_issuer: UI hosting, Identity Pool, and config.js
+    are wired to the corporate IdP instead of a demo Cognito pool."""
+    template = _template(
+        {
+            "manage_invocation_logging": True,
+            "admin_ui": True,
+            "jwt_issuer": "https://idp.example.com",
+            "jwt_audience": "data-plane-client",
+            "admin_ui_client_id": "spa-client",
+            "admin_ui_connect_origins": ["https://login.example.com"],
+            "admin_jwt_claim": "groups",
+            "admin_jwt_value": "quota-admins",
+            "auto_provision_users": False,
+        }
+    )
+    # No demo pool; the Identity Pool trusts the IAM OIDC provider instead.
+    assert template.find_resources("AWS::Cognito::UserPool") == {}
+    template.resource_count_is("Custom::AWSCDKOpenIdConnectProvider", 1)
+    provider = next(
+        iter(
+            template.find_resources(
+                "Custom::AWSCDKOpenIdConnectProvider"
+            ).values()
+        )
+    )
+    assert provider["Properties"]["Url"] == "https://idp.example.com"
+    assert provider["Properties"]["ClientIDList"] == ["spa-client"]
+    identity_pool = next(
+        iter(template.find_resources("AWS::Cognito::IdentityPool").values())
+    )
+    assert identity_pool["Properties"].get("CognitoIdentityProviders") in (
+        None,
+        [],
+    )
+    assert identity_pool["Properties"]["OpenIdConnectProviderARNs"]
+
+    resources = template.to_json()["Resources"]
+    runtime_config_json = json.dumps(
+        resources["AdminUiRuntimeConfigFB2880AD"]["Properties"]
+    )
+    assert "https://idp.example.com" in runtime_config_json
+    assert "spa-client" in runtime_config_json
+    assert "issuer" in runtime_config_json
+    assert "cognitoDomain" not in runtime_config_json
+
+    # CSP allows the issuer origin and the extra token-endpoint origin, and
+    # keeps the demo-only Cognito hosts out.
+    policy = next(
+        iter(
+            template.find_resources(
+                "AWS::CloudFront::ResponseHeadersPolicy"
+            ).values()
+        )
+    )
+    csp = json.dumps(
+        policy["Properties"]["ResponseHeadersPolicyConfig"][
+            "SecurityHeadersConfig"
+        ]["ContentSecurityPolicy"]
+    )
+    assert "https://idp.example.com" in csp
+    assert "https://login.example.com" in csp
+    assert "amazoncognito.com" not in csp
+    assert "cognito-identity.us-east-1." in csp
+
+    # The broker accepts both the data-plane and the SPA audiences.
+    broker = next(
+        env
+        for resource in template.find_resources("AWS::Lambda::Function").values()
+        if (env := resource["Properties"].get("Environment", {}).get("Variables", {}))
+        and "JWT_AUDIENCE" in env
+    )
+    assert broker["JWT_AUDIENCE"] == "data-plane-client,spa-client"
+
+    # The callback URL to register in the IdP is surfaced as an output.
+    outputs = template.to_json()["Outputs"]
+    assert "AdminUiCallbackUrl" in outputs
+
+
+def test_admin_ui_byo_issuer_defaults_spa_client_to_the_shared_audience():
+    template = _template(
+        {
+            "manage_invocation_logging": True,
+            "admin_ui": True,
+            "jwt_issuer": "https://idp.example.com",
+            "jwt_audience": "shared-client",
+            "admin_jwt_claim": "groups",
+            "admin_jwt_value": "quota-admins",
+            "auto_provision_users": False,
+        }
+    )
+    provider = next(
+        iter(
+            template.find_resources(
+                "Custom::AWSCDKOpenIdConnectProvider"
+            ).values()
+        )
+    )
+    assert provider["Properties"]["ClientIDList"] == ["shared-client"]
+    broker = next(
+        env
+        for resource in template.find_resources("AWS::Lambda::Function").values()
+        if (env := resource["Properties"].get("Environment", {}).get("Variables", {}))
+        and "JWT_AUDIENCE" in env
+    )
+    # Same client for data plane and UI: no duplicate audience entry.
+    assert broker["JWT_AUDIENCE"] == "shared-client"

@@ -79,12 +79,99 @@ interface IdTokenClaims {
   exp?: number;
   iss?: string;
   nonce?: string;
+  preferred_username?: string;
   sub?: string;
   token_use?: string;
   "cognito:username"?: string;
 }
 
+/** Endpoints resolved from the issuer's OIDC discovery document. */
+export interface ProviderMetadata {
+  authorizationEndpoint: string;
+  tokenEndpoint: string;
+  endSessionEndpoint?: string;
+}
+
 const callbackExchanges = new Map<string, Promise<Session>>();
+const providerMetadataCache = new Map<string, Promise<ProviderMetadata>>();
+
+/** Test hook: discovery is cached per issuer for the lifetime of the page. */
+export function resetProviderMetadataCache(): void {
+  providerMetadataCache.clear();
+}
+
+function normalizedIssuer(value: string): string {
+  return value.replace(/\/+$/, "");
+}
+
+function httpsEndpoint(value: unknown, name: string): string {
+  if (typeof value !== "string" || !value) {
+    throw new Error(`The discovery document does not contain a valid ${name}.`);
+  }
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`The discovery document does not contain a valid ${name}.`);
+  }
+  if (url.protocol !== "https:" || url.username || url.password) {
+    throw new Error(`The discovery document does not contain a valid ${name}.`);
+  }
+  return url.toString();
+}
+
+async function fetchProviderMetadata(
+  cfg: AdminConfig,
+  deps: AuthDependencies,
+): Promise<ProviderMetadata> {
+  const url = `${normalizedIssuer(cfg.issuer)}/.well-known/openid-configuration`;
+  const response = await deps.fetch(url);
+  if (!response.ok) {
+    throw new Error(`OIDC discovery failed (${response.status}).`);
+  }
+  let document: unknown;
+  try {
+    document = await response.json();
+  } catch {
+    throw new Error("The identity provider returned an invalid discovery document.");
+  }
+  const record = (document ?? {}) as Record<string, unknown>;
+  if (
+    typeof record.issuer !== "string" ||
+    normalizedIssuer(record.issuer) !== normalizedIssuer(cfg.issuer)
+  ) {
+    throw new Error("The discovery document issuer does not match this deployment.");
+  }
+  const metadata: ProviderMetadata = {
+    authorizationEndpoint: httpsEndpoint(
+      record.authorization_endpoint,
+      "authorization_endpoint",
+    ),
+    tokenEndpoint: httpsEndpoint(record.token_endpoint, "token_endpoint"),
+  };
+  if (record.end_session_endpoint !== undefined) {
+    metadata.endSessionEndpoint = httpsEndpoint(
+      record.end_session_endpoint,
+      "end_session_endpoint",
+    );
+  }
+  return metadata;
+}
+
+function providerMetadata(
+  cfg: AdminConfig,
+  deps: AuthDependencies,
+): Promise<ProviderMetadata> {
+  const key = normalizedIssuer(cfg.issuer);
+  const cached = providerMetadataCache.get(key);
+  if (cached) return cached;
+  const pending = fetchProviderMetadata(cfg, deps).catch((error) => {
+    providerMetadataCache.delete(key);
+    throw error;
+  });
+  providerMetadataCache.set(key, pending);
+  return pending;
+}
 
 function dependencies(overrides: AuthDependencyOverrides = {}): AuthDependencies {
   return {
@@ -95,7 +182,9 @@ function dependencies(overrides: AuthDependencyOverrides = {}): AuthDependencies
     navigate: (url) => window.location.assign(url),
     replaceUrl: (url) => window.history.replaceState({}, document.title, url),
     createCredentialsProvider: (cfg, idToken) => {
-      const loginKey = cfg.cognitoIssuer.replace(/^https:\/\//, "");
+      // Identity Pool login key: the provider URL without the scheme. This
+      // matches both Cognito User Pools and IAM OIDC providers.
+      const loginKey = cfg.issuer.replace(/^https:\/\//, "");
       return fromCognitoIdentityPool({
         clientConfig: { region: cfg.region },
         identityPoolId: cfg.identityPoolId,
@@ -135,15 +224,12 @@ function logoutUri(origin: string): string {
   return new URL("/", `${origin}/`).toString();
 }
 
-function expectedIssuer(cfg: AdminConfig): string {
-  return cfg.cognitoIssuer;
-}
-
 export async function createAuthorizationRequest(
   cfg: AdminConfig,
   overrides: AuthDependencyOverrides = {},
 ): Promise<AuthorizationRequest> {
   const deps = dependencies(overrides);
+  const metadata = await providerMetadata(cfg, deps);
   const verifier = randomValue(deps.crypto);
   const state = randomValue(deps.crypto);
   const nonce = randomValue(deps.crypto);
@@ -152,17 +238,20 @@ export async function createAuthorizationRequest(
     new TextEncoder().encode(verifier),
   );
   const redirectUri = callbackUri(deps.origin);
-  const url = new URL("/oauth2/authorize", `${cfg.cognitoDomain}/`);
-  url.search = new URLSearchParams({
-    client_id: cfg.userPoolClientId,
+  // Append to the discovered endpoint: some providers carry fixed query
+  // parameters on their authorization_endpoint.
+  const url = new URL(metadata.authorizationEndpoint);
+  const parameters = new URLSearchParams({
+    client_id: cfg.clientId,
     response_type: "code",
-    scope: "openid email profile",
+    scope: cfg.scopes,
     redirect_uri: redirectUri,
     code_challenge_method: "S256",
     code_challenge: base64Url(new Uint8Array(digest)),
     state,
     nonce,
-  }).toString();
+  });
+  for (const [key, value] of parameters) url.searchParams.set(key, value);
   return {
     url: url.toString(),
     pending: {
@@ -245,19 +334,21 @@ function sanitizeOAuthErrorText(value: string | null, maxLength = 512): string {
 
 function decodeIdToken(idToken: string): IdTokenClaims {
   const parts = idToken.split(".");
-  if (parts.length !== 3) throw new Error("Cognito returned an invalid ID token.");
+  if (parts.length !== 3) {
+    throw new Error("The identity provider returned an invalid ID token.");
+  }
   try {
     const encoded = parts[1].replace(/-/g, "+").replace(/_/g, "/");
     const padded = encoded.padEnd(Math.ceil(encoded.length / 4) * 4, "=");
     return JSON.parse(atob(padded)) as IdTokenClaims;
   } catch {
-    throw new Error("Cognito returned an invalid ID token.");
+    throw new Error("The identity provider returned an invalid ID token.");
   }
 }
 
 /**
  * Checks callback-bound claims before the token is used by the UI. Signature
- * verification remains at Cognito Identity Pool and the gateway JWT verifier.
+ * verification remains at the Identity Pool and the gateway JWT verifier.
  */
 export function validateIdToken(
   idToken: string,
@@ -266,11 +357,14 @@ export function validateIdToken(
   expectedNonce?: string,
 ): IdTokenClaims {
   const claims = decodeIdToken(idToken);
-  if (claims.iss !== expectedIssuer(cfg)) {
+  if (
+    typeof claims.iss !== "string" ||
+    normalizedIssuer(claims.iss) !== normalizedIssuer(cfg.issuer)
+  ) {
     throw new Error("The ID token issuer does not match this deployment.");
   }
   const audiences = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
-  if (!audiences.includes(cfg.userPoolClientId)) {
+  if (!audiences.includes(cfg.clientId)) {
     throw new Error("The ID token audience does not match this application.");
   }
   if (typeof claims.exp !== "number" || claims.exp * 1000 <= now) {
@@ -279,8 +373,9 @@ export function validateIdToken(
   if (expectedNonce !== undefined && claims.nonce !== expectedNonce) {
     throw new Error("The ID token nonce does not match the sign-in request.");
   }
+  // Cognito-specific claim; other providers omit it.
   if (claims.token_use !== undefined && claims.token_use !== "id") {
-    throw new Error("Cognito did not return an ID token.");
+    throw new Error("The identity provider did not return an ID token.");
   }
   return claims;
 }
@@ -290,24 +385,25 @@ async function tokenRequest(
   body: URLSearchParams,
   deps: AuthDependencies,
 ): Promise<TokenResponse> {
-  const response = await deps.fetch(`${cfg.cognitoDomain}/oauth2/token`, {
+  const metadata = await providerMetadata(cfg, deps);
+  const response = await deps.fetch(metadata.tokenEndpoint, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body,
   });
   if (!response.ok) {
-    throw new Error(`Cognito token exchange failed (${response.status}).`);
+    throw new Error(`The token exchange failed (${response.status}).`);
   }
   try {
     return await response.json() as TokenResponse;
   } catch {
-    throw new Error("Cognito returned an invalid token response.");
+    throw new Error("The identity provider returned an invalid token response.");
   }
 }
 
 function requiredIdToken(response: TokenResponse): string {
   if (typeof response.id_token !== "string" || !response.id_token) {
-    throw new Error("Cognito did not return an ID token.");
+    throw new Error("The identity provider did not return an ID token.");
   }
   return response.id_token;
 }
@@ -332,7 +428,7 @@ async function exchangeAuthorizationCode(
       cfg,
       new URLSearchParams({
         grant_type: "authorization_code",
-        client_id: cfg.userPoolClientId,
+        client_id: cfg.clientId,
         code,
         redirect_uri: pending.redirectUri,
         code_verifier: pending.verifier,
@@ -379,8 +475,8 @@ export async function handleAuthCallback(
     const description = sanitizeOAuthErrorText(url.searchParams.get("error_description"));
     const errorCode = sanitizeOAuthErrorText(oauthError, 128);
     throw new Error(description || (errorCode
-      ? `Cognito sign-in failed (${errorCode}).`
-      : "Cognito sign-in failed."));
+      ? `Sign-in failed (${errorCode}).`
+      : "Sign-in failed."));
   }
   if (!returnedState) {
     deps.storage.removeItem(PKCE_STORAGE_KEY);
@@ -434,7 +530,11 @@ class ManagedSession implements Session {
     private readonly deps: AuthDependencies,
   ) {
     this.tokens = tokens;
-    this.email = claims.email || claims["cognito:username"] || claims.sub || "Administrator";
+    this.email = claims.email
+      || claims.preferred_username
+      || claims["cognito:username"]
+      || claims.sub
+      || "Administrator";
   }
 
   async authorization(): Promise<AuthorizationContext> {
@@ -466,7 +566,7 @@ class ManagedSession implements Session {
         this.cfg,
         new URLSearchParams({
           grant_type: "refresh_token",
-          client_id: this.cfg.userPoolClientId,
+          client_id: this.cfg.clientId,
           refresh_token: refreshToken,
         }),
         this.deps,
@@ -530,14 +630,36 @@ class ManagedSession implements Session {
   }
 
   logout(): void {
+    const idToken = this.tokens?.idToken;
     this.clearLocalState();
     this.deps.storage.removeItem(PKCE_STORAGE_KEY);
-    const url = new URL("/logout", `${this.cfg.cognitoDomain}/`);
-    url.search = new URLSearchParams({
-      client_id: this.cfg.userPoolClientId,
-      logout_uri: logoutUri(this.deps.origin),
-    }).toString();
-    this.deps.navigate(url.toString());
+    void this.redirectThroughProviderLogout(idToken);
+  }
+
+  private async redirectThroughProviderLogout(
+    idToken: string | undefined,
+  ): Promise<void> {
+    const localUri = logoutUri(this.deps.origin);
+    try {
+      const metadata = await providerMetadata(this.cfg, this.deps);
+      if (!metadata.endSessionEndpoint) {
+        // No RP-initiated logout: the local session is already cleared.
+        this.deps.navigate(localUri);
+        return;
+      }
+      const url = new URL(metadata.endSessionEndpoint);
+      // Send the OIDC-standard and the Cognito parameter names together;
+      // each provider honors its own and ignores the other (verified
+      // against Cognito's /logout, which requires logout_uri and tolerates
+      // the standard names).
+      url.searchParams.set("client_id", this.cfg.clientId);
+      url.searchParams.set("logout_uri", localUri);
+      url.searchParams.set("post_logout_redirect_uri", localUri);
+      if (idToken) url.searchParams.set("id_token_hint", idToken);
+      this.deps.navigate(url.toString());
+    } catch {
+      this.deps.navigate(localUri);
+    }
   }
 
   private clearLocalState(): void {

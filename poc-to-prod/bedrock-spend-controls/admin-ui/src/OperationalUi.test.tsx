@@ -10,11 +10,10 @@ import type { Session } from "./auth";
 const cfg: AdminConfig = {
   gatewayUrl: "https://gateway.example.test",
   region: "us-east-1",
-  userPoolId: "us-east-1_pool",
-  userPoolClientId: "client",
+  issuer: "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_pool",
+  clientId: "client",
   identityPoolId: "us-east-1:identity",
-  cognitoDomain: "https://login.example.test",
-  cognitoIssuer: "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_pool",
+  scopes: "openid email profile",
 };
 
 const session: Session = {
