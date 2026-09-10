@@ -16,6 +16,7 @@ import pytest
 from boto3.dynamodb.types import TypeDeserializer
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "quota_periods_layer" / "python"))
 sys.path.insert(0, str(ROOT / "gateway"))
 sys.path.insert(0, str(ROOT / "usage_processor"))
 

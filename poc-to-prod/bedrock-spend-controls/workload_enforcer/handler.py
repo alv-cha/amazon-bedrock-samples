@@ -24,6 +24,12 @@ from urllib.parse import unquote
 
 import boto3
 from botocore.exceptions import ClientError
+from bedrock_spend_controls.quota_periods import (
+    aggregate_daily_rows,
+    calendar_windows,
+    evaluate_limits,
+    limits_from_item,
+)
 
 BEDROCK_ACTIONS = (
     "bedrock:CountTokens",
@@ -131,28 +137,25 @@ def _automatic_owned(item: dict) -> bool:
     )
 
 
-def _current_window(now: datetime) -> str:
-    return now.strftime("%Y-%m-%d")
-
-
-def _over_budget(usage_table, item: dict, window: str) -> bool:
-    usage = (
-        usage_table.get_item(
-            Key={"user_id": str(item["user_id"]), "window": window},
-            ConsistentRead=True,
-        ).get("Item")
-        or {}
+def _over_budget(usage_table, item: dict, now: datetime) -> bool:
+    windows = calendar_windows(now)
+    start = min(window.start for window in windows.values()).date().isoformat()
+    end = windows["daily"].start.date().isoformat()
+    response = usage_table.query(
+        KeyConditionExpression=(
+            "user_id = :user_id AND #window BETWEEN :start AND :end"
+        ),
+        ExpressionAttributeNames={"#window": "window"},
+        ExpressionAttributeValues={
+            ":user_id": str(item["user_id"]),
+            ":start": start,
+            ":end": end,
+        },
+        ConsistentRead=True,
     )
-    pairs = (
-        ("daily_usd_micro", "cost_micro"),
-        ("daily_input_tokens", "input_tokens"),
-        ("daily_output_tokens", "output_tokens"),
-    )
-    for limit_key, usage_key in pairs:
-        limit = int(item.get(limit_key, 0) or 0)
-        if limit and int(usage.get(usage_key, 0) or 0) >= limit:
-            return True
-    return False
+    rows = list(response.get("Items", []))
+    usage = aggregate_daily_rows(rows, now)
+    return evaluate_limits(limits_from_item(item), usage, now).over_budget
 
 
 def _set_active(users_table, item: dict) -> bool:
@@ -178,7 +181,7 @@ def _set_active(users_table, item: dict) -> bool:
             ExpressionAttributeValues={
                 ":active": "active",
                 ":blocked": "blocked",
-                ":reason": "auto: current window is under quota",
+                ":reason": "auto: current calendar periods are under quota",
                 ":origin": "automatic",
                 ":now": now,
                 ":observed_version": int(item.get("version", 0) or 0),
@@ -261,7 +264,7 @@ def handler(event, context, *, dynamodb=None, iam=None, sns=None) -> dict:
     )
     users_table = dynamodb.Table(os.environ["USERS_TABLE"])
     usage_table = dynamodb.Table(os.environ["USAGE_TABLE"])
-    window = _current_window(datetime.now(timezone.utc))
+    now = datetime.now(timezone.utc)
 
     result: dict = {
         "enforced": True,
@@ -284,7 +287,7 @@ def handler(event, context, *, dynamodb=None, iam=None, sns=None) -> dict:
             item is not None
             and status == "blocked"
             and _automatic_owned(item)
-            and not _over_budget(usage_table, item, window)
+            and not _over_budget(usage_table, item, now)
         ):
             if _set_active(users_table, item):
                 status = "active"

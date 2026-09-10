@@ -163,10 +163,18 @@ export async function transport<T>(
 
 export type UserStatus = "active" | "blocked";
 
+export type QuotaPeriod = "daily" | "weekly" | "monthly";
+
+export interface PeriodLimits {
+  usd: number;
+  input_tokens: number;
+  output_tokens: number;
+}
+
 export interface QuotaLimits {
-  daily_usd: number;
-  daily_input_tokens: number;
-  daily_output_tokens: number;
+  daily: PeriodLimits | null;
+  weekly: PeriodLimits | null;
+  monthly: PeriodLimits | null;
 }
 
 export interface UsageTotals {
@@ -175,6 +183,16 @@ export interface UsageTotals {
   output_tokens: number;
   requests: number;
 }
+
+export interface PeriodUsage extends UsageTotals {
+  period: QuotaPeriod;
+  window: string;
+  window_start: string;
+  window_end: string;
+  resets_at: string;
+}
+
+export type CurrentUsage = Record<QuotaPeriod, PeriodUsage>;
 
 export interface LeaseState {
   active: boolean;
@@ -202,10 +220,16 @@ export interface AdminUser {
 
 export interface UserRow extends AdminUser {
   today: UsageTotals;
+  current_usage: CurrentUsage;
 }
 
 export interface UserListResponse {
   users: UserRow[];
+  next_cursor: string | null;
+}
+
+export interface AdminUserListResponse {
+  users: AdminUser[];
   next_cursor: string | null;
 }
 
@@ -217,9 +241,10 @@ export interface ListUsersOptions {
   granularity?: "user" | "workload";
 }
 
-export interface CreateUserRequest extends QuotaLimits {
+export interface CreateUserRequest {
   user_id: string;
   name: string;
+  limits: QuotaLimits;
 }
 
 export interface CreateUserResponse {
@@ -231,14 +256,15 @@ export interface CreateUserResponse {
 
 export interface UserDetailResponse {
   user: AdminUser;
+  current_usage: CurrentUsage;
 }
 
-export interface UsageHistoryRow extends UsageTotals {
+export interface UsageHistoryRow extends PeriodUsage {
   user_id: string;
-  window: string;
 }
 
 export interface UsageHistoryOptions {
+  period?: QuotaPeriod;
   start?: string;
   end?: string;
   limit?: number;
@@ -247,16 +273,23 @@ export interface UsageHistoryOptions {
 
 export interface UsageHistoryResponse {
   user_id: string;
+  period: QuotaPeriod;
   start: string;
   end: string;
   usage: UsageHistoryRow[];
   next_cursor: string | null;
 }
 
+export interface AuditPeriodLimits {
+  usd_micro: number;
+  input_tokens: number;
+  output_tokens: number;
+}
+
 export interface AuditSnapshotLimits {
-  daily_usd_micro: number;
-  daily_input_tokens: number;
-  daily_output_tokens: number;
+  daily: AuditPeriodLimits | null;
+  weekly: AuditPeriodLimits | null;
+  monthly: AuditPeriodLimits | null;
 }
 
 export interface AuditUserSnapshot {
@@ -378,8 +411,35 @@ export interface Operations {
   cloudwatch: { status: string; error_code?: string };
 }
 
-export interface SetLimitsRequest extends QuotaLimits {
+
+export interface SetLimitsRequest {
+  limits: QuotaLimits;
   reason?: string;
+}
+
+export interface EnforcementConfig {
+  permission_lease_seconds: number;
+  source: string;
+  generation: number;
+  actor: string;
+  reason: string;
+  updated_at: string | null;
+  valid_permission_lease_seconds?: number[];
+  default_permission_lease_seconds?: number;
+}
+
+export type EmergencyAction = "activate" | "recover";
+
+// The raw CONFIG#EMERGENCY_STOP state returned by POST /admin/emergency-stop.
+// Convergence bookkeeping (applied_* / converged) is computed by the
+// operations endpoint and is not part of this acknowledgement.
+export interface EmergencyStopState {
+  state: string;
+  desired_active: boolean;
+  generation: number;
+  requested_at?: string | null;
+  idempotent?: boolean;
+  retry?: boolean;
 }
 
 export interface SetLimitsResponse {
@@ -441,11 +501,35 @@ function isUsageTotals(value: unknown): value is UsageTotals {
     isNonNegativeInteger(value.requests);
 }
 
+function isPeriodLimits(value: unknown): value is PeriodLimits {
+  return isObject(value) &&
+    isNonNegativeNumber(value.usd) &&
+    isNonNegativeInteger(value.input_tokens) &&
+    isNonNegativeInteger(value.output_tokens);
+}
+
 function isQuotaLimits(value: unknown): value is QuotaLimits {
   return isObject(value) &&
-    isNonNegativeNumber(value.daily_usd) &&
-    isNonNegativeInteger(value.daily_input_tokens) &&
-    isNonNegativeInteger(value.daily_output_tokens);
+    (value.daily === null || isPeriodLimits(value.daily)) &&
+    (value.weekly === null || isPeriodLimits(value.weekly)) &&
+    (value.monthly === null || isPeriodLimits(value.monthly));
+}
+
+function isPeriodUsage(value: unknown): value is PeriodUsage {
+  return isObject(value) &&
+    (value.period === "daily" || value.period === "weekly" || value.period === "monthly") &&
+    hasString(value, "window") &&
+    hasString(value, "window_start") &&
+    hasString(value, "window_end") &&
+    hasString(value, "resets_at") &&
+    isUsageTotals(value);
+}
+
+function isCurrentUsage(value: unknown): value is CurrentUsage {
+  return isObject(value) &&
+    isPeriodUsage(value.daily) && value.daily.period === "daily" &&
+    isPeriodUsage(value.weekly) && value.weekly.period === "weekly" &&
+    isPeriodUsage(value.monthly) && value.monthly.period === "monthly";
 }
 
 export function isAdminUser(value: unknown): value is AdminUser {
@@ -474,12 +558,19 @@ function isNullableLeaseState(value: unknown): value is LeaseState | null | unde
 }
 
 function isUserRow(value: unknown): value is UserRow {
-  return isAdminUser(value) && isObject(value) && isUsageTotals(value.today);
+  return isAdminUser(value) && isObject(value) && isUsageTotals(value.today) &&
+    isCurrentUsage(value.current_usage);
 }
 
 function isUserListResponse(value: unknown): value is UserListResponse {
   return isObject(value) &&
     Array.isArray(value.users) && value.users.every(isUserRow) &&
+    (value.next_cursor === null || typeof value.next_cursor === "string");
+}
+
+function isAdminUserListResponse(value: unknown): value is AdminUserListResponse {
+  return isObject(value) &&
+    Array.isArray(value.users) && value.users.every(isAdminUser) &&
     (value.next_cursor === null || typeof value.next_cursor === "string");
 }
 
@@ -490,7 +581,8 @@ function isCreateUserResponse(value: unknown): value is CreateUserResponse {
 }
 
 function isUserDetailResponse(value: unknown): value is UserDetailResponse {
-  return isObject(value) && isAdminUser(value.user);
+  return isObject(value) && isAdminUser(value.user) &&
+    isCurrentUsage(value.current_usage);
 }
 
 function isIsoDate(value: unknown): value is string {
@@ -499,21 +591,31 @@ function isIsoDate(value: unknown): value is string {
 
 function isUsageHistoryRow(value: unknown): value is UsageHistoryRow {
   return isObject(value) && hasString(value, "user_id") &&
-    isIsoDate(value.window) && isUsageTotals(value);
+    isIsoDate(value.window) && isPeriodUsage(value);
 }
 
 function isUsageHistoryResponse(value: unknown): value is UsageHistoryResponse {
   return isObject(value) && hasString(value, "user_id") &&
+    (value.period === "daily" || value.period === "weekly" || value.period === "monthly") &&
     isIsoDate(value.start) && isIsoDate(value.end) &&
-    Array.isArray(value.usage) && value.usage.every(isUsageHistoryRow) &&
+    Array.isArray(value.usage) && value.usage.every((row) =>
+      isUsageHistoryRow(row) && row.period === value.period
+    ) &&
     (value.next_cursor === null || typeof value.next_cursor === "string");
+}
+
+function isAuditPeriodLimits(value: unknown): value is AuditPeriodLimits {
+  return isObject(value) &&
+    isNonNegativeInteger(value.usd_micro) &&
+    isNonNegativeInteger(value.input_tokens) &&
+    isNonNegativeInteger(value.output_tokens);
 }
 
 function isAuditSnapshotLimits(value: unknown): value is AuditSnapshotLimits {
   return isObject(value) &&
-    isNonNegativeInteger(value.daily_usd_micro) &&
-    isNonNegativeInteger(value.daily_input_tokens) &&
-    isNonNegativeInteger(value.daily_output_tokens);
+    (value.daily === null || isAuditPeriodLimits(value.daily)) &&
+    (value.weekly === null || isAuditPeriodLimits(value.weekly)) &&
+    (value.monthly === null || isAuditPeriodLimits(value.monthly));
 }
 
 function isAuditUserSnapshot(value: unknown): value is AuditUserSnapshot {
@@ -609,16 +711,54 @@ function isSetStatusResponse(value: unknown): value is SetStatusResponse {
     hasString(value, "reason") && isAdminUser(value.user);
 }
 
-export function normalizeDailyUsd(value: number): number {
+function isEnforcementConfig(value: unknown): value is EnforcementConfig {
+  return isObject(value) &&
+    isNonNegativeInteger(value.permission_lease_seconds) &&
+    hasString(value, "source") &&
+    isNonNegativeInteger(value.generation) &&
+    hasString(value, "actor") &&
+    hasString(value, "reason") &&
+    hasNullableString(value, "updated_at") &&
+    (value.valid_permission_lease_seconds === undefined ||
+      (Array.isArray(value.valid_permission_lease_seconds) &&
+        value.valid_permission_lease_seconds.every(isNonNegativeInteger))) &&
+    (value.default_permission_lease_seconds === undefined ||
+      isNonNegativeInteger(value.default_permission_lease_seconds));
+}
+
+function isEmergencyStopState(value: unknown): value is EmergencyStopState {
+  return isObject(value) &&
+    hasString(value, "state") &&
+    hasBoolean(value, "desired_active") &&
+    hasNumber(value, "generation");
+}
+
+export function normalizeUsd(value: number): number {
   let micro = Math.round(value * 1_000_000);
   if (value > 0 && micro === 0) micro = 1;
   return micro / 1_000_000;
 }
 
+function normalizeLimits(limits: QuotaLimits): QuotaLimits {
+  return Object.fromEntries(
+    (["daily", "weekly", "monthly"] as const).map((period) => [
+      period,
+      limits[period] === null
+        ? null
+        : { ...limits[period], usd: normalizeUsd(limits[period].usd) },
+    ]),
+  ) as unknown as QuotaLimits;
+}
+
 function sameLimits(left: QuotaLimits, right: QuotaLimits): boolean {
-  return left.daily_usd === right.daily_usd &&
-    left.daily_input_tokens === right.daily_input_tokens &&
-    left.daily_output_tokens === right.daily_output_tokens;
+  return (["daily", "weekly", "monthly"] as const).every((period) => {
+    const a = left[period];
+    const b = right[period];
+    if (a === null || b === null) return a === b;
+    return a.usd === b.usd &&
+      a.input_tokens === b.input_tokens &&
+      a.output_tokens === b.output_tokens;
+  });
 }
 
 function mutationHeaders(user: AdminUser): Record<string, string> {
@@ -652,6 +792,56 @@ export const api = {
   operations: async (cfg: AdminConfig, session: Session): Promise<Operations> =>
     (await transport<Operations>(cfg, session, "GET", "/admin/operations", { validate: isOperations })).data,
 
+  getEnforcement: async (cfg: AdminConfig, session: Session): Promise<EnforcementConfig> =>
+    (await transport<EnforcementConfig>(cfg, session, "GET", "/admin/enforcement", {
+      validate: isEnforcementConfig,
+    })).data,
+
+  setEnforcement: async (
+    cfg: AdminConfig,
+    session: Session,
+    permissionLeaseSeconds: number,
+    reason?: string,
+    expectedGeneration = 0,
+  ): Promise<EnforcementConfig> => {
+    const trimmedReason = reason?.trim();
+    return (await transport<EnforcementConfig>(cfg, session, "PUT", "/admin/enforcement", {
+      body: {
+        permission_lease_seconds: permissionLeaseSeconds,
+        ...(trimmedReason ? { reason: trimmedReason } : {}),
+      },
+      headers: {
+        "Idempotency-Key": globalThis.crypto.randomUUID(),
+        "If-Match": `"${expectedGeneration}"`,
+      },
+      validate: (value): value is EnforcementConfig =>
+        isEnforcementConfig(value) &&
+        value.permission_lease_seconds === permissionLeaseSeconds,
+    })).data;
+  },
+
+  // The break-glass key is entered by the operator at action time and is only
+  // held in memory for this single request; it is never persisted by the UI.
+  setEmergencyStop: async (
+    cfg: AdminConfig,
+    session: Session,
+    request: {
+      action: EmergencyAction;
+      confirmation: string;
+      reason: string;
+      emergencyKey: string;
+    },
+  ): Promise<EmergencyStopState> =>
+    (await transport<EmergencyStopState>(cfg, session, "POST", "/admin/emergency-stop", {
+      body: {
+        action: request.action,
+        confirmation: request.confirmation,
+        reason: request.reason.trim(),
+      },
+      headers: { "X-Quota-Emergency-Key": request.emergencyKey },
+      validate: isEmergencyStopState,
+    })).data,
+
   listUsersPage: async (
     cfg: AdminConfig,
     session: Session,
@@ -671,13 +861,13 @@ export const api = {
     )).data;
   },
 
-  leaseSnapshot: async (cfg: AdminConfig, session: Session): Promise<UserListResponse> =>
-    (await transport<UserListResponse>(
+  leaseSnapshot: async (cfg: AdminConfig, session: Session): Promise<AdminUserListResponse> =>
+    (await transport<AdminUserListResponse>(
       cfg,
       session,
       "GET",
-      "/admin/users?limit=50",
-      { validate: isUserListResponse },
+      "/admin/users?limit=50&include_usage=false",
+      { validate: isAdminUserListResponse },
     )).data,
 
   createUser: (
@@ -689,7 +879,7 @@ export const api = {
       ...request,
       user_id: request.user_id.trim(),
       name: request.name.trim(),
-      daily_usd: normalizeDailyUsd(request.daily_usd),
+      limits: normalizeLimits(request.limits),
     };
     return transport(cfg, session, "POST", "/admin/users", {
       body,
@@ -700,7 +890,7 @@ export const api = {
         value.user.user_id === body.user_id &&
         value.user.name === body.name &&
         sameLimits(value.limits, value.user.limits) &&
-        sameLimits(value.user.limits, body),
+        sameLimits(value.user.limits, body.limits),
     });
   },
 
@@ -725,6 +915,7 @@ export const api = {
     const params = new URLSearchParams({
       user_id: userId,
       limit: String(options.limit ?? 25),
+      period: options.period ?? "daily",
     });
     if (options.start) params.set("start", options.start);
     if (options.end) params.set("end", options.end);
@@ -737,6 +928,7 @@ export const api = {
       {
         validate: (value): value is UsageHistoryResponse =>
           isUsageHistoryResponse(value) && value.user_id === userId &&
+          value.period === (options.period ?? "daily") &&
           value.usage.every((row) => row.user_id === userId) &&
           (options.start === undefined || value.start === options.start) &&
           (options.end === undefined || value.end === options.end),
@@ -795,11 +987,10 @@ export const api = {
     user: AdminUser,
     limits: SetLimitsRequest,
   ): Promise<TransportResponse<SetLimitsResponse>> => {
-    const { reason, ...quotaLimits } = limits;
+    const { reason, limits: quotaLimits } = limits;
     const trimmedReason = reason?.trim();
     const normalized: SetLimitsRequest = {
-      ...quotaLimits,
-      daily_usd: normalizeDailyUsd(quotaLimits.daily_usd),
+      limits: normalizeLimits(quotaLimits),
       ...(trimmedReason ? { reason: trimmedReason } : {}),
     };
     const params = new URLSearchParams({ user_id: user.user_id });
@@ -812,7 +1003,7 @@ export const api = {
         value.user.user_id === user.user_id &&
         value.user.version > user.version &&
         sameLimits(value.limits, value.user.limits) &&
-        sameLimits(value.user.limits, normalized),
+        sameLimits(value.user.limits, normalized.limits),
     });
   },
 

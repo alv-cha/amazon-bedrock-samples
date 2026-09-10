@@ -142,9 +142,15 @@ def test_admin_cli_create_and_update_include_all_quota_dimensions():
     assert kwargs["json"] == {
         "user_id": "tenant/audit/usage",
         "name": "tenant/audit/usage",
-        "daily_usd": 25.0,
-        "daily_input_tokens": 1_000_000,
-        "daily_output_tokens": 200_000,
+        "limits": {
+            "daily": {
+                "usd": 25.0,
+                "input_tokens": 1_000_000,
+                "output_tokens": 200_000,
+            },
+            "weekly": None,
+            "monthly": None,
+        },
     }
 
     update = _parser().parse_args([
@@ -155,6 +161,11 @@ def test_admin_cli_create_and_update_include_all_quota_dimensions():
         "--daily-input-tokens", "2000000",
         "--daily-output-tokens", "400000",
     ])
+    update.current_limits = {
+        "daily": {"usd": 25, "input_tokens": 1_000_000, "output_tokens": 200_000},
+        "weekly": None,
+        "monthly": None,
+    }
     method, url, kwargs = _admin_request_args(
         update,
         idempotency_key="00000000-0000-4000-8000-000000000011",
@@ -168,9 +179,15 @@ def test_admin_cli_create_and_update_include_all_quota_dimensions():
         "If-Match": '"7"',
     }
     assert kwargs["json"] == {
-        "daily_usd": 30.0,
-        "daily_input_tokens": 2_000_000,
-        "daily_output_tokens": 400_000,
+        "limits": {
+            "daily": {
+                "usd": 30.0,
+                "input_tokens": 2_000_000,
+                "output_tokens": 400_000,
+            },
+            "weekly": None,
+            "monthly": None,
+        },
     }
     assert "reason" not in kwargs["json"]
 
@@ -181,13 +198,22 @@ def test_admin_cli_create_and_update_include_all_quota_dimensions():
         "--daily-usd", "35",
         "--reason", "Annual allocation",
     ])
+    reasoned_update.current_limits = kwargs["json"]["limits"]
     _, _, reasoned_kwargs = _admin_request_args(
         reasoned_update,
         idempotency_key="00000000-0000-4000-8000-000000000012",
         if_match='"8"',
     )
     assert reasoned_kwargs["json"] == {
-        "daily_usd": 35.0,
+        "limits": {
+            "daily": {
+                "usd": 35.0,
+                "input_tokens": 2_000_000,
+                "output_tokens": 400_000,
+            },
+            "weekly": None,
+            "monthly": None,
+        },
         "reason": "Annual allocation",
     }
 
@@ -201,6 +227,7 @@ def test_admin_cli_create_and_update_include_all_quota_dimensions():
     assert (method, url) == ("GET", "https://example.test/admin/user/usage")
     assert usage_kwargs["params"] == {
         "user_id": "team/audit/usage",
+        "period": "daily",
         "window": "2026-09-02",
     }
 
@@ -212,12 +239,49 @@ def test_admin_cli_update_reason_does_not_replace_a_quota_option():
         "update-user", "tenant/audit/usage",
         "--reason", "No quota supplied",
     ])
+    update.current_limits = {
+        "daily": {"usd": 1, "input_tokens": 1, "output_tokens": 1},
+        "weekly": None,
+        "monthly": None,
+    }
 
     with pytest.raises(
         ValueError,
-        match="update-user requires at least one daily quota option",
+        match="update-user requires at least one quota option",
     ):
         _admin_request_args(update, if_match='"7"')
+
+
+def test_admin_cli_supports_optional_weekly_and_monthly_periods():
+    create = _parser().parse_args([
+        "--gateway-url", "https://example.test",
+        "create-user", "tenant/calendar",
+        "--daily-usd", "1",
+        "--daily-input-tokens", "100",
+        "--daily-output-tokens", "50",
+        "--weekly-usd", "5",
+        "--weekly-input-tokens", "500",
+        "--weekly-output-tokens", "250",
+        "--monthly-usd", "20",
+        "--monthly-input-tokens", "2000",
+        "--monthly-output-tokens", "1000",
+    ])
+    _, _, create_kwargs = _admin_request_args(create)
+    assert create_kwargs["json"]["limits"]["weekly"] == {
+        "usd": 5.0,
+        "input_tokens": 500,
+        "output_tokens": 250,
+    }
+    assert create_kwargs["json"]["limits"]["monthly"]["usd"] == 20.0
+
+    update = _parser().parse_args([
+        "--gateway-url", "https://example.test",
+        "update-user", "tenant/calendar", "--disable-monthly",
+    ])
+    update.current_limits = create_kwargs["json"]["limits"]
+    _, _, update_kwargs = _admin_request_args(update, if_match='"1"')
+    assert update_kwargs["json"]["limits"]["monthly"] is None
+    assert update_kwargs["json"]["limits"]["weekly"]["usd"] == 5.0
 
 
 def test_admin_cli_emergency_commands_include_explicit_confirmation():
@@ -276,7 +340,7 @@ def test_versioned_update_fetches_detail_then_sends_etag_and_uuid():
             return _json_response(
                 200,
                 url,
-                {"user": {"user_id": "tenant/audit/usage", "version": 7}},
+                {"user": {"user_id": "tenant/audit/usage", "version": 7, "limits": {"daily": {"usd": 25, "input_tokens": 1_000_000, "output_tokens": 200_000}, "weekly": None, "monthly": None}}},
                 headers={"ETag": '"7"'},
             )
         return _json_response(200, url, {"updated": True})
@@ -294,7 +358,15 @@ def test_versioned_update_fetches_detail_then_sends_etag_and_uuid():
     assert mutation["headers"]["If-Match"] == '"7"'
     UUID(mutation["headers"]["Idempotency-Key"])
     assert mutation["json"] == {
-        "daily_usd": 30.0,
+        "limits": {
+            "daily": {
+                "usd": 30.0,
+                "input_tokens": 1_000_000,
+                "output_tokens": 200_000,
+            },
+            "weekly": None,
+            "monthly": None,
+        },
         "reason": "Reviewed increase",
     }
     assert mutation["admin_key"] == "secret"

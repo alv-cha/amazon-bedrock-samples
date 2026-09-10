@@ -101,9 +101,13 @@ class Settings:
     metrics_namespace: str = field(default_factory=lambda: _env("METRICS_NAMESPACE", "BedrockSpendControls"))
 
     # --- quota defaults applied to newly created users (admin API) ---
-    default_daily_usd: float = field(default_factory=lambda: float(_env("DEFAULT_DAILY_USD", "1.0")))
-    default_daily_input_tokens: int = field(default_factory=lambda: int(_env("DEFAULT_DAILY_INPUT_TOKENS", "1000000")))
-    default_daily_output_tokens: int = field(default_factory=lambda: int(_env("DEFAULT_DAILY_OUTPUT_TOKENS", "200000")))
+    default_limits_json: str = field(
+        default_factory=lambda: _env(
+            "DEFAULT_LIMITS_JSON",
+            '{"daily":{"usd":1.0,"input_tokens":1000000,'
+            '"output_tokens":200000},"weekly":null,"monthly":null}',
+        )
+    )
     # DynamoDB TTL for daily usage rows. Deletion is asynchronous after this
     # timestamp; it is not the quota-window reset mechanism.
     usage_retention_days: int = field(

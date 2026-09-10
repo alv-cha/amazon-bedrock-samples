@@ -7,9 +7,15 @@
   "admin_jwt_claim": "",
   "admin_jwt_value": "",
   "auto_provision_users": false,
-  "default_daily_usd": 25.0,
-  "default_daily_input_tokens": 10000000,
-  "default_daily_output_tokens": 2000000,
+  "default_limits": {
+    "daily": {
+      "usd": 25.0,
+      "input_tokens": 10000000,
+      "output_tokens": 2000000
+    },
+    "weekly": null,
+    "monthly": null
+  },
   "warn_threshold": 0.75,
   "usage_retention_days": 90,
   "retain_tables_on_delete": true,

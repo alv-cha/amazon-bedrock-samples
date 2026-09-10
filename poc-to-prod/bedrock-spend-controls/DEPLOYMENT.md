@@ -67,11 +67,9 @@ Direct `-c key=value` values override the file.
 | Key | Default | Validation and meaning |
 |---|---:|---|
 | `auto_provision_users` | `true` | Boolean; create a quota row on first valid JWT |
-| `default_daily_usd` | `1.0` | Positive number |
-| `default_daily_input_tokens` | `1000000` | Positive integer |
-| `default_daily_output_tokens` | `200000` | Positive integer |
+| `default_limits` | Daily finite; weekly/monthly `null` | Object with `daily`, `weekly`, `monthly`; enabled periods contain non-negative `usd`, `input_tokens`, `output_tokens`; `null` disables a period |
 | `warn_threshold` | `0.8` | Greater than 0 and less than 1 |
-| `usage_retention_days` | `35` | Positive integer; DynamoDB TTL retention |
+| `usage_retention_days` | `35` | At least 31; canonical daily ledger retention used to derive current monthly totals |
 | `retain_tables_on_delete` | `false` | `true` maps tables to `RETAIN` |
 | `vended_ttl_seconds` | `900` | 900–3600; Lambda broker role chaining rejects longer sessions |
 | `permission_lease_seconds` | `300` | `60`, `300`, or `900`; deployment DEFAULT for the runtime dial (`PUT /admin/enforcement`) |
@@ -96,6 +94,26 @@ Direct `-c key=value` values override the file.
 | `snapstart` | `false` | Enable Python Lambda SnapStart for the broker |
 | `adapter_layer_arn` | regional default | Override Lambda Web Adapter layer |
 | `workloads` | empty | Workload-mode roster (inline JSON or file path); see [Workload mode](#workload-mode-per-workload-quotas) |
+
+Calendar quota windows are fixed in UTC: days reset at 00:00, weeks reset
+Monday at 00:00, and months reset on the first at 00:00. All enabled periods
+are enforced simultaneously. Weekly/monthly values are not rolling windows.
+
+The usage table retains one exactly-once daily ledger row per subject. The
+broker, usage processor, and workload enforcer derive current weekly/monthly
+totals with strongly consistent range queries over those daily rows. This
+avoids a rollup migration gap when a longer period is enabled mid-window. It
+adds a small read cost (up to 37 small rows) to vends and metered invocations
+for period-aware evaluation. Increasing retention does not restore rows that
+already expired; a deployment previously below 31 days must wait for a clean
+month boundary or backfill from retained invocation logs before enabling a
+monthly cap.
+
+Pre-period deployment files containing `default_daily_usd`,
+`default_daily_input_tokens`, and `default_daily_output_tokens` are accepted as
+deprecated migration input and become the daily object with weekly/monthly
+disabled. Do not combine those keys with `default_limits`; update the file to
+the nested shape before public deployment.
 
 ### Safe routine administration
 
@@ -143,37 +161,41 @@ remain legacy-compatible, but path-like identities containing values such as
 refresh, and preserves independent last-successful freshness/error state for
 each surface.
 
-A limit of `0` means **Unlimited** for that one dimension. The UI requires
-explicit confirmation plus a non-empty reason when a positive limit becomes
-Unlimited. It also requires a reason for a submitted finite limit below
-current usage; other limit reasons are optional. Deployment defaults remain
-positive. Temporary overrides, bulk operations, browser emergency mutation,
-user delete, and usage reset are not part of this MVP.
+A limit of `0` means **Unlimited** for that one dimension of an enabled
+period. The UI requires explicit confirmation plus a non-empty reason when a
+positive limit becomes Unlimited, when a quota period is enabled or disabled,
+and when a submitted finite limit is below current usage for that period;
+other limit reasons are optional. Deployment defaults enable a finite daily
+period and leave weekly and monthly disabled (`null`). Temporary per-user
+overrides, bulk operations, user delete, and usage reset are not part of this
+MVP.
 
-### Read-only Operations panel
+### Operations tab
 
 `GET /admin/operations` uses the routine admin authorization path and powers a
-read-only GUI panel. It combines deployed credential configuration, normalized
+GUI status panel. It combines deployed credential configuration, normalized
 emergency convergence state, conservative qualification metadata, p95
 `DetectionLagMilliseconds`, revocation freshness/failure/overflow metrics, and
 CloudWatch alarm states—including the emergency/revocation DLQ alarms.
 
+The same tab exposes two explicit controls:
+
+- The runtime permission-lease dial calls `PUT /admin/enforcement`. Its valid
+  values come from `GET /admin/enforcement`; the UI does not hardcode them and
+  requires an audit reason before applying a change.
+- Emergency activate/recover calls `POST /admin/emergency-stop`. It requires
+  the separate break-glass key, the action-specific confirmation phrase, and a
+  non-empty reason. The key is held only in the dialog state for that request
+  and is never persisted by the console.
+
 CloudWatch reads are performed by the broker role using only
 `cloudwatch:GetMetricData` and `cloudwatch:DescribeAlarms`. The browser still
-has only Function URL invocation permission. The response and UI never include
-the emergency key, secret ARN/value, IAM policy ARNs, incident reason, request
-ID, or mutation controls. If CloudWatch is denied or has no data, the endpoint
-returns local state with `unavailable`, `unknown`, `not_applicable`, or
+has only Function URL invocation permission. API responses and generated UI
+configuration never include the emergency key, secret ARN/value, or IAM policy
+ARNs. If CloudWatch is denied or has no data, the endpoint returns local state
+with `unavailable`, `unknown`, `not_applicable`, or
 `INSUFFICIENT_DATA`; it does not label missing telemetry healthy and does not
 break user quota administration.
-
-Qualification shown in the panel is reviewed deployment metadata, not
-inferred from alarm health. Lease, revocation, and emergency live
-qualification remain pending until recorded in `spikes/QUALIFICATION.md`.
-
-Legacy `mode_a_allowed_model_arns` is accepted as an alias for
-`allowed_model_arns`. Former dual-mode keys synthesize only for migration and
-are ignored with a warning. Remove them.
 
 ### Upgrading the former dual-mode stack
 
@@ -207,6 +229,7 @@ permission-lease window, and it changes at runtime without a redeploy:
 GET /admin/enforcement
 
 # Change it (audited; applies to NEW vends immediately)
+# Send the GET ETag as If-Match and a fresh Idempotency-Key.
 PUT /admin/enforcement
 {"permission_lease_seconds": 60, "reason": "incident response"}
 ```
@@ -216,7 +239,9 @@ revocation layer keeps cutting blocked identities regardless of the dial.
 The deployment key `permission_lease_seconds` only sets the default used
 when no runtime override exists. Every change writes an immutable
 `CONFIG#ENFORCEMENT_AUDIT` row and emits the `EnforcementDialChanged`
-metric.
+metric. The state row and immutable audit record commit in one DynamoDB
+transaction. Stale `If-Match` values and reused idempotency keys return distinct
+`409` errors instead of silently overwriting another operator.
 
 ### Lease and revocation qualification
 
@@ -269,8 +294,9 @@ keeps vending closed in `recovering` until the deny has been replaced by its
 no-op policy version.
 
 Retrieve the separate `EmergencyKeySecretArn` only through the approved
-break-glass procedure, then export it as `EMERGENCY_ADMIN_KEY`. Routine admin
-keys and admin UI JWTs cannot invoke these operations.
+break-glass procedure, then either export it as `EMERGENCY_ADMIN_KEY` for the
+CLI or enter it into the Operations tab for one action. Routine admin keys and
+admin UI JWTs alone cannot invoke these operations.
 
 ```bash
 python examples/sigv4_gateway.py \
@@ -660,7 +686,10 @@ cdk/.venv/bin/python examples/sigv4_gateway.py \
   create-user demo-user \
   --daily-usd 2 \
   --daily-input-tokens 1000000 \
-  --daily-output-tokens 200000
+  --daily-output-tokens 200000 \
+  --weekly-usd 10 \
+  --weekly-input-tokens 5000000 \
+  --weekly-output-tokens 1000000
 
 cdk/.venv/bin/python examples/sigv4_gateway.py \
   --gateway-url "$BROKER_API_URL" \
@@ -676,15 +705,18 @@ limits. The client automatically adds UUID idempotency and calls
 `GET /admin/user?user_id=...` before update/block/unblock. It then uses
 `PUT /admin/user/limits?user_id=...` or
 `PUT /admin/user/status?user_id=...` with the current `If-Match` value.
-`get-usage` uses `GET /admin/user/usage?user_id=...&window=...`. User IDs are
+`get-usage --period weekly` uses
+`GET /admin/user/usage?user_id=...&period=weekly&window=...`. User IDs are
 supplied as raw query values and encoded once by the signed HTTP client. Do not
 treat duplicate, version, or idempotency conflicts as success.
 
-In the UI, verify 25-row server pagination/search, explicit Unlimited
-confirmation, required reasons for Unlimited and finite-below-usage changes,
-optional reasons for ordinary limit edits, reasoned status changes, the detail
-Usage/Changes views, and the global Audit log. Operations and emergency state
-remain read-only.
+In the UI, verify the Overview, Users, Operations, and Audit tabs; 25-row
+server pagination/search; explicit Unlimited confirmation; required reasons
+for period enable/disable, Unlimited, and finite-below-current-period changes;
+optional reasons for ordinary limit increases; reasoned status changes; and
+the detail period-selectable Usage/Changes views. In a
+dedicated sandbox, also verify a dial change and one complete emergency
+activate/recover cycle with the break-glass key.
 
 ### 7. Runtime smoke test
 
@@ -710,11 +742,11 @@ cdk/.venv/bin/python examples/sigv4_gateway.py \
   --profile "$AWS_PROFILE" \
   --region "$AWS_REGION" \
   --admin-key "$ADMIN_KEY" \
-  get-usage "$USER_ID"
+  get-usage "$USER_ID" --period weekly
 ```
 
 For the complete enforcement smoke test, run
-[`notebook/per_user_quota_demo.ipynb`](notebook/per_user_quota_demo.ipynb).
+[`notebook/spend_controls_demo.ipynb`](notebook/spend_controls_demo.ipynb).
 The notebook intentionally uses `USER_PASSWORD_AUTH` with the same secretless
 app client/audience used by managed login. It reads exact quota users through
 `GET /admin/user?user_id=...`, so reruns load an existing user and only POST on
@@ -772,9 +804,15 @@ Recommended shape:
   "admin_jwt_claim": "",
   "admin_jwt_value": "",
   "auto_provision_users": false,
-  "default_daily_usd": 25,
-  "default_daily_input_tokens": 10000000,
-  "default_daily_output_tokens": 2000000,
+  "default_limits": {
+    "daily": {
+      "usd": 25,
+      "input_tokens": 10000000,
+      "output_tokens": 2000000
+    },
+    "weekly": null,
+    "monthly": null
+  },
   "warn_threshold": 0.75,
   "usage_retention_days": 90,
   "retain_tables_on_delete": true,
@@ -951,8 +989,8 @@ Verify all of the following:
 The client generates a new UUID idempotency key for each routine mutation.
 Update/block/unblock automatically call `GET /admin/user?user_id=...` first
 and send the returned ETag/version as `If-Match` to the canonical limit/status
-query route; `get-usage` calls
-`GET /admin/user/usage?user_id=...&window=...`. A race still surfaces as an
+query route; `get-usage --period monthly` calls
+`GET /admin/user/usage?user_id=...&period=monthly&window=...`. A race still surfaces as an
 HTTP failure with conflict guidance. Status commands send a reason. `update-user`
 accepts an optional `--reason`, includes it only when supplied, and the backend
 stores its trimmed value with the immutable limit audit event. Omitted or blank
@@ -965,14 +1003,16 @@ python examples/sigv4_gateway.py \
   --region "$AWS_REGION" --admin-key "$ADMIN_KEY" \
   create-user tenant-acme --name "ACME" \
   --daily-usd 25 --daily-input-tokens 10000000 \
-  --daily-output-tokens 2000000
+  --daily-output-tokens 2000000 \
+  --monthly-usd 500 --monthly-input-tokens 200000000 \
+  --monthly-output-tokens 40000000
 
 # List
 python examples/sigv4_gateway.py \
   --gateway-url "$BROKER_API_URL" --profile "$AWS_PROFILE" \
   --region "$AWS_REGION" --admin-key "$ADMIN_KEY" list-users
 
-# Update all quota dimensions
+# Update any dimensions while preserving unspecified periods
 python examples/sigv4_gateway.py \
   --gateway-url "$BROKER_API_URL" --profile "$AWS_PROFILE" \
   --region "$AWS_REGION" --admin-key "$ADMIN_KEY" \
@@ -986,11 +1026,11 @@ python examples/sigv4_gateway.py \
   --region "$AWS_REGION" --admin-key "$ADMIN_KEY" \
   block-user tenant-acme --reason "security review"
 
-# Query today's usage
+# Query the current monthly calendar window
 python examples/sigv4_gateway.py \
   --gateway-url "$BROKER_API_URL" --profile "$AWS_PROFILE" \
   --region "$AWS_REGION" --admin-key "$ADMIN_KEY" \
-  get-usage tenant-acme
+  get-usage tenant-acme --period monthly
 
 # Unblock
 python examples/sigv4_gateway.py \

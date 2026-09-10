@@ -25,6 +25,14 @@ from typing import Any
 import boto3
 from boto3.dynamodb.types import TypeSerializer
 from botocore.exceptions import ClientError
+from bedrock_spend_controls.quota_periods import (
+    PERIODS,
+    aggregate_daily_rows,
+    calendar_windows,
+    evaluate_limits,
+    limits_from_item,
+    quota_reason,
+)
 
 MICRO = 1_000_000
 METRICS_NAMESPACE = os.environ.get(
@@ -327,7 +335,11 @@ def _av(value: Any) -> dict:
 
 def _ttl_epoch(occurred_at: datetime) -> int:
     keep_days = int(os.environ.get("USAGE_RETENTION_DAYS", "35"))
-    return int(occurred_at.timestamp()) + keep_days * 86400
+    # Late CloudWatch delivery must not create an already-expired request
+    # marker or daily row. Retain from processing time when it is later.
+    processed_at = datetime.now(timezone.utc)
+    anchor = max(occurred_at.astimezone(timezone.utc), processed_at)
+    return int(anchor.timestamp()) + keep_days * 86400
 
 
 def _apply_usage(
@@ -411,46 +423,61 @@ def _notify(sns, subject: str, payload: dict) -> None:
         )
 
 
-def _usage_row(table, user_id: str, window: str) -> dict:
-    return table.get_item(
-        Key={"user_id": user_id, "window": window},
+def _current_usage(table, user_id: str, now: datetime) -> dict:
+    windows = calendar_windows(now)
+    start = min(window.start for window in windows.values()).date().isoformat()
+    end = windows["daily"].start.date().isoformat()
+    response = table.query(
+        KeyConditionExpression=(
+            "user_id = :user_id AND #window BETWEEN :start AND :end"
+        ),
+        ExpressionAttributeNames={"#window": "window"},
+        ExpressionAttributeValues={
+            ":user_id": user_id,
+            ":start": start,
+            ":end": end,
+        },
         ConsistentRead=True,
-    ).get("Item", {})
-
-
-def _limit_ratio(usage: dict, user: dict) -> float:
-    dimensions = (
-        ("cost_micro", "daily_usd_micro"),
-        ("input_tokens", "daily_input_tokens"),
-        ("output_tokens", "daily_output_tokens"),
     )
-    ratios = [
-        int(usage.get(value_key, 0)) / int(user[limit_key])
-        for value_key, limit_key in dimensions
-        if int(user.get(limit_key, 0)) > 0
-    ]
-    return max(ratios, default=0.0)
+    rows = list(response.get("Items", []))
+    while response.get("LastEvaluatedKey"):
+        response = table.query(
+            KeyConditionExpression=(
+                "user_id = :user_id AND #window BETWEEN :start AND :end"
+            ),
+            ExpressionAttributeNames={"#window": "window"},
+            ExpressionAttributeValues={
+                ":user_id": user_id,
+                ":start": start,
+                ":end": end,
+            },
+            ConsistentRead=True,
+            ExclusiveStartKey=response["LastEvaluatedKey"],
+        )
+        rows.extend(response.get("Items", []))
+    return aggregate_daily_rows(rows, now)
 
 
 def _evaluate_quota(
+    client,
     users_table,
     usage_table,
     sns,
     user_id: str,
-    window: str,
     *,
     _attempt: int = 0,
 ) -> str:
-    """Block or warn from the just-updated current UTC window."""
-    if window != datetime.now(timezone.utc).strftime("%Y-%m-%d"):
-        return "historical"
+    """Block or warn from all current UTC calendar quota periods."""
+    now = datetime.now(timezone.utc)
     user = users_table.get_item(
         Key={"user_id": user_id}, ConsistentRead=True
     ).get("Item")
     if not user:
         return "missing-user"
-    current = _usage_row(usage_table, user_id, window)
-    ratio = _limit_ratio(current, user)
+    current_usage = _current_usage(usage_table, user_id, now)
+    evaluation = evaluate_limits(
+        limits_from_item(user), current_usage, now
+    )
     status = str(user.get("status", "active"))
     reason = str(user.get("status_reason", ""))
     origin = str(user.get("status_origin", "legacy"))
@@ -458,10 +485,10 @@ def _evaluate_quota(
         origin == "legacy" and reason.startswith("auto:")
     )
 
-    if ratio >= 1:
+    if evaluation.over_budget:
         if status == "blocked" and not automatic_owned:
             return "manually-blocked"
-        auto_reason = f"auto: quota exhausted in {window}"
+        auto_reason = quota_reason(evaluation)
         if status != "blocked" or reason != auto_reason:
             changed_at = datetime.now(timezone.utc).isoformat()
             observed_version = int(user.get("version", 0))
@@ -489,81 +516,122 @@ def _evaluate_quota(
                 else "status_reason = :observed_reason"
             )
             try:
-                users_table.update_item(
-                    Key={"user_id": user_id},
-                    UpdateExpression=(
-                        "SET #s = :s, status_reason = :r, "
-                        "status_changed_at = :t, updated_at = :t, "
-                        "status_origin = :origin, "
-                        "#version = if_not_exists(#version, :zero) + :one"
-                    ),
-                    ConditionExpression=(
-                        f"{version_condition} AND #s = :observed_status AND "
-                        f"{reason_condition}"
-                    ),
-                    ExpressionAttributeNames={
-                        "#s": "status",
-                        "#version": "version",
-                    },
-                    ExpressionAttributeValues=values,
+                client.transact_write_items(
+                    TransactItems=[
+                        {
+                            "Update": {
+                                "TableName": users_table.name,
+                                "Key": {"user_id": _av(user_id)},
+                                "UpdateExpression": (
+                                    "SET #s = :s, status_reason = :r, "
+                                    "status_changed_at = :t, updated_at = :t, "
+                                    "status_origin = :origin, "
+                                    "#version = if_not_exists(#version, :zero) + :one"
+                                ),
+                                "ConditionExpression": (
+                                    f"{version_condition} AND #s = :observed_status AND "
+                                    f"{reason_condition}"
+                                ),
+                                "ExpressionAttributeNames": {
+                                    "#s": "status",
+                                    "#version": "version",
+                                },
+                                "ExpressionAttributeValues": {
+                                    key: _av(value) for key, value in values.items()
+                                },
+                            }
+                        },
+                        {
+                            "Put": {
+                                "TableName": users_table.name,
+                                "Item": {
+                                    "user_id": _av(f"REVOCATION#{user_id}"),
+                                    "maps_to": _av(user_id),
+                                    "desired_status": _av("blocked"),
+                                    "source_identity": _av(
+                                        str(user.get("source_identity", ""))
+                                    ),
+                                    "updated_at": _av(changed_at),
+                                    "expires_at": _av(
+                                        _ttl_epoch(datetime.now(timezone.utc))
+                                    ),
+                                },
+                            }
+                        },
+                    ]
                 )
             except ClientError as exc:
-                if exc.response.get("Error", {}).get("Code") != (
-                    "ConditionalCheckFailedException"
-                ):
+                if exc.response.get("Error", {}).get("Code") not in {
+                    "ConditionalCheckFailedException",
+                    "TransactionCanceledException",
+                }:
                     raise
                 if _attempt < 2:
                     return _evaluate_quota(
+                        client,
                         users_table,
                         usage_table,
                         sns,
                         user_id,
-                        window,
                         _attempt=_attempt + 1,
                     )
                 return "concurrent-change"
-            refreshed_user = users_table.get_item(
-                Key={"user_id": user_id}, ConsistentRead=True
-            ).get("Item", {})
-            users_table.put_item(
-                Item={
-                    "user_id": f"REVOCATION#{user_id}",
-                    "maps_to": user_id,
-                    "desired_status": "blocked",
-                    "source_identity": str(
-                        refreshed_user.get("source_identity", "")
-                    ),
-                    "updated_at": changed_at,
-                    "expires_at": _ttl_epoch(datetime.now(timezone.utc)),
-                }
-            )
+            # User state and the revocation sentinel committed atomically.
+            # Notification remains best-effort and cannot create an
+            # authorization gap.
             _notify(
                 sns,
                 f"[bedrock-spend-controls] BLOCKED {user_id}",
-                {"user_id": user_id, "window": window, "usage": current},
+                {
+                    "user_id": user_id,
+                    "breaches": [
+                        {
+                            "period": breach.period,
+                            "dimension": breach.dimension,
+                            "usage": breach.usage,
+                            "limit": breach.limit,
+                            "window_start": breach.window.start.isoformat(),
+                            "resets_at": breach.window.end.isoformat(),
+                        }
+                        for breach in evaluation.breaches
+                    ],
+                    "current_usage": current_usage,
+                },
             )
         return "blocked"
 
     warn_threshold = float(os.environ.get("WARN_THRESHOLD", "0.8"))
-    if (
-        ratio >= warn_threshold
-        and user.get("warning_sent_window") != window
-    ):
-        users_table.update_item(
-            Key={"user_id": user_id},
-            UpdateExpression="SET warning_sent_window = :w",
-            ExpressionAttributeValues={":w": window},
-        )
-        _notify(
-            sns,
-            f"[bedrock-spend-controls] WARNING {user_id}",
-            {
-                "user_id": user_id,
-                "window": window,
-                "utilization": ratio,
-                "usage": current,
-            },
-        )
+    warned = False
+    windows = calendar_windows(now)
+    for period in PERIODS:
+        period_ratios = [
+            ratio
+            for key, ratio in evaluation.ratios.items()
+            if key.startswith(f"{period}.")
+        ]
+        ratio = max(period_ratios, default=0.0)
+        marker = f"warning_sent_{period}_window"
+        period_window = windows[period]
+        if ratio >= warn_threshold and user.get(marker) != period_window.key:
+            users_table.update_item(
+                Key={"user_id": user_id},
+                UpdateExpression=f"SET {marker} = :w",
+                ExpressionAttributeValues={":w": period_window.key},
+            )
+            _notify(
+                sns,
+                f"[bedrock-spend-controls] WARNING {user_id}",
+                {
+                    "user_id": user_id,
+                    "period": period,
+                    "window_start": period_window.start.isoformat(),
+                    "resets_at": period_window.end.isoformat(),
+                    "utilization": ratio,
+                    "usage": current_usage[period],
+                },
+            )
+            warned = True
+    if warned:
         return "warned"
     return "within-budget"
 
@@ -621,14 +689,31 @@ def _emit_emf(
     print(json.dumps(record))
 
 
-def _default_limits() -> tuple[int, int, int]:
-    """Deploy-configured default limits, mirroring the gateway's shape."""
-    usd = float(os.environ.get("DEFAULT_DAILY_USD", "1.0"))
-    input_tokens = int(os.environ.get("DEFAULT_DAILY_INPUT_TOKENS", "1000000"))
-    output_tokens = int(
-        os.environ.get("DEFAULT_DAILY_OUTPUT_TOKENS", "200000")
+def _default_limit_attributes() -> dict[str, object]:
+    """Deploy-configured defaults, mirroring the gateway's storage shape."""
+    raw = json.loads(
+        os.environ.get(
+            "DEFAULT_LIMITS_JSON",
+            '{"daily":{"usd":1.0,"input_tokens":1000000,'
+            '"output_tokens":200000},"weekly":null,"monthly":null}',
+        )
     )
-    return int(round(usd * MICRO)), input_tokens, output_tokens
+    attributes: dict[str, object] = {}
+    for period in PERIODS:
+        value = raw.get(period)
+        attributes[f"{period}_limits_enabled"] = value is not None
+        usd = float(value.get("usd", 0)) if value else 0
+        usd_micro = int(round(usd * MICRO))
+        if usd > 0 and usd_micro == 0:
+            usd_micro = 1
+        attributes[f"{period}_usd_micro"] = usd_micro
+        attributes[f"{period}_input_tokens"] = (
+            int(value.get("input_tokens", 0)) if value else 0
+        )
+        attributes[f"{period}_output_tokens"] = (
+            int(value.get("output_tokens", 0)) if value else 0
+        )
+    return attributes
 
 
 def _ensure_workload_user(users_table, workload_id: str, name: str) -> None:
@@ -638,7 +723,6 @@ def _ensure_workload_user(users_table, workload_id: str, name: str) -> None:
     admin limit/status mutations apply identically. Losing the race to a
     concurrent create (admin or another processor invocation) is fine.
     """
-    usd_micro, input_tokens, output_tokens = _default_limits()
     now = datetime.now(timezone.utc).isoformat()
     try:
         users_table.put_item(
@@ -647,9 +731,7 @@ def _ensure_workload_user(users_table, workload_id: str, name: str) -> None:
                 "name": name,
                 "status": "active",
                 "status_reason": "",
-                "daily_usd_micro": usd_micro,
-                "daily_input_tokens": input_tokens,
-                "daily_output_tokens": output_tokens,
+                **_default_limit_attributes(),
                 "version": 1,
                 "created_at": now,
                 "updated_at": now,
@@ -726,20 +808,24 @@ def handler(
         cost_micro = _tokens_cost_micro(
             rates, usage.input_tokens, usage.output_tokens
         )
-        if not _apply_usage(
+        applied = _apply_usage(
             client, usage_table_name, user_id, usage, cost_micro
-        ):
-            result["duplicates"] += 1
-            continue
-        result["processed"] += 1
-        _emit_emf(
-            user_id,
-            usage,
-            cost_micro,
-            price_source=price_source,
         )
+        if not applied:
+            result["duplicates"] += 1
+        else:
+            result["processed"] += 1
+            _emit_emf(
+                user_id,
+                usage,
+                cost_micro,
+                price_source=price_source,
+            )
+        # A duplicate delivery may be retrying after accounting committed but
+        # status convergence failed. Re-evaluate without incrementing or
+        # re-emitting usage so the retry repairs enforcement.
         _evaluate_quota(
-            users_table, usage_table, sns, user_id, usage.window
+            client, users_table, usage_table, sns, user_id
         )
 
     result["unresolved_sessions"] = sorted(unresolved)

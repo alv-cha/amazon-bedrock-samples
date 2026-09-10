@@ -7,33 +7,40 @@ It provides:
 - A 25-row server-paginated user list with server-side status/search filters.
 - A safe create wizard. `POST /admin/users` is conditional and never overwrites
   an existing user; duplicate identities return `409 user_already_exists`.
-- Daily USD, input-token, and output-token limits. `0` means **Unlimited** for
-  that individual dimension. The UI collects an optional trimmed audit reason
-  and requires it, in addition to explicit Unlimited confirmation, whenever a
-  positive limit becomes Unlimited or a submitted finite limit is below
-  current usage.
+- Simultaneous daily, weekly, and monthly UTC-calendar limits for USD, input
+  tokens, and output tokens. `null` disables a period and `0` means
+  **Unlimited** for one enabled dimension. The create/edit matrix explains
+  reset times and that newly enabled periods include usage since their current
+  boundary. Period enable/disable, Unlimited changes, and finite limits below
+  current-period usage require an audit reason.
 - Reasoned block/unblock controls.
-- A user detail drawer with Overview, retained Usage history, and Changes
-  (per-user routine audit) views.
+- A user table period selector plus highest-utilization signal, and a detail
+  drawer with all three current windows, period-selectable Usage history, and
+  period-qualified Changes (per-user routine audit).
 - A global Audit log for routine create, limit, and status changes, with an
   explicit refresh and its own last-successful freshness/error state.
 - Independent stale/error states, so one failed panel retains its last
   successful timestamp without presenting unrelated data as fresh.
-- Runtime-only bounded-overspend guarantee and active enforcement mode.
+- Runtime-only bounded-overspend guarantee and layered enforcement status.
 - Actual STS lifetime, effective permission cutoff, refresh overlap/jitter, and
   invocation-to-detection lag metric.
-- Read-only emergency convergence, revocation capacity/freshness, qualification
-  gates, and CloudWatch alarm/DLQ alarm states.
+- An audited runtime permission-lease dial whose allowed values are returned by
+  the gateway, require a reason in the UI, and apply to new credentials without
+  a redeploy.
+- Break-glass emergency activation/recovery with a separate key, exact
+  confirmation phrase, and reason; the key is held only for that request.
+- Emergency convergence, revocation capacity/freshness, qualification gates,
+  and CloudWatch alarm/DLQ states.
 
-The Operations panel has no mutation controls. CloudWatch is queried by the
-broker Lambda; the browser receives no CloudWatch IAM permissions, emergency
-key, secret ARN/value, IAM policy controls, incident detail, or emergency and
-revocation action buttons. Incomplete metric queries and unresolved alarms
-cannot produce a green revocation status. Failed refreshes visibly mark cached
-data with its last successful timestamp, emergency qualification is separate
-from convergence, and permission-lease duration shows `Not active` outside
-lease mode. Missing telemetry is displayed as unknown or unavailable rather
-than healthy.
+The Operations tab never mutates IAM directly. The broker owns CloudWatch and
+IAM permissions; the browser receives no CloudWatch permissions, secret ARN,
+or policy ARN. The runtime dial calls the audited admin endpoint. Emergency
+actions require the operator to supply the independent break-glass key, which
+is never part of generated `config.js`, API responses, or persistent browser
+storage. Incomplete metric queries and unresolved alarms cannot produce a
+green revocation status. Failed refreshes visibly mark cached data with its
+last successful timestamp, and missing telemetry is displayed as unknown or
+unavailable rather than healthy.
 
 The browser never receives the shared admin secret. With the demo Cognito
 deployment it:
@@ -87,9 +94,8 @@ retention is 365 days. Audit history begins when this version is deployed;
 there is no backfill for earlier changes. Usage history is separately bounded
 by `usage_retention_days`.
 
-Temporary overrides, bulk operations, browser emergency mutation, user delete,
-and usage reset are outside this MVP. The Operations and emergency state views
-remain read-only in the routine UI.
+Temporary per-user overrides, bulk operations, user delete, and usage reset are
+outside this MVP.
 
 ## Build and test
 

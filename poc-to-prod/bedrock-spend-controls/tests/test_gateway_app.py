@@ -93,6 +93,27 @@ def _vend(api, token: str):
     )
 
 
+def _limits(
+    usd: float = 1,
+    input_tokens: int = 100,
+    output_tokens: int = 50,
+    *,
+    weekly: dict | None = None,
+    monthly: dict | None = None,
+) -> dict:
+    return {
+        "limits": {
+            "daily": {
+                "usd": usd,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+            },
+            "weekly": weekly,
+            "monthly": monthly,
+        }
+    }
+
+
 def test_health_describes_runtime_only_event_driven_architecture(client):
     api, _, _ = client
     assert api.get("/healthz").json() == {
@@ -115,6 +136,7 @@ def test_vend_requires_valid_jwt_and_auto_provisions(client):
         "https://bedrock-runtime."
     )
     assert response.json()["user_id"] == "alice"
+    assert response.headers["x-quota-enabled-periods"] == "daily"
     assert broker.users == ["alice"]
     assert broker.claims[0]["email"] == "alice@example.com"
     assert "exp" in broker.claims[0]
@@ -136,9 +158,7 @@ def test_reserved_internal_identity_prefixes_are_rejected(client):
         "/admin/users",
         json={
             "user_id": "REVOCATION#alice",
-            "daily_usd": 1,
-            "daily_input_tokens": 10,
-            "daily_output_tokens": 10,
+            **_limits(1, 10, 10),
         },
         headers=ADMIN,
     )
@@ -405,29 +425,27 @@ def test_admin_create_list_update_block_and_usage(client):
         json={
             "user_id": "tenant/acme",
             "name": "ACME",
-            "daily_usd": 25,
-            "daily_input_tokens": 1_000_000,
-            "daily_output_tokens": 200_000,
+            **_limits(25, 1_000_000, 200_000),
         },
         headers=ADMIN,
     )
     assert created.status_code == 200
-    assert created.json()["limits"]["daily_output_tokens"] == 200_000
+    assert created.json()["limits"]["daily"]["output_tokens"] == 200_000
 
     updated = api.put(
         "/admin/users/tenant%2Facme/limits",
-        json={
-            "daily_usd": 30,
-            "daily_input_tokens": 2_000_000,
-            "daily_output_tokens": 400_000,
-        },
+        json=_limits(30, 2_000_000, 400_000),
         headers=ADMIN,
     )
     assert updated.status_code == 200
     assert updated.json()["limits"] == {
-        "daily_usd": 30.0,
-        "daily_input_tokens": 2_000_000,
-        "daily_output_tokens": 400_000,
+        "daily": {
+            "usd": 30.0,
+            "input_tokens": 2_000_000,
+            "output_tokens": 400_000,
+        },
+        "weekly": None,
+        "monthly": None,
     }
 
     blocked = api.put(
@@ -847,16 +865,17 @@ def test_admin_requires_authorization_and_valid_payloads(client):
         "/admin/users", content="{", headers={**ADMIN, "Content-Type": "application/json"}
     ).status_code == 400
     assert api.post(
-        "/admin/users", json={"daily_usd": 1}, headers=ADMIN
+        "/admin/users", json={"limits": _limits()["limits"]}, headers=ADMIN
     ).status_code == 400
 
     store.put_user("alice", "Alice", 1, 100, 50)
     for payload in (
         {},
-        {"daily_usd": -1},
-        {"daily_input_tokens": 1.5},
-        {"daily_output_tokens": False},
-        {"daily_usd": 2, "reason": 123},
+        {"limits": {"daily": {"usd": -1, "input_tokens": 1, "output_tokens": 1}}},
+        {"limits": {"daily": {"usd": 1, "input_tokens": 1.5, "output_tokens": 1}}},
+        {"limits": {"daily": {"usd": 1, "input_tokens": 1, "output_tokens": False}}},
+        {"limits": {"daily": None, "weekly": None, "monthly": None}},
+        {**_limits(2), "reason": 123},
     ):
         assert api.put(
             "/admin/users/alice/limits", json=payload, headers=ADMIN
@@ -905,9 +924,7 @@ def test_duplicate_admin_create_preserves_existing_user(client):
         json={
             "user_id": "alice",
             "name": "Replacement",
-            "daily_usd": 1,
-            "daily_input_tokens": 1,
-            "daily_output_tokens": 1,
+            **_limits(1, 1, 1),
         },
         headers={**ADMIN, "Idempotency-Key": "duplicate-create"},
     )
@@ -935,9 +952,9 @@ def test_legacy_user_reads_as_version_zero_and_upgrades_on_first_mutation(client
     assert detail.status_code == 200
     assert detail.headers["etag"] == '"0"'
     assert detail.json()["user"]["limits"] == {
-        "daily_usd": 1.0,
-        "daily_input_tokens": 100,
-        "daily_output_tokens": 50,
+        "daily": {"usd": 1.0, "input_tokens": 100, "output_tokens": 50},
+        "weekly": None,
+        "monthly": None,
     }
     assert detail.json()["user"]["version"] == 0
     assert detail.json()["user"]["created_at"] is None
@@ -946,7 +963,7 @@ def test_legacy_user_reads_as_version_zero_and_upgrades_on_first_mutation(client
 
     updated = api.put(
         "/admin/users/legacy/limits",
-        json={"daily_usd": 2},
+        json=_limits(2, 100, 50),
         headers={**ADMIN, "Idempotency-Key": "legacy-upgrade"},
     )
     assert updated.status_code == 200
@@ -961,21 +978,21 @@ def test_admin_mutations_enforce_version_and_durable_idempotency(client):
     api, store, _ = client
     created = api.post(
         "/admin/users",
-        json={"user_id": "alice", "daily_usd": 1},
+        json={"user_id": "alice", **_limits()},
         headers={**ADMIN, "Idempotency-Key": "create-alice"},
     )
     assert created.status_code == 200
     assert created.headers["etag"] == '"1"'
     create_replay = api.post(
         "/admin/users",
-        json={"user_id": "alice", "daily_usd": 1},
+        json={"user_id": "alice", **_limits()},
         headers={**ADMIN, "Idempotency-Key": "create-alice"},
     )
     assert create_replay.status_code == 200
     assert create_replay.json() == created.json()
     create_mismatch = api.post(
         "/admin/users",
-        json={"user_id": "alice", "daily_usd": 9},
+        json={"user_id": "alice", **_limits(9)},
         headers={**ADMIN, "Idempotency-Key": "create-alice"},
     )
     assert create_mismatch.status_code == 409
@@ -990,12 +1007,12 @@ def test_admin_mutations_enforce_version_and_durable_idempotency(client):
     }
     first = api.put(
         "/admin/users/alice/limits",
-        json={"daily_usd": 2, "reason": "  Quarterly increase  "},
+        json={**_limits(2), "reason": "  Quarterly increase  "},
         headers=request_headers,
     )
     replay = api.put(
         "/admin/users/alice/limits",
-        json={"daily_usd": 2, "reason": "Quarterly increase"},
+        json={**_limits(2), "reason": "Quarterly increase"},
         headers=request_headers,
     )
     assert first.status_code == replay.status_code == 200
@@ -1009,7 +1026,7 @@ def test_admin_mutations_enforce_version_and_durable_idempotency(client):
 
     mismatch = api.put(
         "/admin/users/alice/limits",
-        json={"daily_usd": 2, "reason": "Different justification"},
+        json={**_limits(2), "reason": "Different justification"},
         headers=request_headers,
     )
     assert mismatch.status_code == 409
@@ -1017,7 +1034,7 @@ def test_admin_mutations_enforce_version_and_durable_idempotency(client):
 
     stale = api.put(
         "/admin/users/alice/limits",
-        json={"daily_usd": 4},
+        json=_limits(4),
         headers={
             **ADMIN,
             "If-Match": '"1"',
@@ -1044,7 +1061,7 @@ def test_limit_reason_is_optional_and_uses_legacy_audit_fallback(
 
     response = api.put(
         "/admin/users/legacy/limits",
-        json={"daily_output_tokens": 75, **reason_payload},
+        json={**_limits(1, 100, 75), **reason_payload},
         headers={
             **ADMIN,
             "If-Match": '"1"',
@@ -1284,7 +1301,7 @@ def test_canonical_admin_routes_disambiguate_path_like_identities(client):
         limits = api.put(
             "/admin/user/limits",
             params={"user_id": user_id},
-            json={"daily_usd": index + 10, "reason": "route regression"},
+            json={**_limits(index + 10), "reason": "route regression"},
             headers={
                 **ADMIN,
                 "If-Match": detail.headers["etag"],
@@ -1328,13 +1345,13 @@ def test_canonical_mutation_hash_binds_the_exact_query_identity(client):
     first = api.put(
         "/admin/user/limits",
         params={"user_id": "team"},
-        json={"daily_usd": 2, "reason": "identity binding"},
+        json={**_limits(2), "reason": "identity binding"},
         headers=headers,
     )
     conflict = api.put(
         "/admin/user/limits",
         params={"user_id": "team/audit"},
-        json={"daily_usd": 2, "reason": "identity binding"},
+        json={**_limits(2), "reason": "identity binding"},
         headers=headers,
     )
 
@@ -1450,7 +1467,7 @@ def test_jwt_admin_audit_actor_uses_subject_with_tenant_quota_identity(
     )
     updated = api.put(
         "/admin/users/tenant-acme/limits",
-        json={"daily_usd": 2, "reason": "Tenant quota review"},
+        json={**_limits(2), "reason": "Tenant quota review"},
         headers={
             "X-Quota-User-Token": token,
             "If-Match": detail.headers["etag"],
@@ -1741,7 +1758,7 @@ def test_non_conditional_transaction_cancellation_is_retryable_not_version_confl
 
     response = api.put(
         "/admin/users/alice/limits",
-        json={"daily_usd": 2},
+        json=_limits(2),
         headers={
             **ADMIN,
             "If-Match": '"1"',
@@ -1992,11 +2009,204 @@ def test_workload_admin_mutations_use_standard_endpoints(client):
             "If-Match": current.headers["ETag"],
             "Idempotency-Key": "workload-limit-test",
         },
-        json={"daily_usd": 9.5, "reason": "workload budget bump"},
+        json={**_limits(9.5, 0, 0), "reason": "workload budget bump"},
     )
 
     assert updated.status_code == 200
-    assert updated.json()["user"]["limits"]["daily_usd"] == 9.5
+    assert updated.json()["user"]["limits"]["daily"]["usd"] == 9.5
+
+
+def test_monthly_limit_enable_uses_existing_daily_ledger_and_blocks_immediately(
+    client,
+):
+    api, store, _ = client
+    store.put_user("alice", "Alice", 100, 0, 0)
+    now = datetime.now(timezone.utc)
+    daily_costs = (
+        ((1, 7_000_000),)
+        if now.day == 1
+        else ((1, 4_000_000), (now.day, 3_000_000))
+    )
+    for day, cost_micro in daily_costs:
+        store._usage.put_item(  # noqa: SLF001 - retained pre-period ledger
+            Item={
+                "user_id": "alice",
+                "window": now.replace(day=day).date().isoformat(),
+                "cost_micro": cost_micro,
+                "requests": 1,
+            }
+        )
+    detail = api.get(
+        "/admin/user", params={"user_id": "alice"}, headers=ADMIN
+    )
+
+    blocked = api.put(
+        "/admin/user/limits",
+        params={"user_id": "alice"},
+        headers={
+            **ADMIN,
+            "If-Match": detail.headers["etag"],
+            "Idempotency-Key": "enable-monthly",
+        },
+        json={
+            **_limits(
+                100,
+                0,
+                0,
+                monthly={
+                    "usd": 6,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                },
+            ),
+            "reason": "monthly guardrail",
+        },
+    )
+
+    assert blocked.status_code == 200
+    assert blocked.json()["user"]["status"] == "blocked"
+    assert blocked.json()["user"]["status_reason"].startswith(
+        "auto: monthly USD quota exhausted"
+    )
+    assert store.get_user("alice").monthly_limits_enabled
+
+    raised = api.put(
+        "/admin/user/limits",
+        params={"user_id": "alice"},
+        headers={
+            **ADMIN,
+            "If-Match": blocked.headers["etag"],
+            "Idempotency-Key": "raise-monthly",
+        },
+        json={
+            **_limits(
+                100,
+                0,
+                0,
+                monthly={
+                    "usd": 8,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                },
+            ),
+            "reason": "approved increase",
+        },
+    )
+    assert raised.status_code == 200
+    assert raised.json()["user"]["status"] == "active"
+
+
+def test_limit_idempotency_replay_returns_original_canonical_result(client):
+    api, store, _ = client
+    store.put_user("alice", "Alice", 1, 100, 50)
+    first_headers = {
+        **ADMIN,
+        "If-Match": '"1"',
+        "Idempotency-Key": "original-limit-change",
+    }
+    first = api.put(
+        "/admin/user/limits",
+        params={"user_id": "alice"},
+        headers=first_headers,
+        json={**_limits(2), "reason": "first"},
+    )
+    second = api.put(
+        "/admin/user/limits",
+        params={"user_id": "alice"},
+        headers={
+            **ADMIN,
+            "If-Match": first.headers["etag"],
+            "Idempotency-Key": "later-limit-change",
+        },
+        json={**_limits(3), "reason": "second"},
+    )
+    replay = api.put(
+        "/admin/user/limits",
+        params={"user_id": "alice"},
+        headers=first_headers,
+        json={**_limits(2), "reason": "first"},
+    )
+
+    assert second.status_code == 200
+    assert second.json()["user"]["limits"]["daily"]["usd"] == 3
+    assert replay.status_code == 200
+    assert replay.headers["etag"] == first.headers["etag"]
+    assert replay.json() == first.json()
+
+
+def test_period_usage_and_history_include_calendar_boundaries(client):
+    api, store, _ = client
+    store.put_user("alice", "Alice", 100, 0, 0)
+    now = datetime.now(timezone.utc)
+    store._usage.put_item(  # noqa: SLF001 - focused API history setup
+        Item={
+            "user_id": "alice",
+            "window": now.date().isoformat(),
+            "cost_micro": 2_000_000,
+            "input_tokens": 20,
+            "output_tokens": 10,
+            "requests": 1,
+        }
+    )
+
+    current = api.get(
+        "/admin/user/usage",
+        params={"user_id": "alice", "period": "monthly"},
+        headers=ADMIN,
+    )
+    assert current.status_code == 200
+    assert current.json()["period"] == "monthly"
+    assert current.json()["window_start"].endswith("T00:00:00+00:00")
+    assert current.json()["resets_at"] == current.json()["window_end"]
+    assert current.json()["cost_usd"] == 2
+
+    history = api.get(
+        "/admin/user/usage-history",
+        params={
+            "user_id": "alice",
+            "period": "monthly",
+            "start": now.replace(day=1).date().isoformat(),
+            "end": now.replace(day=1).date().isoformat(),
+        },
+        headers=ADMIN,
+    )
+    assert history.status_code == 200
+    assert history.json()["period"] == "monthly"
+    assert history.json()["usage"][0]["period"] == "monthly"
+    assert history.json()["usage"][0]["cost_usd"] == 2
+
+    misaligned = api.get(
+        "/admin/user/usage-history",
+        params={
+            "user_id": "alice",
+            "period": "weekly",
+            "start": now.date().isoformat(),
+            "end": now.date().isoformat(),
+        },
+        headers=ADMIN,
+    )
+    if now.weekday() == 0:
+        assert misaligned.status_code == 200
+    else:
+        assert misaligned.status_code == 400
+        assert "weekly period start" in misaligned.json()["error"]["message"]
+
+
+def test_lightweight_user_list_omits_period_queries_for_lease_poll(client):
+    api, store, _ = client
+    store.put_user("alice", "Alice", 1, 100, 50)
+
+    response = api.get(
+        "/admin/users",
+        params={"include_usage": "false", "limit": 50},
+        headers=ADMIN,
+    )
+
+    assert response.status_code == 200
+    row = response.json()["users"][0]
+    assert row["user_id"] == "alice"
+    assert "today" not in row
+    assert "current_usage" not in row
 
 
 # ---------------------------------------------------------------------------
@@ -2053,12 +2263,47 @@ def test_enforcement_dial_validates_and_audits(client, fake_dynamodb):
             for item in table.scan()["Items"]
             if str(item["user_id"]).startswith("CONFIG#ENFORCEMENT_AUDIT#")
         ),
-        key=lambda item: str(item["user_id"]),
+        key=lambda item: int(item["generation"]),
     )
     assert len(audit_rows) == 2
     assert audit_rows[0]["permission_lease_seconds"] == 60
     assert audit_rows[0]["previous_permission_lease_seconds"] == 300
     assert audit_rows[0]["reason"] == "live demo: tighter lease"
+
+
+def test_enforcement_dial_is_versioned_and_idempotent(client, monkeypatch):
+    api, _, _ = client
+    metric = []
+    monkeypatch.setattr(
+        gateway.emf,
+        "record_enforcement_dial",
+        lambda actor, seconds: metric.append((actor, seconds)),
+    )
+    headers = {**ADMIN, "If-Match": '"0"', "Idempotency-Key": "dial-change-1"}
+    body = {"permission_lease_seconds": 60, "reason": "incident response"}
+
+    first = api.put("/admin/enforcement", headers=headers, json=body)
+    replay = api.put("/admin/enforcement", headers=headers, json=body)
+    stale = api.put(
+        "/admin/enforcement",
+        headers={**ADMIN, "If-Match": '"0"', "Idempotency-Key": "dial-change-2"},
+        json={"permission_lease_seconds": 900, "reason": "stale operator"},
+    )
+    reused = api.put(
+        "/admin/enforcement",
+        headers=headers,
+        json={"permission_lease_seconds": 300, "reason": "different request"},
+    )
+
+    assert first.status_code == replay.status_code == 200
+    assert first.json() == replay.json()
+    assert first.headers["etag"] == replay.headers["etag"] == '"1"'
+    assert stale.status_code == 409
+    assert stale.json()["error"]["type"] == "version_conflict"
+    assert stale.headers["etag"] == '"1"'
+    assert reused.status_code == 409
+    assert reused.json()["error"]["type"] == "idempotency_conflict"
+    assert metric == [("admin-shared-key", 60)]
 
 
 def test_vend_deadline_follows_the_runtime_dial(client):

@@ -1,4 +1,5 @@
 import base64
+import copy
 import gzip
 import json
 import os
@@ -23,34 +24,47 @@ class FakeDynamoClient:
         self.resource = resource
 
     def transact_write_items(self, TransactItems):  # noqa: N803
-        put = TransactItems[0]["Put"]
-        update = TransactItems[1]["Update"]
-        put_table = self.resource.Table(put["TableName"])
-        put_item = _decode_map(put["Item"])
-        put_key = {
-            key: put_item[key]
-            for key in put_table.key_attrs
+        snapshots = {
+            name: copy.deepcopy(table.items)
+            for name, table in self.resource.tables.items()
         }
-        if put_table.get_item(Key=put_key).get("Item"):
+        try:
+            for action in TransactItems:
+                if "Put" in action:
+                    put = action["Put"]
+                    table = self.resource.Table(put["TableName"])
+                    item = _decode_map(put["Item"])
+                    table.put_item(
+                        Item=item,
+                        ConditionExpression=put.get("ConditionExpression"),
+                    )
+                elif "Update" in action:
+                    update = action["Update"]
+                    self.resource.Table(update["TableName"]).update_item(
+                        Key=_decode_map(update["Key"]),
+                        UpdateExpression=update["UpdateExpression"],
+                        ConditionExpression=update.get("ConditionExpression"),
+                        ExpressionAttributeNames=update.get(
+                            "ExpressionAttributeNames"
+                        ),
+                        ExpressionAttributeValues=_decode_map(
+                            update.get("ExpressionAttributeValues")
+                        ),
+                    )
+                else:
+                    raise AssertionError("unsupported transaction action")
+        except ClientError as exc:
+            for name, items in snapshots.items():
+                self.resource.tables[name].items = items
             raise ClientError(
                 {
                     "Error": {
                         "Code": "TransactionCanceledException",
-                        "Message": "duplicate",
+                        "Message": str(exc),
                     }
                 },
                 "TransactWriteItems",
-            )
-
-        update_table = self.resource.Table(update["TableName"])
-        update_key = _decode_map(update["Key"])
-        update_values = _decode_map(update["ExpressionAttributeValues"])
-        put_table.put_item(Item=put_item)
-        update_table.update_item(
-            Key=update_key,
-            UpdateExpression=update["UpdateExpression"],
-            ExpressionAttributeValues=update_values,
-        )
+            ) from exc
 
     def get_item(self, TableName, Key, ConsistentRead=False):  # noqa: N803
         assert ConsistentRead is True
@@ -116,7 +130,15 @@ def _record(
     }
 
 
-def _seed_user(db, user_id: str, *, usd=1.0, in_limit=1000, out_limit=1000):
+def _seed_user(
+    db,
+    user_id: str,
+    *,
+    usd=1.0,
+    in_limit=1000,
+    out_limit=1000,
+    **period_limits,
+):
     db.Table(os.environ["USERS_TABLE"]).put_item(
         Item={
             "user_id": user_id,
@@ -126,6 +148,7 @@ def _seed_user(db, user_id: str, *, usd=1.0, in_limit=1000, out_limit=1000):
             "daily_usd_micro": int(usd * processor.MICRO),
             "daily_input_tokens": in_limit,
             "daily_output_tokens": out_limit,
+            **period_limits,
         }
     )
 
@@ -216,6 +239,16 @@ def test_duplicate_delivery_is_idempotent(fake_dynamodb, fake_sns, monkeypatch):
         }
     )["Item"]
     assert row["requests"] == 1
+    current = processor._current_usage(
+        fake_dynamodb.Table(os.environ["USAGE_TABLE"]),
+        "alice",
+        datetime.now(timezone.utc),
+    )
+    assert {period: value["requests"] for period, value in current.items()} == {
+        "daily": 1,
+        "weekly": 1,
+        "monthly": 1,
+    }
 
 
 def test_transient_transaction_cancellation_is_retried_not_dropped(
@@ -321,6 +354,131 @@ def test_historical_late_log_is_metered_but_does_not_block_current_day(
         Key={"user_id": "alice", "window": yesterday.strftime("%Y-%m-%d")}
     )["Item"]
     assert row["input_tokens"] == 100
+
+
+def test_late_daily_log_can_exhaust_current_weekly_quota(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    fixed = datetime(2026, 9, 9, 12, tzinfo=timezone.utc)  # Wednesday
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed if tz is not None else fixed.replace(tzinfo=None)
+
+    monkeypatch.setattr(processor, "datetime", FrozenDateTime)
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    _seed_user(
+        fake_dynamodb,
+        "alice",
+        in_limit=1_000,
+        weekly_limits_enabled=True,
+        weekly_usd_micro=0,
+        weekly_input_tokens=150,
+        weekly_output_tokens=0,
+    )
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+    fake_dynamodb.Table(os.environ["USAGE_TABLE"]).put_item(
+        Item={
+            "user_id": "alice",
+            "window": "2026-09-09",
+            "input_tokens": 60,
+        }
+    )
+
+    _run(
+        _subscription(
+            [
+                _record(
+                    request_id="late-weekly",
+                    when=datetime(2026, 9, 8, 23, tzinfo=timezone.utc),
+                    input_tokens=100,
+                    output_tokens=0,
+                )
+            ]
+        ),
+        fake_dynamodb,
+        fake_sns,
+    )
+
+    user = fake_dynamodb.Table(os.environ["USERS_TABLE"]).get_item(
+        Key={"user_id": "alice"}
+    )["Item"]
+    assert user["status"] == "blocked"
+    assert user["status_reason"] == (
+        "auto: weekly input tokens quota exhausted in 2026-09-07"
+    )
+
+
+def test_warning_threshold_is_tracked_per_calendar_period(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    fixed = datetime(2026, 9, 9, 12, tzinfo=timezone.utc)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed if tz is not None else fixed.replace(tzinfo=None)
+
+    monkeypatch.setattr(processor, "datetime", FrozenDateTime)
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    monkeypatch.setenv("SNS_TOPIC_ARN", "arn:aws:sns:us-east-1:1:alerts")
+    monkeypatch.setenv("WARN_THRESHOLD", "0.8")
+    _seed_user(
+        fake_dynamodb,
+        "alice",
+        in_limit=1_000,
+        weekly_limits_enabled=True,
+        weekly_usd_micro=0,
+        weekly_input_tokens=100,
+        weekly_output_tokens=0,
+    )
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+
+    _run(
+        _subscription([_record(request_id="weekly-warning", when=fixed, input_tokens=80, output_tokens=0)]),
+        fake_dynamodb,
+        fake_sns,
+    )
+
+    assert len(fake_sns.published) == 1
+    payload = json.loads(fake_sns.published[0]["Message"])
+    assert payload["period"] == "weekly"
+    row = fake_dynamodb.Table(os.environ["USERS_TABLE"]).get_item(
+        Key={"user_id": "alice"}
+    )["Item"]
+    assert row["warning_sent_weekly_window"] == "2026-09-07"
+
+
+def test_duplicate_delivery_repairs_failed_status_convergence(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    _seed_user(fake_dynamodb, "alice", in_limit=1)
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+    event = _subscription([_record(input_tokens=1, output_tokens=0)])
+    real_evaluate = processor._evaluate_quota
+
+    monkeypatch.setattr(
+        processor,
+        "_evaluate_quota",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("after commit")),
+    )
+    with pytest.raises(RuntimeError, match="after commit"):
+        _run(event, fake_dynamodb, fake_sns)
+
+    monkeypatch.setattr(processor, "_evaluate_quota", real_evaluate)
+    result = _run(event, fake_dynamodb, fake_sns)
+
+    assert result["duplicates"] == 1
+    user = fake_dynamodb.Table(os.environ["USERS_TABLE"]).get_item(
+        Key={"user_id": "alice"}
+    )["Item"]
+    assert user["status"] == "blocked"
+    usage = fake_dynamodb.Table(os.environ["USAGE_TABLE"]).get_item(
+        Key={"user_id": "alice", "window": datetime.now(timezone.utc).date().isoformat()}
+    )["Item"]
+    assert usage["requests"] == 1
 
 
 def test_unknown_model_uses_configured_conservative_fallback(
@@ -754,9 +912,20 @@ def _workload_env(monkeypatch, *, model="us.anthropic.claude-opus-4-7"):
             }
         ),
     )
-    monkeypatch.setenv("DEFAULT_DAILY_USD", "2.5")
-    monkeypatch.setenv("DEFAULT_DAILY_INPUT_TOKENS", "111")
-    monkeypatch.setenv("DEFAULT_DAILY_OUTPUT_TOKENS", "222")
+    monkeypatch.setenv(
+        "DEFAULT_LIMITS_JSON",
+        json.dumps(
+            {
+                "daily": {
+                    "usd": 2.5,
+                    "input_tokens": 111,
+                    "output_tokens": 222,
+                },
+                "weekly": None,
+                "monthly": None,
+            }
+        ),
+    )
 
 
 def _workload_record(**overrides) -> dict:
@@ -824,6 +993,33 @@ def test_workload_row_is_auto_provisioned_with_deploy_defaults(
     assert row["version"] == 1
 
 
+def test_workload_positive_submicro_default_remains_finite(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    _workload_env(monkeypatch)
+    monkeypatch.setenv(
+        "DEFAULT_LIMITS_JSON",
+        json.dumps(
+            {
+                "daily": {
+                    "usd": 0.0000001,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                },
+                "weekly": None,
+                "monthly": None,
+            }
+        ),
+    )
+
+    _run(_subscription([_workload_record()]), fake_dynamodb, fake_sns)
+
+    row = fake_dynamodb.Table(os.environ["USERS_TABLE"]).get_item(
+        Key={"user_id": "workload:payments"}
+    )["Item"]
+    assert row["daily_usd_micro"] == 1
+
+
 def test_workload_auto_provision_never_overwrites_admin_limits(
     fake_dynamodb, fake_sns, monkeypatch
 ):
@@ -881,7 +1077,20 @@ def test_workload_over_budget_blocks_the_workload_row(
     fake_dynamodb, fake_sns, monkeypatch
 ):
     _workload_env(monkeypatch)
-    monkeypatch.setenv("DEFAULT_DAILY_USD", "0.008")  # 8000 micro
+    monkeypatch.setenv(
+        "DEFAULT_LIMITS_JSON",
+        json.dumps(
+            {
+                "daily": {
+                    "usd": 0.008,
+                    "input_tokens": 111,
+                    "output_tokens": 222,
+                },
+                "weekly": None,
+                "monthly": None,
+            }
+        ),
+    )
 
     result = _run(
         _subscription(
@@ -899,7 +1108,7 @@ def test_workload_over_budget_blocks_the_workload_row(
     )
     assert row["status"] == "blocked"
     assert row["status_origin"] == "automatic"
-    assert row["status_reason"].startswith("auto: quota exhausted")
+    assert row["status_reason"].startswith("auto: daily USD quota exhausted")
 
 
 def test_vended_session_via_workload_profile_bills_the_workload(

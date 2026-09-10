@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 import pytest
 
@@ -212,6 +213,76 @@ def test_emergency_stop_state_keeps_vending_closed_through_recovery(
     store.mark_emergency_applied(active=False, now=now + timedelta(seconds=3))
     assert not store.emergency_stop_active()
     assert store.list_users() == []
+
+
+def test_emergency_state_normalizes_dynamodb_decimals(fake_dynamodb):
+    store = QuotaStore(dynamodb=fake_dynamodb)
+    store._users.put_item(  # noqa: SLF001 - focused store boundary test
+        Item={
+            "user_id": "CONFIG#EMERGENCY_STOP",
+            "state": "inactive",
+            "desired_active": False,
+            "generation": Decimal("2"),
+            "applied_generation": Decimal("2"),
+        }
+    )
+
+    state = store.get_emergency_state()
+
+    assert state["generation"] == 2
+    assert type(state["generation"]) is int
+    assert state["applied_generation"] == 2
+    assert type(state["applied_generation"]) is int
+
+
+def test_existing_daily_rows_feed_weekly_and_monthly_limits(fake_dynamodb):
+    store = QuotaStore(dynamodb=fake_dynamodb)
+    now = datetime(2026, 9, 9, 12, tzinfo=timezone.utc)
+    store.put_user(
+        "calendar-user",
+        "Calendar User",
+        limits={
+            "daily": {"usd": 100, "input_tokens": 0, "output_tokens": 0},
+            "weekly": {"usd": 0.000006, "input_tokens": 0, "output_tokens": 0},
+            "monthly": {"usd": 0.000020, "input_tokens": 0, "output_tokens": 0},
+        },
+    )
+    for window, cost in (
+        ("2026-09-01", 10),
+        ("2026-09-07", 4),
+        ("2026-09-09", 3),
+    ):
+        store._usage.put_item(  # noqa: SLF001 - existing ledger rows
+            Item={"user_id": "calendar-user", "window": window, "cost_micro": cost}
+        )
+
+    user = store.get_user("calendar-user")
+    usage = store.get_current_usage("calendar-user", now)
+    evaluation = store.evaluate_user_quota(user, now)
+
+    assert usage["daily"]["cost_micro"] == 3
+    assert usage["weekly"]["cost_micro"] == 7
+    assert usage["monthly"]["cost_micro"] == 17
+    assert [(item.period, item.dimension) for item in evaluation.breaches] == [
+        ("weekly", "usd")
+    ]
+
+
+def test_period_limit_change_reconciles_automatic_but_not_manual_status(
+    fake_dynamodb,
+):
+    store = QuotaStore(dynamodb=fake_dynamodb)
+    store.put_user("alice", "Alice", 1, 100, 50)
+    store.set_user_status(
+        "alice", "blocked", "auto: daily USD quota exhausted in 2026-09-09"
+    )
+    automatic = store.get_user("alice")
+    assert store.reconcile_limits(automatic).status == "active"
+
+    store.set_user_status("alice", "blocked", "security review", origin="admin")
+    manual = store.get_user("alice")
+    assert store.reconcile_limits(manual).status == "blocked"
+    assert store.get_user("alice").status_reason == "security review"
 
 
 def test_auto_block_reactivates_only_when_current_window_is_under_quota(

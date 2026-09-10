@@ -19,6 +19,12 @@ import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
+from bedrock_spend_controls.quota_periods import (
+    PERIODS,
+    calendar_window,
+    period_for_start,
+    quota_reason,
+)
 
 from . import emf
 from .auth import (
@@ -35,6 +41,7 @@ from .quota import (
     MICRO,
     VALID_PERMISSION_LEASE_SECONDS,
     WORKLOAD_USER_ID_PREFIX,
+    EnforcementVersionConflict,
     IdempotencyConflict,
     LeaseExpired,
     LeaseNotRefreshable,
@@ -44,6 +51,7 @@ from .quota import (
     UserAlreadyExists,
     UserRecord,
     VersionConflict,
+    configured_default_limits,
     validate_user_id,
 )
 
@@ -193,15 +201,32 @@ def _authenticate(
     return user, identity, ""
 
 
-def _quota_headers(user: UserRecord) -> dict[str, str]:
-    return {
+def _quota_headers(user: UserRecord, evaluation=None) -> dict[str, str]:
+    # X-Quota-Limit-USD intentionally reports only the DAILY USD limit and
+    # keeps its pre-period name and shape for backward compatibility with
+    # existing clients. Weekly or monthly may be the binding constraint:
+    # clients discover enabled periods via X-Quota-Enabled-Periods and, on
+    # 429 responses, the binding period/dimension and its reset time via the
+    # X-Quota-Breached-* and X-Quota-Resets-At headers below.
+    headers = {
         "X-Quota-Limit-USD": (
             f"{user.daily_usd_micro / MICRO:.6f}"
-            if user.daily_usd_micro
-            else "unlimited"
+            if user.daily_limits_enabled and user.daily_usd_micro
+            else ("unlimited" if user.daily_limits_enabled else "disabled")
         ),
         "X-Quota-Window": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "X-Quota-Enabled-Periods": ",".join(
+            period
+            for period, limits in user.period_limits.items()
+            if limits is not None
+        ),
     }
+    if evaluation is not None and evaluation.breaches:
+        first = evaluation.breaches[0]
+        headers["X-Quota-Breached-Period"] = first.period
+        headers["X-Quota-Breached-Dimension"] = first.dimension
+        headers["X-Quota-Resets-At"] = first.window.end.isoformat()
+    return headers
 
 
 def _lease_retry_headers(retry_after: datetime) -> dict[str, str]:
@@ -289,13 +314,15 @@ async def vend_credentials(request: Request) -> Response:
             "quota_blocked",
             headers=_quota_headers(user),
         )
+    evaluation = None
     for _ in range(3):
-        if not user.active or not store().is_over_budget(user):
+        evaluation = store().evaluate_user_quota(user)
+        if not user.active or not evaluation.over_budget:
             break
         changed = store().set_user_status(
             user.user_id,
             "blocked",
-            "auto: quota exhausted at credential vend",
+            quota_reason(evaluation),
             expected_version=user.version,
             expected_status=user.status,
             expected_reason=user.status_reason,
@@ -308,9 +335,9 @@ async def vend_credentials(request: Request) -> Response:
             emf.record_throttle(user.user_id, "-", "over-budget-at-vend")
             return _error(
                 429,
-                "Daily quota exhausted; credentials not issued.",
+                "A quota limit is exhausted; credentials were not issued.",
                 "quota_exceeded",
-                headers=_quota_headers(user),
+                headers=_quota_headers(user, evaluation),
             )
     if not user.active:
         return _error(
@@ -319,12 +346,13 @@ async def vend_credentials(request: Request) -> Response:
             "quota_blocked",
             headers=_quota_headers(user),
         )
-    if store().is_over_budget(user):
+    evaluation = store().evaluate_user_quota(user)
+    if evaluation.over_budget:
         return _error(
             503,
             "Quota state changed concurrently; retry credential vending.",
             "quota_state_conflict",
-            headers={"Retry-After": "1"},
+            headers={"Retry-After": "1", **_quota_headers(user, evaluation)},
         )
 
     reservation, lease_error = _reserve_permission_lease(
@@ -350,11 +378,13 @@ async def vend_credentials(request: Request) -> Response:
                 f"User '{user.user_id}' is blocked.",
                 "quota_blocked",
             )
-        if store().is_over_budget(latest_user):
+        evaluation = store().evaluate_user_quota(latest_user)
+        if evaluation.over_budget:
             return _error(
                 429,
-                "Daily quota exhausted; credentials not issued.",
+                "A quota limit is exhausted; credentials were not issued.",
                 "quota_exceeded",
+                headers=_quota_headers(latest_user, evaluation),
             )
 
     try:
@@ -508,10 +538,38 @@ async def _admin_json_object(
 
 
 def _limits_json(user: UserRecord) -> dict:
+    limits: dict[str, dict | None] = {}
+    for period, value in user.period_limits.items():
+        limits[period] = (
+            {
+                "usd": int(value.get("usd_micro", 0)) / MICRO,
+                "input_tokens": int(value.get("input_tokens", 0)),
+                "output_tokens": int(value.get("output_tokens", 0)),
+            }
+            if value is not None
+            else None
+        )
+    return limits
+
+
+def _period_usage_json(value: dict[str, object]) -> dict:
     return {
-        "daily_usd": user.daily_usd_micro / MICRO,
-        "daily_input_tokens": user.daily_input_tokens,
-        "daily_output_tokens": user.daily_output_tokens,
+        "period": str(value["period"]),
+        "window": str(value["window"]),
+        "window_start": str(value["window_start"]),
+        "window_end": str(value["window_end"]),
+        "resets_at": str(value["resets_at"]),
+        "cost_usd": int(value.get("cost_micro", 0)) / MICRO,
+        "input_tokens": int(value.get("input_tokens", 0)),
+        "output_tokens": int(value.get("output_tokens", 0)),
+        "requests": int(value.get("requests", 0)),
+    }
+
+
+def _current_usage_json(user_id: str) -> dict[str, dict]:
+    return {
+        period: _period_usage_json(value)
+        for period, value in store().get_current_usage(user_id).items()
     }
 
 
@@ -671,32 +729,61 @@ def _transaction_unavailable() -> JSONResponse:
 def _parse_limits(
     body: dict, *, with_defaults: bool
 ) -> tuple[dict, str]:
-    defaults = {
-        "daily_usd": settings.default_daily_usd,
-        "daily_input_tokens": settings.default_daily_input_tokens,
-        "daily_output_tokens": settings.default_daily_output_tokens,
-    }
-    values: dict = {}
-    for field_name, default in defaults.items():
-        if field_name not in body:
-            if with_defaults:
-                values[field_name] = default
+    if "limits" not in body:
+        return (
+            (configured_default_limits(), "")
+            if with_defaults
+            else ({}, "limits is required.")
+        )
+    raw_limits = body["limits"]
+    if not isinstance(raw_limits, dict):
+        return {}, "limits must be an object."
+    unknown_periods = sorted(set(raw_limits) - set(PERIODS))
+    if unknown_periods:
+        return {}, "Unknown quota periods: " + ", ".join(unknown_periods)
+    values: dict[str, dict | None] = (
+        configured_default_limits() if with_defaults else {}
+    )
+    expected_fields = {"usd", "input_tokens", "output_tokens"}
+    for period in PERIODS:
+        if period not in raw_limits:
             continue
-        raw = body[field_name]
-        if field_name == "daily_usd":
-            if isinstance(raw, bool):
-                return {}, f"{field_name} must be a non-negative number."
-            try:
-                value = float(raw)
-            except (TypeError, ValueError):
-                return {}, f"{field_name} must be a non-negative number."
-            if not math.isfinite(value) or value < 0:
-                return {}, f"{field_name} must be a non-negative number."
-        else:
-            if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
-                return {}, f"{field_name} must be a non-negative integer."
-            value = raw
-        values[field_name] = value
+        raw_period = raw_limits[period]
+        if raw_period is None:
+            values[period] = None
+            continue
+        if not isinstance(raw_period, dict):
+            return {}, f"limits.{period} must be an object or null."
+        unknown_fields = sorted(set(raw_period) - expected_fields)
+        missing_fields = sorted(expected_fields - set(raw_period))
+        if unknown_fields or missing_fields:
+            details = []
+            if missing_fields:
+                details.append("missing " + ", ".join(missing_fields))
+            if unknown_fields:
+                details.append("unknown " + ", ".join(unknown_fields))
+            return {}, f"Invalid limits.{period}: " + "; ".join(details)
+        period_values: dict[str, float | int] = {}
+        for field_name in ("usd", "input_tokens", "output_tokens"):
+            raw = raw_period[field_name]
+            qualified = f"limits.{period}.{field_name}"
+            if field_name == "usd":
+                if isinstance(raw, bool):
+                    return {}, f"{qualified} must be a non-negative number."
+                try:
+                    parsed: float | int = float(raw)
+                except (TypeError, ValueError):
+                    return {}, f"{qualified} must be a non-negative number."
+                if not math.isfinite(parsed) or parsed < 0:
+                    return {}, f"{qualified} must be a non-negative number."
+            else:
+                if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+                    return {}, f"{qualified} must be a non-negative integer."
+                parsed = raw
+            period_values[field_name] = parsed
+        values[period] = period_values
+    if with_defaults and not any(value is not None for value in values.values()):
+        return {}, "At least one quota period must be enabled."
     return values, ""
 
 
@@ -737,7 +824,7 @@ async def create_user(request: Request) -> Response:
         result = store().create_admin_user(
             user_id=user_id,
             name=name.strip(),
-            **limits,
+            limits=limits,
             actor=principal.actor,
             auth_method=principal.auth_method,
             idempotency_key=request_id,
@@ -779,6 +866,7 @@ async def list_users(
     status: str | None = None,
     query: str | None = None,
     granularity: str | None = None,
+    include_usage: bool = True,
 ) -> Response:
     if (denied := _require_admin(request)) is not None:
         return denied
@@ -808,15 +896,32 @@ async def list_users(
         )
     except ValueError:
         return _error(400, "Invalid cursor.", "invalid_request_error")
-    return JSONResponse(
-        {
-            "users": [
-                {**_user_json(user), "today": store().get_window_usage(user.user_id)}
-                for user in users
-            ],
-            "next_cursor": next_cursor,
-        }
-    )
+    if not include_usage:
+        return JSONResponse(
+            {
+                "users": [_user_json(user) for user in users],
+                "next_cursor": next_cursor,
+            }
+        )
+    rows = []
+    for user in users:
+        current_usage = _current_usage_json(user.user_id)
+        rows.append(
+            {
+                **_user_json(user),
+                "today": {
+                    key: current_usage["daily"][key]
+                    for key in (
+                        "cost_usd",
+                        "input_tokens",
+                        "output_tokens",
+                        "requests",
+                    )
+                },
+                "current_usage": current_usage,
+            }
+        )
+    return JSONResponse({"users": rows, "next_cursor": next_cursor})
 
 
 def _json_object(raw: str) -> dict:
@@ -1176,7 +1281,8 @@ async def get_enforcement(request: Request) -> Response:
             "default_permission_lease_seconds": (
                 settings.permission_lease_seconds
             ),
-        }
+        },
+        headers={"ETag": f'"{int(config["generation"])}"'},
     )
 
 
@@ -1207,14 +1313,62 @@ async def set_enforcement(request: Request) -> Response:
     if reason_error is not None:
         return reason_error
     assert reason is not None
+    current = store().get_enforcement_config()
+    raw_match = request.headers.get("if-match")
+    if raw_match is None:
+        expected_generation = int(current["generation"])
+    else:
+        normalized_match = raw_match.strip().removeprefix("W/").strip('"')
+        try:
+            expected_generation = int(normalized_match)
+        except ValueError:
+            return _error(
+                400,
+                "If-Match must contain the enforcement generation.",
+                "invalid_request_error",
+            )
+        if expected_generation < 0:
+            return _error(
+                400,
+                "If-Match must contain the enforcement generation.",
+                "invalid_request_error",
+            )
+    request_id, key_error = _idempotency_key(request)
+    if key_error is not None:
+        return key_error
+    assert request_id is not None
     try:
         config = store().set_permission_lease_seconds(
-            raw_seconds, actor=principal.actor, reason=reason
+            raw_seconds,
+            actor=principal.actor,
+            reason=reason,
+            expected_generation=expected_generation,
+            idempotency_key=request_id,
         )
     except ValueError as exc:
         return _error(400, str(exc), "invalid_request_error")
-    emf.record_enforcement_dial(principal.actor, raw_seconds)
-    return JSONResponse(config)
+    except IdempotencyConflict:
+        return _error(
+            409,
+            "Idempotency-Key was already used for a different request.",
+            "idempotency_conflict",
+        )
+    except EnforcementVersionConflict as exc:
+        return _error(
+            409,
+            "The enforcement dial changed; refresh and retry.",
+            "version_conflict",
+            headers={"ETag": f'"{int(exc.current["generation"])}"'},
+            details={"current_enforcement": exc.current},
+        )
+    except ClientError:
+        return _transaction_unavailable()
+    replayed = bool(config.pop("_replayed", False))
+    if not replayed:
+        emf.record_enforcement_dial(principal.actor, raw_seconds)
+    return JSONResponse(
+        config, headers={"ETag": f'"{int(config["generation"])}"'}
+    )
 
 
 @app.post("/admin/emergency-stop", status_code=202)
@@ -1349,7 +1503,11 @@ def _suffix_detail_collision(
     if exact is None:
         return None
     return JSONResponse(
-        {"user": _user_json(exact)}, headers={"ETag": _etag(exact)}
+        {
+            "user": _user_json(exact),
+            "current_usage": _current_usage_json(exact.user_id),
+        },
+        headers={"ETag": _etag(exact)},
     )
 
 
@@ -1423,6 +1581,7 @@ def _admin_reason(body: dict) -> tuple[str | None, JSONResponse | None]:
 
 def _user_usage_history_response(
     user_id: str,
+    period: str,
     start: str | None,
     end: str | None,
     limit: int,
@@ -1435,13 +1594,38 @@ def _user_usage_history_response(
     user = store().get_user(user_id)
     if user is None:
         return _error(404, f"User '{user_id}' was not found.", "not_found")
+    if period not in PERIODS:
+        return _error(
+            400,
+            "period must be 'daily', 'weekly', or 'monthly'.",
+            "invalid_request_error",
+        )
+    if period != "daily":
+        today = datetime.now(timezone.utc)
+        oldest = today.date() - timedelta(days=settings.usage_retention_days)
+        if start is None:
+            first = calendar_window(
+                period,
+                datetime.combine(oldest, datetime.min.time(), tzinfo=timezone.utc),
+            )
+            if first.start.date() < oldest:
+                first = calendar_window(period, first.end)
+            start = first.key
+        if end is None:
+            end = calendar_window(period, today).key
+        try:
+            period_for_start(period, start)
+            period_for_start(period, end)
+        except ValueError as exc:
+            return _error(400, str(exc), "invalid_date_range")
     date_range, range_error = _usage_history_range(start, end)
     if range_error is not None:
         return range_error
     assert date_range is not None
     try:
-        history, next_cursor = store().get_usage_history_page(
+        history, next_cursor = store().get_period_usage_history_page(
             user_id,
+            period=period,
             start=date_range[0],
             end=date_range[1],
             limit=limit,
@@ -1452,6 +1636,7 @@ def _user_usage_history_response(
     return JSONResponse(
         {
             "user_id": user_id,
+            "period": period,
             "start": date_range[0],
             "end": date_range[1],
             "usage": history,
@@ -1464,6 +1649,7 @@ def _user_usage_history_response(
 async def canonical_user_usage_history(
     request: Request,
     user_id: str | None = None,
+    period: str = "daily",
     start: str | None = None,
     end: str | None = None,
     limit: int = 50,
@@ -1474,13 +1660,16 @@ async def canonical_user_usage_history(
     if (invalid := _canonical_user_id_error(request, user_id)) is not None:
         return invalid
     assert user_id is not None
-    return _user_usage_history_response(user_id, start, end, limit, cursor)
+    return _user_usage_history_response(
+        user_id, period, start, end, limit, cursor
+    )
 
 
 @app.get("/admin/users/{user_id:path}/usage-history")
 async def user_usage_history(
     user_id: str,
     request: Request,
+    period: str = "daily",
     start: str | None = None,
     end: str | None = None,
     limit: int = 50,
@@ -1494,7 +1683,9 @@ async def user_usage_history(
         collision := _suffix_detail_collision(user_id, "usage-history")
     ) is not None:
         return collision
-    return _user_usage_history_response(user_id, start, end, limit, cursor)
+    return _user_usage_history_response(
+        user_id, period, start, end, limit, cursor
+    )
 
 
 def _user_admin_audit_response(
@@ -1550,25 +1741,43 @@ async def user_admin_audit(
     return _user_admin_audit_response(user_id, limit, cursor)
 
 
-def _user_usage_response(user_id: str, window: str | None) -> Response:
-    return JSONResponse(store().get_window_usage(user_id, window))
+def _user_usage_response(
+    user_id: str, period: str, window: str | None
+) -> Response:
+    if period not in PERIODS:
+        return _error(
+            400,
+            "period must be 'daily', 'weekly', or 'monthly'.",
+            "invalid_request_error",
+        )
+    try:
+        usage = store().get_period_usage(user_id, period, window)
+    except ValueError as exc:
+        return _error(400, str(exc), "invalid_request_error")
+    return JSONResponse({"user_id": user_id, **_period_usage_json(usage)})
 
 
 @app.get("/admin/user/usage")
 async def canonical_user_usage(
-    request: Request, user_id: str | None = None, window: str | None = None
+    request: Request,
+    user_id: str | None = None,
+    period: str = "daily",
+    window: str | None = None,
 ) -> Response:
     if (denied := _require_admin(request)) is not None:
         return denied
     if (invalid := _canonical_user_id_error(request, user_id)) is not None:
         return invalid
     assert user_id is not None
-    return _user_usage_response(user_id, window)
+    return _user_usage_response(user_id, period, window)
 
 
 @app.get("/admin/users/{user_id:path}/usage")
 async def user_usage(
-    user_id: str, request: Request, window: str | None = None
+    user_id: str,
+    request: Request,
+    period: str = "daily",
+    window: str | None = None,
 ) -> Response:
     if (denied := _require_admin(request)) is not None:
         return denied
@@ -1576,7 +1785,7 @@ async def user_usage(
         return invalid
     if (collision := _suffix_detail_collision(user_id, "usage")) is not None:
         return collision
-    return _user_usage_response(user_id, window)
+    return _user_usage_response(user_id, period, window)
 
 
 def _user_detail_response(user_id: str) -> Response:
@@ -1584,7 +1793,11 @@ def _user_detail_response(user_id: str) -> Response:
     if user is None:
         return _error(404, f"User '{user_id}' was not found.", "not_found")
     return JSONResponse(
-        {"user": _user_json(user)}, headers={"ETag": _etag(user)}
+        {
+            "user": _user_json(user),
+            "current_usage": _current_usage_json(user.user_id),
+        },
+        headers={"ETag": _etag(user)},
     )
 
 
@@ -1624,7 +1837,14 @@ async def _set_limits_response(user_id: str, request: Request) -> Response:
     if not limits:
         return _error(
             400,
-            "At least one daily quota is required.",
+            "At least one quota period update is required.",
+            "invalid_request_error",
+        )
+    limits = {**_limits_json(current), **limits}
+    if not any(value is not None for value in limits.values()):
+        return _error(
+            400,
+            "At least one quota period must be enabled.",
             "invalid_request_error",
         )
     reason, reason_error = _admin_reason(body)
@@ -1641,6 +1861,8 @@ async def _set_limits_response(user_id: str, request: Request) -> Response:
     if key_error is not None:
         return key_error
     assert expected is not None and request_id is not None
+    request_hash = _request_hash(request, canonical_body, principal)
+    reconciled_status = store().status_after_limit_change(current, limits)
     try:
         result = store().update_admin_limits(
             user_id,
@@ -1650,9 +1872,8 @@ async def _set_limits_response(user_id: str, request: Request) -> Response:
             actor=principal.actor,
             auth_method=principal.auth_method,
             idempotency_key=request_id,
-            request_hash=_request_hash(
-                request, canonical_body, principal
-            ),
+            request_hash=request_hash,
+            reconciled_status=reconciled_status,
         )
     except IdempotencyConflict:
         return _error(

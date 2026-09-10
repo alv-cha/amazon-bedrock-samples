@@ -13,10 +13,17 @@ from cdk.stacks.spend_controls_stack import SpendControlsStack
 @pytest.fixture(autouse=True)
 def no_asset_bundling(monkeypatch):
     inline = lambda_.Code.from_inline("def handler(event, context): return {}")
+    original_from_asset = stack_module.lambda_.Code.from_asset
+
+    def code_from_asset(path, *args, **kwargs):
+        if str(path).endswith("quota_periods_layer"):
+            return original_from_asset(path)
+        return inline
+
     monkeypatch.setattr(
         stack_module.lambda_.Code,
         "from_asset",
-        lambda *args, **kwargs: inline,
+        code_from_asset,
     )
     monkeypatch.setattr(
         stack_module.s3deploy.Source,
@@ -152,9 +159,15 @@ def test_defaults_are_injected_and_tables_are_destroyable_for_demo():
     processor_env = _environment_with(template, "WARN_THRESHOLD")
 
     assert broker_env["AUTO_PROVISION_USERS"] == "true"
-    assert broker_env["DEFAULT_DAILY_USD"] == "1.0"
-    assert broker_env["DEFAULT_DAILY_INPUT_TOKENS"] == "1000000"
-    assert broker_env["DEFAULT_DAILY_OUTPUT_TOKENS"] == "200000"
+    assert json.loads(broker_env["DEFAULT_LIMITS_JSON"]) == {
+        "daily": {
+            "usd": 1.0,
+            "input_tokens": 1_000_000,
+            "output_tokens": 200_000,
+        },
+        "weekly": None,
+        "monthly": None,
+    }
     assert broker_env["USAGE_RETENTION_DAYS"] == "35"
     assert broker_env["VENDED_CREDENTIAL_TTL_SECONDS"] == "900"
     assert "CREDENTIAL_ENFORCEMENT_MODE" not in broker_env
@@ -198,9 +211,15 @@ def test_production_values_and_table_retention():
         {
             "manage_invocation_logging": True,
             "auto_provision_users": False,
-            "default_daily_usd": 25,
-            "default_daily_input_tokens": 10_000_000,
-            "default_daily_output_tokens": 2_000_000,
+            "default_limits": {
+                "daily": {
+                    "usd": 25,
+                    "input_tokens": 10_000_000,
+                    "output_tokens": 2_000_000,
+                },
+                "weekly": None,
+                "monthly": None,
+            },
             "warn_threshold": 0.75,
             "usage_retention_days": 90,
             "retain_tables_on_delete": True,
@@ -214,7 +233,7 @@ def test_production_values_and_table_retention():
     broker_env = _environment_with(template, "BEDROCK_USER_ROLE_ARN")
     processor_env = _environment_with(template, "WARN_THRESHOLD")
     assert broker_env["AUTO_PROVISION_USERS"] == "false"
-    assert broker_env["DEFAULT_DAILY_USD"] == "25.0"
+    assert json.loads(broker_env["DEFAULT_LIMITS_JSON"])["daily"]["usd"] == 25.0
     assert broker_env["VENDED_CREDENTIAL_TTL_SECONDS"] == "1800"
     assert "CREDENTIAL_ENFORCEMENT_MODE" not in broker_env
     assert broker_env["PERMISSION_LEASE_SECONDS"] == "300"
@@ -592,10 +611,8 @@ def test_admin_ui_rejects_unsupported_or_unauthorized_identity_setup():
         ("manage_invocation_logging", "yes", "must be true or false"),
         ("retain_tables_on_delete", "sometimes", "must be true or false"),
         ("snapstart", "1", "must be true or false"),
-        ("default_daily_usd", 0, "positive number"),
-        ("default_daily_input_tokens", -1, "positive integer"),
-        ("default_daily_output_tokens", 1.5, "positive integer"),
         ("usage_retention_days", 0, "positive integer"),
+        ("usage_retention_days", 30, "at least 31"),
         ("warn_threshold", 0, "positive number"),
         ("warn_threshold", 1, "less than 1"),
         ("vended_ttl_seconds", 899, "between 900"),
@@ -615,6 +632,75 @@ def test_admin_ui_rejects_unsupported_or_unauthorized_identity_setup():
 def test_invalid_deployment_values_fail_synth(key, value, message):
     with pytest.raises(ValueError, match=message):
         _template({"manage_invocation_logging": True, key: value})
+
+
+@pytest.mark.parametrize(
+    ("limits", "message"),
+    [
+        (
+            {"daily": None, "weekly": None, "monthly": None},
+            "missing daily",
+        ),
+        (
+            {
+                "daily": {"usd": -1, "input_tokens": 1, "output_tokens": 1},
+                "weekly": None,
+                "monthly": None,
+            },
+            "non-negative number",
+        ),
+        (
+            {
+                "daily": {"usd": 1, "input_tokens": 1.5, "output_tokens": 1},
+                "weekly": None,
+                "monthly": None,
+            },
+            "non-negative integer",
+        ),
+    ],
+)
+def test_invalid_default_limits_fail_synth(limits, message):
+    with pytest.raises(ValueError, match=message):
+        _template(
+            {
+                "manage_invocation_logging": True,
+                "default_limits": limits,
+            }
+        )
+
+
+def test_legacy_daily_defaults_migrate_to_daily_period_only():
+    template = _template(
+        {
+            "manage_invocation_logging": True,
+            "default_daily_usd": 7,
+            "default_daily_input_tokens": 700,
+            "default_daily_output_tokens": 70,
+        }
+    )
+    defaults = json.loads(
+        _environment_with(template, "BEDROCK_USER_ROLE_ARN")[
+            "DEFAULT_LIMITS_JSON"
+        ]
+    )
+    assert defaults == {
+        "daily": {"usd": 7.0, "input_tokens": 700, "output_tokens": 70},
+        "weekly": None,
+        "monthly": None,
+    }
+
+
+def test_nested_and_legacy_default_limits_cannot_be_mixed():
+    with pytest.raises(ValueError, match="incompatible"):
+        _template(
+            {
+                "manage_invocation_logging": True,
+                "default_limits": {
+                    "daily": {"usd": 1, "input_tokens": 1, "output_tokens": 1},
+                },
+                "default_daily_usd": 2,
+            }
+        )
 
 
 def test_model_pricing_accepts_validated_json_and_conservative_fallback():
@@ -677,7 +763,15 @@ def test_deployment_file_loads_and_context_overrides_it(tmp_path):
         json.dumps(
             {
                 "manage_invocation_logging": True,
-                "default_daily_usd": 5,
+                "default_limits": {
+                    "daily": {
+                        "usd": 5,
+                        "input_tokens": 1_000_000,
+                        "output_tokens": 200_000,
+                    },
+                    "weekly": None,
+                    "monthly": None,
+                },
                 "model_config": "models.json",
             }
         )
@@ -685,14 +779,24 @@ def test_deployment_file_loads_and_context_overrides_it(tmp_path):
     template = _template(
         {
             "deployment_config": str(deployment_path),
-            "default_daily_usd": 9,
+            "default_limits": {
+                "daily": {
+                    "usd": 9,
+                    "input_tokens": 1_000_000,
+                    "output_tokens": 200_000,
+                },
+                "weekly": None,
+                "monthly": None,
+            },
         }
     )
     assert (
-        _environment_with(template, "BEDROCK_USER_ROLE_ARN")[
-            "DEFAULT_DAILY_USD"
-        ]
-        == "9.0"
+        json.loads(
+            _environment_with(template, "BEDROCK_USER_ROLE_ARN")[
+                "DEFAULT_LIMITS_JSON"
+            ]
+        )["daily"]["usd"]
+        == 9.0
     )
 
 
@@ -769,7 +873,11 @@ def test_admin_audit_table_gateway_grant_and_safe_ui_cors():
 
     policies = json.dumps(template.find_resources("AWS::IAM::Policy"))
     assert audit_logical_id in policies
-    assert "dynamodb:TransactWriteItems" in policies
+    # Transactions are authorized by the item-level actions from
+    # grant_read_write_data; the API-level name is not a valid IAM action.
+    assert "dynamodb:TransactWriteItems" not in policies
+    assert "dynamodb:PutItem" in policies
+    assert "dynamodb:ConditionCheckItem" in policies
 
     function_url = next(
         iter(template.find_resources("AWS::Lambda::Url").values())
@@ -777,10 +885,58 @@ def test_admin_audit_table_gateway_grant_and_safe_ui_cors():
     cors = function_url["Properties"]["Cors"]
     assert "if-match" in cors["AllowHeaders"]
     assert "idempotency-key" in cors["AllowHeaders"]
+    # The browser sends the break-glass key with emergency-stop requests.
+    assert "x-quota-emergency-key" in cors["AllowHeaders"]
     assert "etag" in cors["ExposeHeaders"]
+    assert "x-quota-breached-period" in cors["ExposeHeaders"]
+    assert "x-quota-breached-dimension" in cors["ExposeHeaders"]
+    assert "x-quota-enabled-periods" in cors["ExposeHeaders"]
+    assert "x-quota-resets-at" in cors["ExposeHeaders"]
     assert "x-request-id" in cors["ExposeHeaders"]
     assert cors["AllowOrigins"] != ["*"]
     assert function_url["Properties"]["AuthType"] == "AWS_IAM"
+
+
+def test_period_helper_layer_and_usage_transaction_permission_are_wired():
+    template = _template({"manage_invocation_logging": True})
+    layers = template.find_resources("AWS::Lambda::LayerVersion")
+    assert len(layers) == 1
+    layer_id = next(iter(layers))
+
+    functions = template.find_resources("AWS::Lambda::Function")
+    broker = next(
+        value
+        for value in functions.values()
+        if "BEDROCK_USER_ROLE_ARN"
+        in value.get("Properties", {}).get("Environment", {}).get("Variables", {})
+    )
+    processor = next(
+        value
+        for value in functions.values()
+        if "WARN_THRESHOLD"
+        in value.get("Properties", {}).get("Environment", {}).get("Variables", {})
+    )
+    for function in (broker, processor):
+        assert {"Ref": layer_id} in function["Properties"]["Layers"]
+
+    processor_role = processor["Properties"]["Role"]["Fn::GetAtt"][0]
+    processor_policies = [
+        value
+        for value in template.find_resources("AWS::IAM::Policy").values()
+        if {"Ref": processor_role} in value["Properties"].get("Roles", [])
+    ]
+    rendered = json.dumps(processor_policies)
+    # TransactWriteItems is not an IAM action; transactional writes are
+    # authorized by the item-level actions on both tables.
+    assert "dynamodb:TransactWriteItems" not in rendered
+    for action in (
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:ConditionCheckItem",
+    ):
+        assert action in rendered
+    assert "UsageTable" in rendered
+    assert "UsersTable" in rendered
 
 
 def test_admin_managed_login_reuses_compatible_demo_client():
@@ -1190,7 +1346,7 @@ def test_enforcer_wiring_least_privilege_and_schedules():
 def test_processor_receives_the_workload_profile_map():
     template = _template(_WORKLOADS_CONTEXT)
     env = _environment_with(template, "WORKLOAD_PROFILES_JSON")
-    assert "DEFAULT_DAILY_USD" in env
+    assert "DEFAULT_LIMITS_JSON" in env
     assert env["BEDROCK_USER_ROLE_NAME"]  # user path unchanged
     profiles = env["WORKLOAD_PROFILES_JSON"]
     rendered = json.dumps(profiles)

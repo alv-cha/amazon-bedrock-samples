@@ -19,12 +19,13 @@ import {
   ApiError,
   api,
   apiErrorMessage,
-  normalizeDailyUsd,
+  normalizeUsd,
   type AdminUser,
   type AuditEvent,
-  type AuditUserSnapshot,
   type CreateUserRequest,
+  type CurrentUsage,
   type QuotaLimits,
+  type QuotaPeriod,
   type Operations,
   type UsageHistoryResponse,
   type UserAuditListResponse,
@@ -34,6 +35,7 @@ import { useModalLifecycle } from "./modal";
 
 const PAGE_SIZE = 25;
 const RESERVED_PREFIXES = ["SESSION#", "VEND#", "REVOCATION#", "CONFIG#", "EMERGENCY_AUDIT#"];
+const QUOTA_PERIODS: QuotaPeriod[] = ["daily", "weekly", "monthly"];
 
 type DrawerTab = "overview" | "usage" | "changes";
 
@@ -64,18 +66,38 @@ function formatLimit(value: number, formatter: (item: number) => string): string
   return value === 0 ? "Unlimited" : formatter(value);
 }
 
-function parseLimits(usd: string, input: string, output: string): QuotaLimits | null {
-  const parsedUsd = usd.trim() === "" ? Number.NaN : Number(usd);
-  const parsedInput = input.trim() === "" ? Number.NaN : Number(input);
-  const parsedOutput = output.trim() === "" ? Number.NaN : Number(output);
-  if (!Number.isFinite(parsedUsd) || parsedUsd < 0 ||
-      !Number.isInteger(parsedInput) || parsedInput < 0 ||
-      !Number.isInteger(parsedOutput) || parsedOutput < 0) return null;
+type WizardPeriodDraft = { enabled: boolean; usd: string; input: string; output: string };
+type WizardLimitsDraft = Record<QuotaPeriod, WizardPeriodDraft>;
+
+function initialWizardLimits(): WizardLimitsDraft {
   return {
-    daily_usd: normalizeDailyUsd(parsedUsd),
-    daily_input_tokens: parsedInput,
-    daily_output_tokens: parsedOutput,
+    daily: { enabled: true, usd: "1", input: "1000000", output: "200000" },
+    weekly: { enabled: false, usd: "0", input: "0", output: "0" },
+    monthly: { enabled: false, usd: "0", input: "0", output: "0" },
   };
+}
+
+function parseLimits(draft: WizardLimitsDraft): QuotaLimits | null {
+  const result: Partial<QuotaLimits> = {};
+  for (const period of QUOTA_PERIODS) {
+    const value = draft[period];
+    if (!value.enabled) {
+      result[period] = null;
+      continue;
+    }
+    const usd = value.usd.trim() === "" ? Number.NaN : Number(value.usd);
+    const input = value.input.trim() === "" ? Number.NaN : Number(value.input);
+    const output = value.output.trim() === "" ? Number.NaN : Number(value.output);
+    if (!Number.isFinite(usd) || usd < 0 || !Number.isInteger(input) || input < 0 || !Number.isInteger(output) || output < 0) return null;
+    result[period] = { usd: normalizeUsd(usd), input_tokens: input, output_tokens: output };
+  }
+  return Object.values(result).some((value) => value !== null)
+    ? result as QuotaLimits
+    : null;
+}
+
+function periodLabel(period: QuotaPeriod): string {
+  return period[0].toUpperCase() + period.slice(1);
 }
 
 export function CreateUserWizard({
@@ -92,9 +114,7 @@ export function CreateUserWizard({
   const [step, setStep] = useState(0);
   const [userId, setUserId] = useState("");
   const [name, setName] = useState("");
-  const [dailyUsd, setDailyUsd] = useState("1");
-  const [dailyInput, setDailyInput] = useState("1000000");
-  const [dailyOutput, setDailyOutput] = useState("200000");
+  const [limitsDraft, setLimitsDraft] = useState<WizardLimitsDraft>(initialWizardLimits);
   const [unlimitedConfirmed, setUnlimitedConfirmed] = useState(false);
   const [openDetails, setOpenDetails] = useState(true);
   const [errors, setErrors] = useState<string[]>([]);
@@ -105,8 +125,11 @@ export function CreateUserWizard({
   const stepHeadingRef = useRef<HTMLHeadingElement>(null);
   useModalLifecycle(busy, onClose, dialogRef, userIdRef);
 
-  const limits = parseLimits(dailyUsd, dailyInput, dailyOutput);
-  const unlimited = limits !== null && Object.values(limits).some((value) => value === 0);
+  const limits = parseLimits(limitsDraft);
+  const unlimited = limits !== null && QUOTA_PERIODS.some((period) => {
+    const value = limits[period];
+    return value !== null && Object.values(value).some((item) => item === 0);
+  });
   const steps = ["Identity", "Limits", "Review"];
 
   useEffect(() => {
@@ -125,7 +148,9 @@ export function CreateUserWizard({
   }
 
   function limitErrors(): string[] {
-    if (!limits) return ["Enter a non-negative USD amount and whole token values. Fields cannot be blank."];
+    if (!limits) return [Object.values(limitsDraft).some((value) => value.enabled)
+      ? "Enter a non-negative USD amount and whole token values. Fields cannot be blank."
+      : "Enable at least one calendar quota period."];
     if (unlimited && !unlimitedConfirmed) return ["Confirm that every zero limit should be Unlimited."];
     return [];
   }
@@ -145,7 +170,7 @@ export function CreateUserWizard({
     const request: CreateUserRequest = {
       user_id: userId.trim(),
       name: name.trim(),
-      ...limits,
+      limits,
     };
     setBusy(true);
     try {
@@ -201,10 +226,19 @@ export function CreateUserWizard({
           )}
           {step === 1 && (
             <div className="wizard-fields">
-              <p className="field-help">Daily limits apply independently. Enter 0 only when that dimension must be Unlimited.</p>
-              <label><span>USD limit</span><input aria-label="Create USD limit" disabled={busy} min="0" onChange={(event) => { setDailyUsd(event.target.value); setUnlimitedConfirmed(false); setErrors([]); }} step="0.000001" type="number" value={dailyUsd} /></label>
-              <label><span>Input token limit</span><input aria-label="Create input token limit" disabled={busy} min="0" onChange={(event) => { setDailyInput(event.target.value); setUnlimitedConfirmed(false); setErrors([]); }} step="1" type="number" value={dailyInput} /></label>
-              <label><span>Output token limit</span><input aria-label="Create output token limit" disabled={busy} min="0" onChange={(event) => { setDailyOutput(event.target.value); setUnlimitedConfirmed(false); setErrors([]); }} step="1" type="number" value={dailyOutput} /></label>
+              <p className="field-help">Calendar windows use UTC. Daily is enabled by default; weekly and monthly are optional. Enter 0 only when that dimension must be Unlimited.</p>
+              <div className="quota-limit-matrix">
+                {QUOTA_PERIODS.map((period) => (
+                  <fieldset className="quota-period-card" key={period}>
+                    <legend><label className="quota-period-toggle"><input checked={limitsDraft[period].enabled} disabled={busy} onChange={(event) => { setLimitsDraft((current) => ({ ...current, [period]: { ...current[period], enabled: event.target.checked } })); setUnlimitedConfirmed(false); setErrors([]); }} type="checkbox" /><span>{periodLabel(period)}</span></label></legend>
+                    <div className="field-grid">
+                      <label><span>{periodLabel(period)} USD limit</span><input aria-label={`Create ${periodLabel(period)} USD limit`} disabled={busy || !limitsDraft[period].enabled} min="0" onChange={(event) => { setLimitsDraft((current) => ({ ...current, [period]: { ...current[period], usd: event.target.value } })); setUnlimitedConfirmed(false); setErrors([]); }} step="0.000001" type="number" value={limitsDraft[period].usd} /></label>
+                      <label><span>{periodLabel(period)} input token limit</span><input aria-label={`Create ${periodLabel(period)} input token limit`} disabled={busy || !limitsDraft[period].enabled} min="0" onChange={(event) => { setLimitsDraft((current) => ({ ...current, [period]: { ...current[period], input: event.target.value } })); setUnlimitedConfirmed(false); setErrors([]); }} step="1" type="number" value={limitsDraft[period].input} /></label>
+                      <label><span>{periodLabel(period)} output token limit</span><input aria-label={`Create ${periodLabel(period)} output token limit`} disabled={busy || !limitsDraft[period].enabled} min="0" onChange={(event) => { setLimitsDraft((current) => ({ ...current, [period]: { ...current[period], output: event.target.value } })); setUnlimitedConfirmed(false); setErrors([]); }} step="1" type="number" value={limitsDraft[period].output} /></label>
+                    </div>
+                  </fieldset>
+                ))}
+              </div>
               {unlimited && (
                 <label className="unlimited-confirm"><input checked={unlimitedConfirmed} disabled={busy} onChange={(event) => setUnlimitedConfirmed(event.target.checked)} type="checkbox" /><span>I confirm that each 0 value above means Unlimited.</span></label>
               )}
@@ -215,9 +249,10 @@ export function CreateUserWizard({
               <dl>
                 <div><dt>User identity</dt><dd>{userId.trim()}</dd></div>
                 <div><dt>Display name</dt><dd>{name.trim()}</dd></div>
-                <div><dt>USD / day</dt><dd>{formatLimit(limits.daily_usd, (value) => formatUsd(value, 6))}</dd></div>
-                <div><dt>Input tokens / day</dt><dd>{formatLimit(limits.daily_input_tokens, (value) => value.toLocaleString())}</dd></div>
-                <div><dt>Output tokens / day</dt><dd>{formatLimit(limits.daily_output_tokens, (value) => value.toLocaleString())}</dd></div>
+                {QUOTA_PERIODS.map((period) => {
+                  const value = limits[period];
+                  return <div key={period}><dt>{periodLabel(period)}</dt><dd>{value ? `${formatLimit(value.usd, (item) => formatUsd(item, 6))} · ${formatLimit(value.input_tokens, (item) => item.toLocaleString())} input · ${formatLimit(value.output_tokens, (item) => item.toLocaleString())} output` : "Disabled"}</dd></div>;
+                })}
               </dl>
               <div className="safety-warning"><ShieldAlert aria-hidden="true" size={18} /><span>Creating this user grants quota-managed access for the immutable identity shown above. No request is sent until you select Create user.</span></div>
               <label className="review-option"><input checked={openDetails} disabled={busy} onChange={(event) => setOpenDetails(event.target.checked)} type="checkbox" />Open details if the new user is added to this page</label>
@@ -244,6 +279,16 @@ function utcDate(offsetDays: number): string {
   return date.toISOString().slice(0, 10);
 }
 
+function periodStart(period: QuotaPeriod, value: string): string {
+  const date = new Date(`${value}T00:00:00Z`);
+  if (period === "weekly") {
+    date.setUTCDate(date.getUTCDate() - ((date.getUTCDay() + 6) % 7));
+  } else if (period === "monthly") {
+    date.setUTCDate(1);
+  }
+  return date.toISOString().slice(0, 10);
+}
+
 function Pagination({
   busy,
   hasNext,
@@ -263,6 +308,7 @@ function Pagination({
 }
 
 function UsageTab({ active, cfg, session, userId }: { active: boolean; cfg: AdminConfig; session: Session; userId: string }) {
+  const [period, setPeriod] = useState<QuotaPeriod>("daily");
   const [start, setStart] = useState(() => utcDate(-29));
   const [end, setEnd] = useState(() => utcDate(0));
   const [applied, setApplied] = useState(() => ({ start: utcDate(-29), end: utcDate(0) }));
@@ -272,7 +318,7 @@ function UsageTab({ active, cfg, session, userId }: { active: boolean; cfg: Admi
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [rangeError, setRangeError] = useState("");
-  const loaded = useRef(false);
+  const loadedPeriod = useRef<QuotaPeriod | null>(null);
   const request = useRef(0);
 
   async function load(cursor: string | null, range: { start: string; end: string } | undefined, targetIndex: number, reset = false) {
@@ -280,7 +326,7 @@ function UsageTab({ active, cfg, session, userId }: { active: boolean; cfg: Admi
     setLoading(true);
     setError("");
     try {
-      const next = await api.usageHistory(cfg, session, userId, { ...range, limit: PAGE_SIZE, cursor });
+      const next = await api.usageHistory(cfg, session, userId, { ...range, period, limit: PAGE_SIZE, cursor });
       if (request.current !== currentRequest) return;
       const resolvedRange = { start: next.start, end: next.end };
       setPage(next);
@@ -296,7 +342,7 @@ function UsageTab({ active, cfg, session, userId }: { active: boolean; cfg: Admi
         setCursors((current) => targetIndex > pageIndex ? [...current.slice(0, pageIndex + 1), cursor] : current);
         setPageIndex(targetIndex);
       }
-      loaded.current = true;
+      loadedPeriod.current = period;
     } catch (caught) {
       if (request.current === currentRequest) setError(apiErrorMessage(caught));
     } finally {
@@ -305,13 +351,17 @@ function UsageTab({ active, cfg, session, userId }: { active: boolean; cfg: Admi
   }
 
   useEffect(() => {
-    if (active && !loaded.current) void load(null, undefined, 0, true);
-  }, [active]);
+    if (active && loadedPeriod.current !== period) void load(null, undefined, 0, true);
+  }, [active, period]);
 
   function applyRange(event: FormEvent) {
     event.preventDefault();
     if (!start || !end || start > end) {
       setRangeError("Choose an inclusive start date that is not after the end date.");
+      return;
+    }
+    if (period !== "daily" && (periodStart(period, start) !== start || periodStart(period, end) !== end)) {
+      setRangeError(`Choose ${period} period-start dates (${period === "weekly" ? "Mondays" : "the first day of each month"}).`);
       return;
     }
     setRangeError("");
@@ -321,41 +371,57 @@ function UsageTab({ active, cfg, session, userId }: { active: boolean; cfg: Admi
   return (
     <div aria-busy={loading} className="drawer-tab-content">
       <form className="range-form" onSubmit={applyRange}>
+        <label><span>Quota period</span><select aria-label="Usage history period" onChange={(event) => { const next = event.target.value as QuotaPeriod; request.current += 1; loadedPeriod.current = null; setPeriod(next); setStart(periodStart(next, utcDate(-29))); setEnd(periodStart(next, utcDate(0))); setPage(null); setCursors([null]); setPageIndex(0); }} value={period}><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option></select></label>
         <label><span>Start date</span><input max={utcDate(0)} onChange={(event) => setStart(event.target.value)} type="date" value={start} /></label>
         <label><span>End date</span><input max={utcDate(0)} onChange={(event) => setEnd(event.target.value)} type="date" value={end} /></label>
         <button className="button button-secondary" disabled={loading} type="submit"><CalendarDays aria-hidden="true" size={16} />Apply range</button>
       </form>
-      <p className="field-help">Dates are inclusive. The gateway enforces the configured usage retention window.</p>
+      <p className="field-help">{period === "daily" ? "Dates are inclusive." : `${periodLabel(period)} history selects an inclusive range of period start dates.`} The gateway enforces the configured usage retention window.</p>
       {rangeError && <ErrorMessage message={rangeError} />}
       {error && <ErrorMessage message={error} />}
       {error && page && <span className="ops-status ops-status-amber"><span aria-hidden="true" />Showing the previous usage page</span>}
       {loading && !page ? <div className="drawer-loading"><BusyLabel>Loading usage</BusyLabel></div> : page && (
         <>
-          <div aria-label="Daily usage history" className="drawer-table-scroll" role="region" tabIndex={0}>
-            <table className="compact-table"><thead><tr><th>Date</th><th>USD</th><th>Input tokens</th><th>Output tokens</th><th>Requests</th></tr></thead><tbody>
-              {page.usage.map((row) => <tr key={row.window}><td>{row.window}</td><td>{formatUsd(row.cost_usd, 4)}</td><td>{row.input_tokens.toLocaleString()}</td><td>{row.output_tokens.toLocaleString()}</td><td>{row.requests.toLocaleString()}</td></tr>)}
+          <div aria-label={`${periodLabel(period)} usage history`} className="drawer-table-scroll" role="region" tabIndex={0}>
+            <table className="compact-table"><thead><tr><th>Window start</th><th>Resets</th><th>USD</th><th>Input tokens</th><th>Output tokens</th><th>Requests</th></tr></thead><tbody>
+              {page.usage.map((row) => <tr key={row.window}><td>{row.window}</td><td>{formatTimestamp(row.resets_at)}</td><td>{formatUsd(row.cost_usd, 4)}</td><td>{row.input_tokens.toLocaleString()}</td><td>{row.output_tokens.toLocaleString()}</td><td>{row.requests.toLocaleString()}</td></tr>)}
             </tbody></table>
             {page.usage.length === 0 && <div className="compact-empty">No usage was recorded in this date range.</div>}
           </div>
-          <Pagination busy={loading} hasNext={Boolean(page.next_cursor)} hasPrevious={pageIndex > 0} label={`${page.usage.length} daily records on this page · ${page.start} to ${page.end}`} onNext={() => page.next_cursor && void load(page.next_cursor, applied, pageIndex + 1)} onPrevious={() => void load(cursors[pageIndex - 1], applied, pageIndex - 1)} />
+          <Pagination busy={loading} hasNext={Boolean(page.next_cursor)} hasPrevious={pageIndex > 0} label={`${page.usage.length} ${period} records on this page · ${page.start} to ${page.end}`} onNext={() => page.next_cursor && void load(page.next_cursor, applied, pageIndex + 1)} onPrevious={() => void load(cursors[pageIndex - 1], applied, pageIndex - 1)} />
         </>
       )}
     </div>
   );
 }
 
-function auditUsd(snapshot: AuditUserSnapshot): number {
-  return snapshot.limits.daily_usd_micro / 1_000_000;
-}
-
 export function summarizeAuditEvent(event: AuditEvent): string {
-  if (!event.before) return `Created ${event.after.status}; USD ${formatLimit(auditUsd(event.after), (value) => formatUsd(value, 6))}, input ${formatLimit(event.after.limits.daily_input_tokens, (value) => value.toLocaleString())}, output ${formatLimit(event.after.limits.daily_output_tokens, (value) => value.toLocaleString())}.`;
+  if (!event.before) {
+    const periods = QUOTA_PERIODS.map((period) => {
+      const limits = event.after.limits[period];
+      return limits ? `${periodLabel(period)}: ${formatLimit(limits.usd_micro / 1_000_000, (value) => formatUsd(value, 6))}, ${formatLimit(limits.input_tokens, (value) => value.toLocaleString())} input, ${formatLimit(limits.output_tokens, (value) => value.toLocaleString())} output` : `${periodLabel(period)}: disabled`;
+    });
+    return `Created ${event.after.status}; ${periods.join("; ")}.`;
+  }
   const changes: string[] = [];
   if (event.before.name !== event.after.name) changes.push(`name: ${event.before.name} → ${event.after.name}`);
   if (event.before.status !== event.after.status) changes.push(`status: ${event.before.status} → ${event.after.status}`);
-  if (event.before.limits.daily_usd_micro !== event.after.limits.daily_usd_micro) changes.push(`USD: ${formatLimit(auditUsd(event.before), (value) => formatUsd(value, 6))} → ${formatLimit(auditUsd(event.after), (value) => formatUsd(value, 6))}`);
-  if (event.before.limits.daily_input_tokens !== event.after.limits.daily_input_tokens) changes.push(`input: ${formatLimit(event.before.limits.daily_input_tokens, (value) => value.toLocaleString())} → ${formatLimit(event.after.limits.daily_input_tokens, (value) => value.toLocaleString())}`);
-  if (event.before.limits.daily_output_tokens !== event.after.limits.daily_output_tokens) changes.push(`output: ${formatLimit(event.before.limits.daily_output_tokens, (value) => value.toLocaleString())} → ${formatLimit(event.after.limits.daily_output_tokens, (value) => value.toLocaleString())}`);
+  for (const period of QUOTA_PERIODS) {
+    const before = event.before.limits[period];
+    const after = event.after.limits[period];
+    if (before === null || after === null) {
+      if (before !== after) {
+        const afterDetail = after
+          ? `enabled (${formatLimit(after.usd_micro / 1_000_000, (value) => formatUsd(value, 6))}, ${formatLimit(after.input_tokens, (value) => value.toLocaleString())} input, ${formatLimit(after.output_tokens, (value) => value.toLocaleString())} output)`
+          : "disabled";
+        changes.push(`${periodLabel(period)}: ${before ? "enabled" : "disabled"} → ${afterDetail}`);
+      }
+      continue;
+    }
+    if (before.usd_micro !== after.usd_micro) changes.push(`${periodLabel(period)} USD: ${formatLimit(before.usd_micro / 1_000_000, (value) => formatUsd(value, 6))} → ${formatLimit(after.usd_micro / 1_000_000, (value) => formatUsd(value, 6))}`);
+    if (before.input_tokens !== after.input_tokens) changes.push(`${periodLabel(period)} input: ${formatLimit(before.input_tokens, (value) => value.toLocaleString())} → ${formatLimit(after.input_tokens, (value) => value.toLocaleString())}`);
+    if (before.output_tokens !== after.output_tokens) changes.push(`${periodLabel(period)} output: ${formatLimit(before.output_tokens, (value) => value.toLocaleString())} → ${formatLimit(after.output_tokens, (value) => value.toLocaleString())}`);
+  }
   return changes.length > 0 ? changes.join("; ") : `Configuration version ${event.before.version} → ${event.after.version}.`;
 }
 
@@ -427,6 +493,7 @@ export function UserDetailDrawer({
   const [tab, setTab] = useState<DrawerTab>("overview");
   const [detailError, setDetailError] = useState("");
   const [detailLoading, setDetailLoading] = useState(true);
+  const [detailUsage, setDetailUsage] = useState<CurrentUsage>(user.current_usage);
   const drawerRef = useRef<HTMLElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
@@ -442,7 +509,10 @@ export function UserDetailDrawer({
     setDetailLoading(true);
     setDetailError("");
     void api.getUser(cfg, session, user.user_id).then((result) => {
-      if (active) onCanonical(result.data.user);
+      if (active) {
+        onCanonical(result.data.user);
+        setDetailUsage(result.data.current_usage);
+      }
     }).catch((caught) => {
       if (active) setDetailError(apiErrorMessage(caught));
     }).finally(() => {
@@ -488,7 +558,7 @@ export function UserDetailDrawer({
             </button>
           </div>
           <section><h3>Identity and status</h3><dl className="detail-list"><div><dt>Status</dt><dd><span className={`status-badge status-${user.status}`}><span aria-hidden="true" />{user.status}</span></dd></div><div><dt>Status origin</dt><dd>{user.status_origin || "Not provided"}</dd></div><div><dt>Status reason</dt><dd>{user.status_reason || "Not provided"}</dd></div><div><dt>Created</dt><dd>{formatTimestamp(user.created_at)}</dd></div><div><dt>Updated</dt><dd>{formatTimestamp(user.updated_at)}</dd></div><div><dt>Version</dt><dd>{user.version}</dd></div></dl></section>
-          <section><h3>Limits and usage today</h3><dl className="detail-list"><div><dt>USD</dt><dd>{formatUsd(user.today.cost_usd, 6)} of {formatLimit(user.limits.daily_usd, (value) => formatUsd(value, 6))}</dd></div><div><dt>Input tokens</dt><dd>{user.today.input_tokens.toLocaleString()} of {formatLimit(user.limits.daily_input_tokens, (value) => value.toLocaleString())}</dd></div><div><dt>Output tokens</dt><dd>{user.today.output_tokens.toLocaleString()} of {formatLimit(user.limits.daily_output_tokens, (value) => value.toLocaleString())}</dd></div><div><dt>Requests</dt><dd>{user.today.requests.toLocaleString()}</dd></div></dl></section>
+          <section><h3>Calendar quota windows</h3><div className="detail-periods">{QUOTA_PERIODS.map((period) => { const limits = user.limits[period]; const usage = detailUsage[period]; return <article className="detail-period" key={period}><div><h4>{periodLabel(period)}</h4><span>Resets {formatTimestamp(usage.resets_at)}</span></div>{limits ? <dl className="detail-list"><div><dt>USD</dt><dd>{formatUsd(usage.cost_usd, 6)} of {formatLimit(limits.usd, (value) => formatUsd(value, 6))}</dd></div><div><dt>Input tokens</dt><dd>{usage.input_tokens.toLocaleString()} of {formatLimit(limits.input_tokens, (value) => value.toLocaleString())}</dd></div><div><dt>Output tokens</dt><dd>{usage.output_tokens.toLocaleString()} of {formatLimit(limits.output_tokens, (value) => value.toLocaleString())}</dd></div><div><dt>Requests</dt><dd>{usage.requests.toLocaleString()}</dd></div></dl> : <p className="operations-muted">Disabled</p>}</article>; })}</div></section>
         </div>
       </section>
       <section aria-labelledby="user-usage-tab" hidden={tab !== "usage"} id="user-usage-panel" role="tabpanel" tabIndex={0}><UsageTab active={tab === "usage"} cfg={cfg} session={session} userId={user.user_id} /></section>
@@ -572,7 +642,7 @@ export function LiveLeases({ cfg, configuration, session }: {
   configuration: Operations["configuration"];
   session: Session;
 }) {
-  const [rows, setRows] = useState<UserRow[]>([]);
+  const [rows, setRows] = useState<AdminUser[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   const generations = useRef<Record<string, number>>({});

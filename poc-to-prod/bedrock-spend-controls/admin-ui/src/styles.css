@@ -1767,6 +1767,9 @@ tbody tr:hover {
 
 .primary-nav button {
   position: relative;
+  display: inline-flex;
+  gap: 7px;
+  align-items: center;
   min-height: 46px;
   padding: 0 2px;
   color: #536071;
@@ -1774,6 +1777,15 @@ tbody tr:hover {
   border: 0;
   font-size: 13px;
   font-weight: 700;
+}
+
+.primary-nav button svg {
+  opacity: 0.75;
+}
+
+.primary-nav button[aria-current="page"] svg {
+  color: var(--orange);
+  opacity: 1;
 }
 
 .primary-nav button[aria-current="page"] {
@@ -2481,4 +2493,248 @@ tbody tr:hover {
 .lease-renewed-flash {
   color: #0972d3;
   font-weight: 700;
+}
+
+/* --- Operations tab: runtime controls -------------------------------- */
+
+.ops-status-blue {
+  color: #1d4f8a;
+  background: #eaf2fb;
+}
+
+.ops-status-blue > span {
+  background: var(--blue);
+}
+
+.control-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 14px;
+  margin: 0 0 16px;
+}
+
+.control-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 18px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+}
+
+.control-card-heading {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+}
+
+.control-card-help {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.control-card form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.segmented {
+  display: flex;
+  gap: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+
+.segment {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+  align-items: center;
+  padding: 10px 8px;
+  color: #536071;
+  background: #fafbfc;
+  border: 0;
+  border-right: 1px solid var(--line);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.segment:last-child {
+  border-right: 0;
+}
+
+.segment small {
+  color: var(--muted);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+.segment-active {
+  color: #7d3f00;
+  background: #fef3e7;
+  box-shadow: inset 0 0 0 2px var(--orange);
+}
+
+.segment-active small {
+  color: #a35a10;
+}
+
+.control-meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 8px 14px;
+  margin: 0;
+}
+
+.control-meta div {
+  min-width: 0;
+}
+
+.control-meta dt {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.control-meta dd {
+  margin: 2px 0 0;
+  overflow: hidden;
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.control-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.control-card-emergency .control-actions {
+  justify-content: flex-start;
+}
+
+@media (max-width: 600px) {
+  .primary-nav > div {
+    gap: 10px;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .primary-nav > div::-webkit-scrollbar {
+    display: none;
+  }
+
+  .primary-nav button {
+    flex: 0 0 auto;
+    font-size: 12.5px;
+  }
+
+  .control-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .segmented {
+    width: 100%;
+  }
+
+  .segment {
+    min-width: 0;
+    padding-inline: 5px;
+  }
+}
+
+/* --- Calendar quota periods ------------------------------------------ */
+
+.period-display-note {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.highest-utilization {
+  display: block;
+  margin-top: 4px;
+  font-size: 10.5px;
+  font-weight: 700;
+}
+
+.highest-normal { color: var(--green); }
+.highest-warning { color: #9a6700; }
+.highest-critical { color: var(--red); }
+
+.quota-limit-matrix,
+.detail-periods {
+  display: grid;
+  gap: 12px;
+}
+
+.quota-period-card,
+.detail-period {
+  min-width: 0;
+  padding: 14px;
+  background: #fafbfc;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.quota-period-card legend {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 0 2px 8px;
+}
+
+.quota-period-card legend small,
+.detail-period > div > span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.quota-period-toggle {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+  font-weight: 750;
+}
+
+.quota-period-toggle input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--orange);
+}
+
+.detail-period > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 9px;
+}
+
+.detail-period h4 {
+  margin: 0;
+  font-size: 14px;
+}
+
+@media (max-width: 700px) {
+  .quota-period-card legend,
+  .detail-period > div {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
+  }
 }

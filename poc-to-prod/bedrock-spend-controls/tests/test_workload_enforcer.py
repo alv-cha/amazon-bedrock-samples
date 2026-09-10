@@ -95,6 +95,7 @@ def _seed_workload_row(
     status_reason: str = "",
     daily_usd_micro: int = 5_000_000,
     version: int = 3,
+    **period_limits,
 ) -> None:
     fake_dynamodb.Table(os.environ["USERS_TABLE"]).put_item(
         Item={
@@ -107,6 +108,7 @@ def _seed_workload_row(
             "daily_input_tokens": 0,
             "daily_output_tokens": 0,
             "version": version,
+            **period_limits,
         }
     )
 
@@ -214,8 +216,53 @@ def test_automatic_block_lifts_when_window_resets(
         .get("Item")
     )
     assert row["status"] == "active"
-    assert row["status_reason"] == "auto: current window is under quota"
+    assert row["status_reason"] == (
+        "auto: current calendar periods are under quota"
+    )
     assert row["version"] == 4
+
+
+def test_daily_reset_does_not_lift_exhausted_monthly_workload(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    _configure(
+        monkeypatch,
+        {"workload:payments": {"name": "payments", "role_arn": ROLE_ARN}},
+    )
+    _seed_workload_row(
+        fake_dynamodb,
+        "workload:payments",
+        status="blocked",
+        status_origin="automatic",
+        status_reason="auto: monthly USD quota exhausted",
+        monthly_limits_enabled=True,
+        monthly_usd_micro=5_000_000,
+        monthly_input_tokens=0,
+        monthly_output_tokens=0,
+    )
+    now = datetime.now(timezone.utc)
+    fake_dynamodb.Table(os.environ["USAGE_TABLE"]).put_item(
+        Item={
+            "user_id": "workload:payments",
+            "window": now.replace(day=1).date().isoformat(),
+            "cost_micro": 6_000_000,
+            "requests": 1,
+        }
+    )
+    iam = FakeIAM()
+    iam.role_policies[("payments-app", "bedrock-spend-controls-workload-deny")] = (
+        enforcer.deny_policy("workload:payments")
+    )
+
+    result = _run(fake_dynamodb, fake_sns, iam)
+
+    assert result["unblocked"] == 0
+    assert result["blocked_workloads"] == 1
+    row = fake_dynamodb.Table(os.environ["USERS_TABLE"]).get_item(
+        Key={"user_id": "workload:payments"}
+    )["Item"]
+    assert row["status"] == "blocked"
+    assert row["version"] == 3
 
 
 def test_manual_admin_block_never_auto_lifts(

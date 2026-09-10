@@ -2,8 +2,9 @@
 
 Per-user, per-tenant, and per-workload quotas for Amazon Bedrock Runtime.
 
-This sample adds per-user or per-tenant daily quotas to applications that call
-the Amazon Bedrock Runtime endpoint.
+This sample adds simultaneous daily, weekly, and monthly calendar quotas to
+applications that call the Amazon Bedrock Runtime endpoint. Quotas can be
+assigned per user, tenant, or directly invoking workload.
 
 The application authenticates to a small credential broker with its existing
 OIDC JWT. If the configured identity is active and under quota, the broker
@@ -11,6 +12,28 @@ returns a short-lived STS session restricted to approved Bedrock model or
 inference-profile ARNs. The application then calls `bedrock-runtime` directly.
 
 There is no inference proxy and no second Bedrock endpoint.
+
+## Calendar quota periods
+
+Each subject can independently enable daily, weekly, and monthly limits for
+estimated USD, input tokens, and output tokens. Every enabled period is
+enforced concurrently; reaching any finite limit blocks the subject. `0`
+means Unlimited for that one dimension, while `null` disables the entire
+period.
+
+Windows are fixed UTC calendars, not rolling intervals:
+
+- Daily: 00:00 UTC through the following day.
+- Weekly: Monday 00:00 UTC through the following Monday.
+- Monthly: the first day at 00:00 UTC through the first of the next month.
+
+Daily usage rows remain the canonical ledger. Current weekly and monthly totals
+are derived with a strongly consistent query over at most 37 retained daily
+rows. This makes enabling a longer-period limit mid-period include usage that
+was recorded before the limit existed, with no backfill or dual-write cutover.
+Deployments must retain at least 31 days of usage. Subjects with only daily
+limits retain the same accounting semantics; longer-period evaluation adds a
+small DynamoDB read cost on each vend and metered invocation.
 
 ## Architecture
 
@@ -88,46 +111,51 @@ outside this direct-to-Runtime architecture.
 | Broker/admin Lambda | JWT validation, quota check, logical lease, STS vending, admin API |
 | BedrockUserRole | Runtime-only permissions restricted by model ARN and permissions boundary |
 | Users table | Identity, status, limits, logical leases, session maps, control state |
-| Usage table | Daily aggregates and invocation idempotency markers |
+| Usage table | Canonical daily ledger and invocation idempotency markers |
 | Admin audit table | Routine mutation audit events and idempotency records (365-day retention) |
 | Invocation logging | Trusted principal ARN, model, request ID, and tokens |
 | Usage processor | Event-driven pricing, deduplication, counters, blocking, detection-lag metric |
-| Revocation processor | Optional sharded `SourceIdentity` deny reconciliation |
+| Revocation processor | Always-on sharded `SourceIdentity` deny reconciliation |
 | Emergency processor | Operator-controlled role-wide deny state machine |
 | CloudWatch/SNS | Operational metrics, alarms, warnings, and block notifications |
-| Admin UI | User controls plus read-only enforcement, emergency, revocation, alarm/DLQ, and qualification status |
+| Admin UI | Overview, user management, runtime enforcement controls, emergency stop, alarms, and audit history |
 
 The admin UI uses Cognito managed login with authorization-code + PKCE, then
 exchanges the current ID token through the Identity Pool for temporary AWS
 credentials. It remains an `AWS_IAM`/SigV4 client; the browser never receives
-the shared routine or break-glass key. The same secretless User Pool client and
+the shared routine admin secret. The break-glass key is entered by an operator
+only when confirming an emergency action, is sent with that one request, and
+is never persisted by the console. The same secretless User Pool client and
 JWT audience retain `USER_SRP_AUTH` and `USER_PASSWORD_AUTH` for the
 notebook/CLI programmatic flows.
 
 The Users view uses 25-row server pagination and server-side search/status
 filters. It includes a conditional-create wizard, reasoned block/unblock,
-versioned limit editing with optional audit reasons, and a detail drawer for
-retained usage and per-user changes. A non-empty reason is required when a
-positive limit becomes Unlimited or a submitted finite limit is below current
-usage; other limit reasons remain optional. A separate global Audit view shows
-routine administrative changes. Independent failures leave only the affected
-view visibly stale.
+versioned calendar-limit editing with optional audit reasons, and a detail
+drawer for current daily/weekly/monthly usage, retained history, and per-user
+changes. A non-empty reason is required when a period is enabled/disabled, a
+positive limit becomes Unlimited, or a submitted finite limit is below current
+period usage; other limit reasons remain optional. A separate global Audit
+view shows period-qualified administrative changes. Independent failures leave
+only the affected view visibly stale.
 
-The admin UI's Operations panel is read-only. The broker reads CloudWatch
+The Operations tab changes the audited 60/300/900-second permission-lease dial
+without a redeploy and exposes the emergency stop behind a separate
+break-glass key plus exact confirmation phrase. The broker reads CloudWatch
 metrics and alarm state server-side with `GetMetricData` and `DescribeAlarms`;
-the browser receives no CloudWatch permissions, emergency key, secret ARN, IAM
-policy controls, or emergency/revocation mutation buttons. Missing metrics and
-`INSUFFICIENT_DATA` are displayed as unknown rather than healthy.
+the browser receives no CloudWatch permissions, secret ARN, or IAM policy
+controls. Missing metrics and `INSUFFICIENT_DATA` are displayed as unknown
+rather than healthy.
 
 CloudWatch is the observability system. DynamoDB remains necessary because the
 broker needs a low-latency quota decision when credentials are requested.
 
 An admin API limit of `0` disables that one dimension and is displayed as
-**Unlimited**. The UI requires explicit confirmation and a non-empty reason
-before a positive limit becomes Unlimited. It also requires a reason for any
-submitted finite limit below current usage; reasons are optional for other
-limit changes. Declarative deployment defaults must be positive so
-auto-provisioning cannot create unlimited users accidentally.
+**Unlimited**. A `null` period is disabled. The UI requires explicit
+confirmation and a non-empty reason before a positive limit becomes Unlimited,
+when changing period enablement, or when a finite limit is below current-period
+usage. Reasons are optional for ordinary increases. Daily deployment defaults
+are finite; weekly and monthly defaults are disabled.
 
 Routine creates are conditional: an existing identity returns
 `409 user_already_exists` and is never overwritten. Every routine mutation
@@ -140,8 +168,8 @@ version, duplicate, and idempotency conflict for review.
 Routine create/limit/status audit begins when the audit-table deployment is
 installed, is currently retained for 365 days, and has no historical backfill.
 
-Temporary overrides, bulk operations, browser emergency mutation, user delete,
-and usage reset are explicitly outside this MVP.
+Temporary per-user overrides, bulk operations, user delete, and usage reset
+are explicitly outside this MVP.
 
 ## Identity
 
@@ -190,7 +218,8 @@ code change. Each configured workload gets:
   `bedrock:InvokeModel*` Deny to the workload's role (users-table stream fast
   path plus a 5-minute repair schedule). The Deny applies to already-issued
   STS sessions after IAM propagation. On window reset the enforcer lifts
-  automatic blocks and removes the Deny. Manual admin blocks never auto-lift.
+  automatic blocks only after every enabled current period is under quota, then
+  removes the Deny. Manual admin blocks never auto-lift.
 
 Configure workloads in `cdk/config/workloads.json` (see
 `cdk/config/workloads.example.json`) and pass `-c workloads=config/workloads.json`
@@ -198,9 +227,9 @@ or the `workloads` key of `deployment_config`. Workloads without `role_arn`
 are metered and alerted but cannot be hard-blocked; they surface as
 `enforcement_ready: false` in the admin API and as "metering only" in the UI.
 
-Enforcement latency is metering lag (about 15 s) plus IAM propagation
-(seconds to about a minute) — bounded overspend, like Mode A. For hard
-pre-spend denial use the inline proxy (Mode B).
+Enforcement latency is metering lag plus IAM propagation or the remaining
+permission lease, whichever cuts access first. It remains bounded overspend;
+there is no selectable enforcement mode.
 
 ## Metering
 
@@ -214,9 +243,10 @@ The processor:
    usage and priced by the profile's underlying model).
 3. Prices input and output tokens.
 4. Creates a `requestId` idempotency marker.
-5. Updates the daily aggregate in the same DynamoDB transaction.
-6. Emits CloudWatch EMF metrics.
-7. Sends a warning or blocks the identity when a limit is reached.
+5. Updates the canonical daily ledger in the same DynamoDB transaction.
+6. Derives all current enabled calendar totals from retained daily rows.
+7. Emits CloudWatch EMF metrics.
+8. Sends period-qualified warnings or blocks when any limit is reached.
 
 There is no periodic Logs Insights scan or EventBridge reconciler.
 
@@ -348,7 +378,7 @@ workflows, logging ownership, IdP configuration, UI setup, IAM/SCP decision,
 smoke tests, and cleanup.
 
 Use [DEMO.md](DEMO.md) as the presentation runbook and
-[`notebook/per_user_quota_demo.ipynb`](notebook/per_user_quota_demo.ipynb) for
+[`notebook/spend_controls_demo.ipynb`](notebook/spend_controls_demo.ipynb) for
 the executable capability walkthrough. The notebook uses GPT OSS 20B
 `Converse`, displays actual response usage, waits for invocation-log metering,
 proves automatic quota rejection, raises the limits, and proves credential
@@ -357,7 +387,7 @@ diagnostic; it is not part of enforcement.
 
 ## Administrative client
 
-The SigV4 client manages all three limits. Routine writes generate a UUID
+The SigV4 client manages every period/dimension limit. Routine writes generate a UUID
 `Idempotency-Key`; `update-user`, `block-user`, and `unblock-user` first fetch
 the exact user and send its ETag (or canonical integer version) as `If-Match`.
 `update-user` accepts an optional `--reason` and omits the field when not
@@ -374,7 +404,10 @@ python examples/sigv4_gateway.py \
   create-user alice \
   --daily-usd 5 \
   --daily-input-tokens 1000000 \
-  --daily-output-tokens 200000
+  --daily-output-tokens 200000 \
+  --weekly-usd 25 \
+  --weekly-input-tokens 5000000 \
+  --weekly-output-tokens 1000000
 ```
 
 The notebook uses the same safe routine-write flow and performs an exact GET
@@ -389,7 +422,8 @@ The canonical exact-user route family is:
 - `GET /admin/user?user_id=<encoded>` for detail.
 - `PUT /admin/user/limits?user_id=<encoded>` for limits.
 - `PUT /admin/user/status?user_id=<encoded>` for status.
-- `GET /admin/user/usage?user_id=<encoded>&window=...` for usage.
+- `GET /admin/user/usage?user_id=<encoded>&period=weekly&window=...` for a
+  calendar usage window (`period` defaults to `daily`).
 - `/admin/user/usage-history` and `/admin/user/audit` with the same `user_id`
   query parameter for retained history and per-user audit.
 

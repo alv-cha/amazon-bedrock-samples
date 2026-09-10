@@ -3,7 +3,7 @@ import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { CreateUserWizard, GlobalAuditView, UserDetailDrawer } from "./OperationalUi";
-import { ApiError, api, type AdminUser, type AuditEvent, type UsageHistoryResponse, type UserRow } from "./api";
+import { ApiError, api, type AdminUser, type AuditEvent, type CurrentUsage, type UsageHistoryResponse, type UserRow } from "./api";
 import type { AdminConfig } from "./config";
 import type { Session } from "./auth";
 
@@ -24,6 +24,12 @@ const session: Session = {
   logout: vi.fn(),
 };
 
+const currentUsage: CurrentUsage = {
+  daily: { period: "daily", window: "2026-09-02", window_start: "2026-09-02T00:00:00+00:00", window_end: "2026-09-03T00:00:00+00:00", resets_at: "2026-09-03T00:00:00+00:00", cost_usd: 5, input_tokens: 50, output_tokens: 10, requests: 4 },
+  weekly: { period: "weekly", window: "2026-08-31", window_start: "2026-08-31T00:00:00+00:00", window_end: "2026-09-07T00:00:00+00:00", resets_at: "2026-09-07T00:00:00+00:00", cost_usd: 6, input_tokens: 60, output_tokens: 12, requests: 5 },
+  monthly: { period: "monthly", window: "2026-09-01", window_start: "2026-09-01T00:00:00+00:00", window_end: "2026-10-01T00:00:00+00:00", resets_at: "2026-10-01T00:00:00+00:00", cost_usd: 7, input_tokens: 70, output_tokens: 14, requests: 6 },
+};
+
 const alice: UserRow = {
   user_id: "tenant/alice",
   name: "Alice Example",
@@ -33,12 +39,17 @@ const alice: UserRow = {
   version: 1,
   created_at: "2026-09-01T10:00:00Z",
   updated_at: "2026-09-01T10:00:00Z",
-  limits: { daily_usd: 10, daily_input_tokens: 100, daily_output_tokens: 20 },
+  limits: {
+    daily: { usd: 10, input_tokens: 100, output_tokens: 20 },
+    weekly: null,
+    monthly: null,
+  },
   today: { cost_usd: 5, input_tokens: 50, output_tokens: 10, requests: 4 },
+  current_usage: currentUsage,
 };
 
 function adminUser(overrides: Partial<AdminUser> = {}): AdminUser {
-  const { today: _today, ...user } = alice;
+  const { today: _today, current_usage: _currentUsage, ...user } = alice;
   return { ...user, ...overrides };
 }
 
@@ -53,11 +64,11 @@ const auditEvent: AuditEvent = {
   created_at: "2026-09-02T10:00:00Z",
   before: {
     ...adminUser(),
-    limits: { daily_usd_micro: 5_000_000, daily_input_tokens: 100, daily_output_tokens: 20 },
+    limits: { daily: { usd_micro: 5_000_000, input_tokens: 100, output_tokens: 20 }, weekly: null, monthly: null },
   },
   after: {
     ...adminUser({ version: 2 }),
-    limits: { daily_usd_micro: 10_000_000, daily_input_tokens: 100, daily_output_tokens: 20 },
+    limits: { daily: { usd_micro: 10_000_000, input_tokens: 100, output_tokens: 20 }, weekly: null, monthly: null },
   },
 };
 
@@ -73,7 +84,7 @@ function createResult(user: AdminUser) {
 function DrawerHarness() {
   const [open, setOpen] = useState(false);
   const [user, setUser] = useState(alice);
-  return <><button onClick={() => setOpen(true)} type="button">Open Alice</button>{open && <UserDetailDrawer cfg={cfg} onCanonical={(updated) => setUser((current) => ({ ...updated, today: current.today }))} onClose={() => setOpen(false)} onEdit={vi.fn()} onStatus={vi.fn()} session={session} user={user} />}</>;
+  return <><button onClick={() => setOpen(true)} type="button">Open Alice</button>{open && <UserDetailDrawer cfg={cfg} onCanonical={(updated) => setUser((current) => ({ ...updated, today: current.today, current_usage: current.current_usage }))} onClose={() => setOpen(false)} onEdit={vi.fn()} onStatus={vi.fn()} session={session} user={user} />}</>;
 }
 
 describe("create user wizard", () => {
@@ -92,7 +103,7 @@ describe("create user wizard", () => {
     await actor.type(screen.getByLabelText("User identity claim value"), "tenant/new");
     await actor.type(screen.getByLabelText("Display name"), "New User");
     await actor.click(screen.getByRole("button", { name: "Next" }));
-    const usd = screen.getByLabelText("Create USD limit");
+    const usd = screen.getByLabelText("Create Daily USD limit");
     await actor.clear(usd);
     await actor.type(usd, "0");
     await actor.click(screen.getByRole("button", { name: "Next" }));
@@ -102,11 +113,11 @@ describe("create user wizard", () => {
     await actor.click(screen.getByRole("checkbox", { name: /each 0 value above means Unlimited/ }));
     await actor.click(screen.getByRole("button", { name: "Next" }));
     expect(screen.getByText("tenant/new")).toBeInTheDocument();
-    expect(screen.getByText("Unlimited")).toBeInTheDocument();
+    expect(screen.getByText(/Unlimited ·/)).toBeInTheDocument();
     expect(createUser).not.toHaveBeenCalled();
 
     await actor.click(screen.getByRole("button", { name: "Back" }));
-    expect(screen.getByLabelText("Create USD limit")).toHaveValue(0);
+    expect(screen.getByLabelText("Create Daily USD limit")).toHaveValue(0);
     expect(screen.getByRole("checkbox", { name: /each 0 value above means Unlimited/ })).toBeChecked();
     await actor.click(screen.getByRole("button", { name: "Next" }));
     await actor.click(screen.getByRole("button", { name: "Create user" }));
@@ -115,9 +126,11 @@ describe("create user wizard", () => {
     expect(createUser).toHaveBeenCalledWith(cfg, session, {
       user_id: "tenant/new",
       name: "New User",
-      daily_usd: 0,
-      daily_input_tokens: 1_000_000,
-      daily_output_tokens: 200_000,
+      limits: {
+        daily: { usd: 0, input_tokens: 1_000_000, output_tokens: 200_000 },
+        weekly: null,
+        monthly: null,
+      },
     });
     expect(onClose).toHaveBeenCalledOnce();
   });
@@ -136,13 +149,54 @@ describe("create user wizard", () => {
     expect(await screen.findByText(/already exists.*search for the existing user/i)).toBeInTheDocument();
     expect(screen.getByRole("dialog", { name: "Create user" })).toBeInTheDocument();
   });
+
+  it("creates an optional weekly calendar limit as part of one mutation", async () => {
+    const actor = userEvent.setup();
+    const created = adminUser({ user_id: "tenant/weekly", name: "Weekly User" });
+    const createUser = vi.spyOn(api, "createUser").mockResolvedValue(createResult(created));
+    render(<CreateUserWizard cfg={cfg} onClose={vi.fn()} onCreated={vi.fn()} session={session} />);
+
+    await actor.type(screen.getByLabelText("User identity claim value"), "tenant/weekly");
+    await actor.type(screen.getByLabelText("Display name"), "Weekly User");
+    await actor.click(screen.getByRole("button", { name: "Next" }));
+    await actor.click(screen.getByRole("checkbox", { name: "Weekly" }));
+    await actor.clear(screen.getByLabelText("Create Weekly USD limit"));
+    await actor.type(screen.getByLabelText("Create Weekly USD limit"), "5");
+    await actor.clear(screen.getByLabelText("Create Weekly input token limit"));
+    await actor.type(screen.getByLabelText("Create Weekly input token limit"), "5000000");
+    await actor.clear(screen.getByLabelText("Create Weekly output token limit"));
+    await actor.type(screen.getByLabelText("Create Weekly output token limit"), "1000000");
+    await actor.click(screen.getByRole("button", { name: "Next" }));
+    await actor.click(screen.getByRole("button", { name: "Create user" }));
+
+    expect(createUser).toHaveBeenCalledWith(cfg, session, {
+      user_id: "tenant/weekly",
+      name: "Weekly User",
+      limits: {
+        daily: { usd: 1, input_tokens: 1_000_000, output_tokens: 200_000 },
+        weekly: { usd: 5, input_tokens: 5_000_000, output_tokens: 1_000_000 },
+        monthly: null,
+      },
+    });
+  });
+
+  it("does not allow every calendar period to be disabled", async () => {
+    const actor = userEvent.setup();
+    render(<CreateUserWizard cfg={cfg} onClose={vi.fn()} onCreated={vi.fn()} session={session} />);
+    await actor.type(screen.getByLabelText("User identity claim value"), "tenant/unbounded");
+    await actor.type(screen.getByLabelText("Display name"), "Unbounded");
+    await actor.click(screen.getByRole("button", { name: "Next" }));
+    await actor.click(screen.getByRole("checkbox", { name: "Daily" }));
+    await actor.click(screen.getByRole("button", { name: "Next" }));
+    expect(screen.getByRole("alert", { name: "Create user errors" })).toHaveTextContent("Enable at least one calendar quota period");
+  });
 });
 
 describe("user detail drawer", () => {
   it("traps/restores focus, supports arrow-key tabs, and does not load audit before Changes", async () => {
     const actor = userEvent.setup();
-    vi.spyOn(api, "getUser").mockResolvedValue({ data: { user: adminUser() }, etag: '"1"', requestId: null, status: 200 });
-    vi.spyOn(api, "usageHistory").mockResolvedValue({ user_id: alice.user_id, start: "2026-08-04", end: "2026-09-02", usage: [], next_cursor: null });
+    vi.spyOn(api, "getUser").mockResolvedValue({ data: { user: adminUser(), current_usage: currentUsage }, etag: '"1"', requestId: null, status: 200 });
+    vi.spyOn(api, "usageHistory").mockResolvedValue({ user_id: alice.user_id, period: "daily", start: "2026-08-04", end: "2026-09-02", usage: [], next_cursor: null });
     const audit = vi.spyOn(api, "listUserAuditPage").mockResolvedValue({ user_id: alice.user_id, events: [auditEvent], next_cursor: null });
     render(<DrawerHarness />);
 
@@ -172,12 +226,13 @@ describe("user detail drawer", () => {
 
   it("shows usage pages newest-first, preserves data through errors, and applies an inclusive range", async () => {
     const actor = userEvent.setup();
-    vi.spyOn(api, "getUser").mockResolvedValue({ data: { user: adminUser() }, etag: '"1"', requestId: null, status: 200 });
+    vi.spyOn(api, "getUser").mockResolvedValue({ data: { user: adminUser(), current_usage: currentUsage }, etag: '"1"', requestId: null, status: 200 });
     const first: UsageHistoryResponse = {
       user_id: alice.user_id,
+      period: "daily",
       start: "2026-08-27",
       end: "2026-09-02",
-      usage: [{ user_id: alice.user_id, window: "2026-09-02", cost_usd: 1.25, input_tokens: 100, output_tokens: 50, requests: 3 }],
+      usage: [{ user_id: alice.user_id, period: "daily", window: "2026-09-02", window_start: "2026-09-02T00:00:00+00:00", window_end: "2026-09-03T00:00:00+00:00", resets_at: "2026-09-03T00:00:00+00:00", cost_usd: 1.25, input_tokens: 100, output_tokens: 50, requests: 3 }],
       next_cursor: "usage-next",
     };
     const empty: UsageHistoryResponse = { ...first, usage: [], next_cursor: null };
@@ -191,7 +246,7 @@ describe("user detail drawer", () => {
     await actor.click(screen.getByRole("button", { name: "Open Alice" }));
     await actor.click(screen.getByRole("tab", { name: "Usage" }));
     expect(await screen.findByText("2026-09-02")).toBeInTheDocument();
-    expect(usage.mock.calls[0][3]).toEqual({ limit: 25, cursor: null });
+    expect(usage.mock.calls[0][3]).toEqual({ limit: 25, cursor: null, period: "daily" });
     expect(screen.getByLabelText("Start date")).toHaveValue("2026-08-27");
     expect(screen.getByLabelText("End date")).toHaveValue("2026-09-02");
     await actor.click(screen.getByRole("button", { name: "Next" }));
@@ -211,6 +266,24 @@ describe("user detail drawer", () => {
     expect(screen.getByText("2026-09-02")).toBeInTheDocument();
     expect(screen.getByText("Showing the previous usage page")).toBeInTheDocument();
     expect(usage.mock.calls[3][3]).toMatchObject({ start: "2026-08-10", end: "2026-09-01", cursor: null });
+  });
+
+  it("switches retained usage history between calendar periods", async () => {
+    const actor = userEvent.setup();
+    vi.spyOn(api, "getUser").mockResolvedValue({ data: { user: adminUser(), current_usage: currentUsage }, etag: '"1"', requestId: null, status: 200 });
+    const usage = vi.spyOn(api, "usageHistory")
+      .mockResolvedValueOnce({ user_id: alice.user_id, period: "daily", start: "2026-08-04", end: "2026-09-02", usage: [], next_cursor: null })
+      .mockResolvedValueOnce({ user_id: alice.user_id, period: "weekly", start: "2026-08-04", end: "2026-09-02", usage: [{ user_id: alice.user_id, ...currentUsage.weekly }], next_cursor: null });
+    render(<DrawerHarness />);
+
+    await actor.click(screen.getByRole("button", { name: "Open Alice" }));
+    await actor.click(screen.getByRole("tab", { name: "Usage" }));
+    await waitFor(() => expect(usage).toHaveBeenCalledTimes(1));
+    await actor.selectOptions(screen.getByLabelText("Usage history period"), "weekly");
+    await waitFor(() => expect(usage).toHaveBeenCalledTimes(2));
+
+    expect(usage.mock.calls[1][3]).toMatchObject({ period: "weekly" });
+    expect(await screen.findByLabelText("Weekly usage history")).toBeInTheDocument();
   });
 });
 

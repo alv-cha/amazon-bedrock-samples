@@ -115,6 +115,15 @@ def _admin_request_args(
     """Build one routine or emergency request without performing I/O."""
     base = args.gateway_url.rstrip("/")
     if args.command == "create-user":
+        limits = {
+            "daily": {
+                "usd": args.daily_usd,
+                "input_tokens": args.daily_input_tokens,
+                "output_tokens": args.daily_output_tokens,
+            },
+            "weekly": _optional_period(args, "weekly"),
+            "monthly": _optional_period(args, "monthly"),
+        }
         return "POST", f"{base}/admin/users", {
             "headers": {
                 "Idempotency-Key": idempotency_key or str(uuid.uuid4())
@@ -122,9 +131,7 @@ def _admin_request_args(
             "json": {
                 "user_id": args.user_id,
                 "name": args.name or args.user_id,
-                "daily_usd": args.daily_usd,
-                "daily_input_tokens": args.daily_input_tokens,
-                "daily_output_tokens": args.daily_output_tokens,
+                "limits": limits,
             },
         }
     if args.command == "list-users":
@@ -144,30 +151,46 @@ def _admin_request_args(
         }
 
     if args.command == "update-user":
-        limits = {
-            name: getattr(args, name)
-            for name in (
-                "daily_usd",
-                "daily_input_tokens",
-                "daily_output_tokens",
-            )
-            if getattr(args, name) is not None
-        }
-        if not limits:
+        current_limits = getattr(args, "current_limits", None)
+        if not isinstance(current_limits, dict):
+            raise ValueError("update-user requires canonical current limits")
+        limits = json.loads(json.dumps(current_limits))
+        changed = False
+        for period in ("daily", "weekly", "monthly"):
+            if getattr(args, f"disable_{period}", False):
+                limits[period] = None
+                changed = True
+                continue
+            names = ("usd", "input_tokens", "output_tokens")
+            provided = {
+                name: getattr(args, f"{period}_{name}")
+                for name in names
+                if getattr(args, f"{period}_{name}") is not None
+            }
+            if provided:
+                existing = limits.get(period) or {
+                    "usd": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                }
+                limits[period] = {**existing, **provided}
+                changed = True
+        if not changed:
             raise ValueError(
-                "update-user requires at least one daily quota option"
+                "update-user requires at least one quota option"
             )
-        if args.reason is not None:
-            limits["reason"] = args.reason
         if if_match is None:
             raise ValueError("update-user requires the current user version")
+        body = {"limits": limits}
+        if args.reason is not None:
+            body["reason"] = args.reason
         return "PUT", f"{base}/admin/user/limits", {
             "params": {"user_id": args.user_id},
             "headers": {
                 "Idempotency-Key": idempotency_key or str(uuid.uuid4()),
                 "If-Match": if_match,
             },
-            "json": limits,
+            "json": body,
         }
     if args.command in {"block-user", "unblock-user"}:
         if if_match is None:
@@ -184,11 +207,27 @@ def _admin_request_args(
             "json": {"status": status, "reason": args.reason},
         }
     if args.command == "get-usage":
-        params = {"user_id": args.user_id}
+        params = {"user_id": args.user_id, "period": args.period}
         if args.window:
             params["window"] = args.window
         return "GET", f"{base}/admin/user/usage", {"params": params}
     raise ValueError(f"Unsupported command: {args.command}")
+
+
+def _optional_period(args, period: str) -> dict | None:
+    values = {
+        "usd": getattr(args, f"{period}_usd", None),
+        "input_tokens": getattr(args, f"{period}_input_tokens", None),
+        "output_tokens": getattr(args, f"{period}_output_tokens", None),
+    }
+    provided = [value is not None for value in values.values()]
+    if not any(provided):
+        return None
+    if not all(provided):
+        raise ValueError(
+            f"{period} requires USD, input-token, and output-token limits"
+        )
+    return values
 
 
 def _response_body(response: httpx.Response) -> dict:
@@ -252,6 +291,13 @@ def _execute_admin_command(args, session, request_fn=signed_request):
         if detail.status_code >= 400:
             _emit_response(detail)
         if_match = _if_match_from_detail(detail)
+        if args.command == "update-user":
+            body = _response_body(detail)
+            user = body.get("user")
+            limits = user.get("limits") if isinstance(user, dict) else None
+            if not isinstance(limits, dict):
+                raise RuntimeError("User detail response did not include limits")
+            args.current_limits = limits
 
     method, url, request_kwargs = _admin_request_args(
         args,
@@ -304,6 +350,12 @@ def _parser() -> argparse.ArgumentParser:
     create.add_argument("--daily-usd", type=float, required=True)
     create.add_argument("--daily-input-tokens", type=int, required=True)
     create.add_argument("--daily-output-tokens", type=int, required=True)
+    create.add_argument("--weekly-usd", type=float)
+    create.add_argument("--weekly-input-tokens", type=int)
+    create.add_argument("--weekly-output-tokens", type=int)
+    create.add_argument("--monthly-usd", type=float)
+    create.add_argument("--monthly-input-tokens", type=int)
+    create.add_argument("--monthly-output-tokens", type=int)
 
     commands.add_parser("list-users")
 
@@ -318,6 +370,15 @@ def _parser() -> argparse.ArgumentParser:
     update.add_argument("--daily-usd", type=float)
     update.add_argument("--daily-input-tokens", type=int)
     update.add_argument("--daily-output-tokens", type=int)
+    update.add_argument("--disable-daily", action="store_true")
+    update.add_argument("--weekly-usd", type=float)
+    update.add_argument("--weekly-input-tokens", type=int)
+    update.add_argument("--weekly-output-tokens", type=int)
+    update.add_argument("--disable-weekly", action="store_true")
+    update.add_argument("--monthly-usd", type=float)
+    update.add_argument("--monthly-input-tokens", type=int)
+    update.add_argument("--monthly-output-tokens", type=int)
+    update.add_argument("--disable-monthly", action="store_true")
     update.add_argument("--reason")
 
     block = commands.add_parser("block-user")
@@ -331,6 +392,9 @@ def _parser() -> argparse.ArgumentParser:
     usage = commands.add_parser("get-usage")
     usage.add_argument("user_id")
     usage.add_argument("--window", help="UTC window in YYYY-MM-DD format.")
+    usage.add_argument(
+        "--period", choices=("daily", "weekly", "monthly"), default="daily"
+    )
     return parser
 
 

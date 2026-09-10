@@ -1,7 +1,7 @@
 """DynamoDB state used by the runtime credential broker and admin API.
 
 Inference never passes through this application. DynamoDB stores only the
-quota configuration, the event-driven daily aggregate, and a temporary map
+quota configuration, the event-driven daily ledger, and a temporary map
 from STS RoleSessionName to the configured JWT identity claim.
 """
 
@@ -18,6 +18,17 @@ from decimal import Decimal
 import boto3
 from boto3.dynamodb.types import TypeSerializer
 from botocore.exceptions import ClientError
+from bedrock_spend_controls.quota_periods import (
+    PERIODS,
+    QuotaEvaluation,
+    aggregate_daily_rows,
+    calendar_window,
+    calendar_windows,
+    evaluate_limits,
+    limits_from_item,
+    period_for_start,
+    quota_reason,
+)
 
 from .config import settings
 
@@ -62,8 +73,51 @@ def _usd_to_micro(daily_usd: float) -> int:
     return micro
 
 
+def configured_default_limits() -> dict[str, dict[str, float | int] | None]:
+    raw = json.loads(settings.default_limits_json)
+    if not isinstance(raw, dict):
+        raise ValueError("DEFAULT_LIMITS_JSON must contain an object")
+    result: dict[str, dict[str, float | int] | None] = {}
+    for period in PERIODS:
+        value = raw.get(period)
+        if value is None:
+            result[period] = None
+            continue
+        if not isinstance(value, dict):
+            raise ValueError(f"DEFAULT_LIMITS_JSON.{period} must be an object")
+        result[period] = {
+            "usd": float(value.get("usd", 0)),
+            "input_tokens": int(value.get("input_tokens", 0)),
+            "output_tokens": int(value.get("output_tokens", 0)),
+        }
+    if result["daily"] is None:
+        raise ValueError("DEFAULT_LIMITS_JSON.daily must be enabled")
+    return result
+
+
+def _limit_attributes(
+    limits: dict[str, dict[str, float | int] | None],
+) -> dict[str, object]:
+    attributes: dict[str, object] = {}
+    for period, value in limits.items():
+        if period not in PERIODS:
+            raise ValueError(f"unsupported quota period: {period}")
+        enabled = value is not None
+        attributes[f"{period}_limits_enabled"] = enabled
+        attributes[f"{period}_usd_micro"] = (
+            _usd_to_micro(float(value.get("usd", 0))) if value else 0
+        )
+        attributes[f"{period}_input_tokens"] = (
+            int(value.get("input_tokens", 0)) if value else 0
+        )
+        attributes[f"{period}_output_tokens"] = (
+            int(value.get("output_tokens", 0)) if value else 0
+        )
+    return attributes
+
+
 def current_window(now: datetime | None = None) -> str:
-    return (now or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
+    return calendar_window("daily", now).key
 
 
 def window_ttl_epoch(
@@ -83,6 +137,15 @@ class UserRecord:
     daily_usd_micro: int
     daily_input_tokens: int
     daily_output_tokens: int
+    daily_limits_enabled: bool = True
+    weekly_usd_micro: int = 0
+    weekly_input_tokens: int = 0
+    weekly_output_tokens: int = 0
+    weekly_limits_enabled: bool = False
+    monthly_usd_micro: int = 0
+    monthly_input_tokens: int = 0
+    monthly_output_tokens: int = 0
+    monthly_limits_enabled: bool = False
     version: int = 0
     created_at: str | None = None
     updated_at: str | None = None
@@ -91,6 +154,25 @@ class UserRecord:
     lease_refresh_after_epoch: int | None = None
     lease_generation: int | None = None
     lease_duration_seconds: int | None = None
+
+    @property
+    def period_limits(self) -> dict[str, dict[str, int] | None]:
+        return limits_from_item(
+            {
+                "daily_limits_enabled": self.daily_limits_enabled,
+                "daily_usd_micro": self.daily_usd_micro,
+                "daily_input_tokens": self.daily_input_tokens,
+                "daily_output_tokens": self.daily_output_tokens,
+                "weekly_limits_enabled": self.weekly_limits_enabled,
+                "weekly_usd_micro": self.weekly_usd_micro,
+                "weekly_input_tokens": self.weekly_input_tokens,
+                "weekly_output_tokens": self.weekly_output_tokens,
+                "monthly_limits_enabled": self.monthly_limits_enabled,
+                "monthly_usd_micro": self.monthly_usd_micro,
+                "monthly_input_tokens": self.monthly_input_tokens,
+                "monthly_output_tokens": self.monthly_output_tokens,
+            }
+        )
 
     @property
     def active(self) -> bool:
@@ -117,6 +199,12 @@ class VersionConflict(Exception):
 
 class IdempotencyConflict(Exception):
     """An idempotency key was already used for a different request."""
+
+
+class EnforcementVersionConflict(Exception):
+    def __init__(self, current: dict):
+        super().__init__("enforcement configuration has changed")
+        self.current = current
 
 
 @dataclass(frozen=True)
@@ -275,9 +363,7 @@ class QuotaStore:
             self.put_user(
                 user_id=user_id,
                 name=name or user_id,
-                daily_usd=settings.default_daily_usd,
-                daily_input_tokens=settings.default_daily_input_tokens,
-                daily_output_tokens=settings.default_daily_output_tokens,
+                limits=configured_default_limits(),
             )
         except UserAlreadyExists:
             # A concurrent admin create is authoritative. Never replace it
@@ -291,20 +377,32 @@ class QuotaStore:
         self,
         user_id: str,
         name: str,
-        daily_usd: float,
-        daily_input_tokens: int,
-        daily_output_tokens: int,
+        daily_usd: float | None = None,
+        daily_input_tokens: int | None = None,
+        daily_output_tokens: int | None = None,
+        *,
+        limits: dict[str, dict[str, float | int] | None] | None = None,
     ) -> None:
         validate_user_id(user_id)
+        if limits is None:
+            if None in (daily_usd, daily_input_tokens, daily_output_tokens):
+                raise ValueError("daily limits are required")
+            limits = {
+                "daily": {
+                    "usd": float(daily_usd),
+                    "input_tokens": int(daily_input_tokens),
+                    "output_tokens": int(daily_output_tokens),
+                },
+                "weekly": None,
+                "monthly": None,
+            }
         now = datetime.now(timezone.utc).isoformat()
         item = {
             "user_id": user_id,
             "name": name,
             "status": "active",
             "status_reason": "",
-            "daily_usd_micro": _usd_to_micro(daily_usd),
-            "daily_input_tokens": daily_input_tokens,
-            "daily_output_tokens": daily_output_tokens,
+            **_limit_attributes(limits),
             "version": 1,
             "created_at": now,
             "updated_at": now,
@@ -532,7 +630,10 @@ class QuotaStore:
                 "actor": "",
                 "reason": "",
             }
-        return dict(item)
+        # DynamoDB returns Number attributes as Decimal. Normalize at the
+        # store boundary because this state is returned directly by the admin
+        # API, including the idempotent activate/recover acknowledgement.
+        return self._json_safe(dict(item))
 
     def get_enforcement_config(self) -> dict:
         """Runtime enforcement dial: the effective permission-lease window.
@@ -581,6 +682,8 @@ class QuotaStore:
         *,
         actor: str,
         reason: str,
+        expected_generation: int | None = None,
+        idempotency_key: str | None = None,
         now: datetime | None = None,
     ) -> dict:
         """Change the lease window at runtime (audited, no redeploy).
@@ -605,40 +708,114 @@ class QuotaStore:
             )
         now = now or datetime.now(timezone.utc)
         current = self.get_enforcement_config()
-        generation = int(current.get("generation", 0)) + 1
-        request_id = str(uuid.uuid4())
-        # Immutable audit row first (CONFIG# prefix keeps it out of every
-        # user scan and enforcement consumer); a later state-write failure
-        # leaves an unapplied request record, never an unaudited change.
-        self._users.put_item(
-            Item={
-                "user_id": (
-                    f"CONFIG#ENFORCEMENT_AUDIT#{now.isoformat()}"
-                    f"#{request_id}"
-                ),
-                "action": "set_permission_lease_seconds",
-                "permission_lease_seconds": seconds,
-                "previous_permission_lease_seconds": int(
-                    current["permission_lease_seconds"]
-                ),
-                "actor": actor,
-                "reason": reason,
-                "generation": generation,
-                "requested_at": now.isoformat(),
-                "expires_at": window_ttl_epoch(now),
-            }
+        observed_generation = int(current.get("generation", 0))
+        expected_generation = (
+            observed_generation
+            if expected_generation is None
+            else expected_generation
         )
-        self._users.put_item(
-            Item={
-                "user_id": "CONFIG#ENFORCEMENT",
-                "permission_lease_seconds": seconds,
-                "generation": generation,
-                "actor": actor,
-                "reason": reason,
-                "updated_at": now.isoformat(),
-            }
+        idempotency_key = idempotency_key or str(uuid.uuid4())
+        audit_key = f"CONFIG#ENFORCEMENT_AUDIT#{idempotency_key}"
+        existing = self._users.get_item(
+            Key={"user_id": audit_key}, ConsistentRead=True
+        ).get("Item")
+        if existing:
+            if (
+                int(existing.get("permission_lease_seconds", -1)) != seconds
+                or str(existing.get("actor", "")) != actor
+                or str(existing.get("reason", "")) != reason
+            ):
+                raise IdempotencyConflict("enforcement idempotency conflict")
+            replay_result = self._json_safe(dict(existing["result"]))
+            replay_result["_replayed"] = True
+            return replay_result
+        if expected_generation != observed_generation:
+            raise EnforcementVersionConflict(current)
+        generation = expected_generation + 1
+        result = {
+            "permission_lease_seconds": seconds,
+            "source": "runtime",
+            "generation": generation,
+            "actor": actor,
+            "reason": reason,
+            "updated_at": now.isoformat(),
+        }
+        values = {
+            ":seconds": seconds,
+            ":generation": generation,
+            ":actor": actor,
+            ":reason": reason,
+            ":updated": now.isoformat(),
+            ":expected": expected_generation,
+        }
+        condition = (
+            "attribute_not_exists(generation)"
+            if expected_generation == 0
+            else "generation = :expected"
         )
-        return self.get_enforcement_config()
+        if expected_generation == 0:
+            values.pop(":expected")
+        try:
+            self._client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Put": {
+                            "TableName": self._users.name,
+                            "Item": self._serialize(
+                                {
+                                    "user_id": audit_key,
+                                    "action": "set_permission_lease_seconds",
+                                    "permission_lease_seconds": seconds,
+                                    "previous_permission_lease_seconds": int(
+                                        current["permission_lease_seconds"]
+                                    ),
+                                    "actor": actor,
+                                    "reason": reason,
+                                    "generation": generation,
+                                    "requested_at": now.isoformat(),
+                                    "expires_at": window_ttl_epoch(now),
+                                    "result": result,
+                                }
+                            ),
+                            "ConditionExpression": "attribute_not_exists(user_id)",
+                        }
+                    },
+                    {
+                        "Update": {
+                            "TableName": self._users.name,
+                            "Key": self._serialize(
+                                {"user_id": "CONFIG#ENFORCEMENT"}
+                            ),
+                            "UpdateExpression": (
+                                "SET permission_lease_seconds = :seconds, "
+                                "generation = :generation, actor = :actor, "
+                                "reason = :reason, updated_at = :updated"
+                            ),
+                            "ConditionExpression": condition,
+                            "ExpressionAttributeValues": self._serialize(values),
+                        }
+                    },
+                ]
+            )
+        except ClientError:
+            replay = self._users.get_item(
+                Key={"user_id": audit_key}, ConsistentRead=True
+            ).get("Item")
+            if replay:
+                if (
+                    int(replay.get("permission_lease_seconds", -1)) == seconds
+                    and str(replay.get("actor", "")) == actor
+                    and str(replay.get("reason", "")) == reason
+                ):
+                    replay_result = self._json_safe(dict(replay["result"]))
+                    replay_result["_replayed"] = True
+                    return replay_result
+                raise IdempotencyConflict("enforcement idempotency conflict")
+            latest = self.get_enforcement_config()
+            if int(latest.get("generation", 0)) != expected_generation:
+                raise EnforcementVersionConflict(latest)
+            raise
+        return result
 
     def emergency_stop_active(self) -> bool:
         state = self.get_emergency_state()
@@ -760,8 +937,10 @@ class QuotaStore:
                 if expected_reason == ""
                 else "status_reason = :expected_reason"
             )
-        update_kwargs = {
-            "Key": {"user_id": user_id},
+        observed = self._get_user_item(user_id) or {}
+        update = {
+            "TableName": self._users.name,
+            "Key": self._serialize({"user_id": user_id}),
             "UpdateExpression": (
                 "SET #s = :s, status_reason = :r, status_changed_at = :t, "
                 "updated_at = :t, status_origin = :origin, "
@@ -771,31 +950,34 @@ class QuotaStore:
                 "#s": "status",
                 "#version": "version",
             },
-            "ExpressionAttributeValues": values,
+            "ExpressionAttributeValues": self._serialize(values),
         }
         if conditions:
-            update_kwargs["ConditionExpression"] = " AND ".join(conditions)
+            update["ConditionExpression"] = " AND ".join(conditions)
+        revocation = {
+            "user_id": f"REVOCATION#{user_id}",
+            "maps_to": user_id,
+            "desired_status": status,
+            "source_identity": str(observed.get("source_identity", "")),
+            "updated_at": changed_at,
+            "expires_at": window_ttl_epoch(),
+        }
         try:
-            self._users.update_item(**update_kwargs)
+            self._client.transact_write_items(
+                TransactItems=[
+                    {"Update": update},
+                    {
+                        "Put": {
+                            "TableName": self._users.name,
+                            "Item": self._serialize(revocation),
+                        }
+                    },
+                ]
+            )
         except ClientError as exc:
-            if exc.response.get("Error", {}).get("Code") != (
-                "ConditionalCheckFailedException"
-            ):
+            if not self._is_conditional_failure(exc):
                 raise
             return False
-        user = self._users.get_item(
-            Key={"user_id": user_id}, ConsistentRead=True
-        ).get("Item", {})
-        self._users.put_item(
-            Item={
-                "user_id": f"REVOCATION#{user_id}",
-                "maps_to": user_id,
-                "desired_status": status,
-                "source_identity": str(user.get("source_identity", "")),
-                "updated_at": changed_at,
-                "expires_at": window_ttl_epoch(),
-            }
-        )
         return True
 
     def set_user_limits(
@@ -835,16 +1017,13 @@ class QuotaStore:
 
     @staticmethod
     def _user_snapshot(user: UserRecord) -> dict:
+        limits = user.period_limits
         return {
             "user_id": user.user_id,
             "name": user.name,
             "status": user.status,
             "status_reason": user.status_reason,
-            "limits": {
-                "daily_usd_micro": user.daily_usd_micro,
-                "daily_input_tokens": user.daily_input_tokens,
-                "daily_output_tokens": user.daily_output_tokens,
-            },
+            "limits": limits,
             "version": user.version,
             "created_at": user.created_at,
             "updated_at": user.updated_at,
@@ -854,14 +1033,69 @@ class QuotaStore:
     @staticmethod
     def _snapshot_to_user(snapshot: dict) -> UserRecord:
         limits = snapshot.get("limits", {})
+        if "daily" in limits:
+            limit_item: dict[str, object] = {}
+            for period in PERIODS:
+                value = limits.get(period)
+                limit_item[f"{period}_limits_enabled"] = value is not None
+                limit_item[f"{period}_usd_micro"] = (
+                    int(value.get("usd_micro", 0)) if value else 0
+                )
+                limit_item[f"{period}_input_tokens"] = (
+                    int(value.get("input_tokens", 0)) if value else 0
+                )
+                limit_item[f"{period}_output_tokens"] = (
+                    int(value.get("output_tokens", 0)) if value else 0
+                )
+        else:
+            # Audit/idempotency rows created before period limits existed.
+            limit_item = {
+                "daily_limits_enabled": True,
+                "daily_usd_micro": int(limits.get("daily_usd_micro", 0)),
+                "daily_input_tokens": int(
+                    limits.get("daily_input_tokens", 0)
+                ),
+                "daily_output_tokens": int(
+                    limits.get("daily_output_tokens", 0)
+                ),
+                "weekly_limits_enabled": False,
+                "monthly_limits_enabled": False,
+            }
         return UserRecord(
             user_id=str(snapshot["user_id"]),
             name=str(snapshot.get("name", "")),
             status=str(snapshot.get("status", "active")),
             status_reason=str(snapshot.get("status_reason", "")),
-            daily_usd_micro=int(limits.get("daily_usd_micro", 0)),
-            daily_input_tokens=int(limits.get("daily_input_tokens", 0)),
-            daily_output_tokens=int(limits.get("daily_output_tokens", 0)),
+            daily_usd_micro=int(limit_item.get("daily_usd_micro", 0)),
+            daily_input_tokens=int(
+                limit_item.get("daily_input_tokens", 0)
+            ),
+            daily_output_tokens=int(
+                limit_item.get("daily_output_tokens", 0)
+            ),
+            daily_limits_enabled=bool(
+                limit_item.get("daily_limits_enabled", True)
+            ),
+            weekly_usd_micro=int(limit_item.get("weekly_usd_micro", 0)),
+            weekly_input_tokens=int(
+                limit_item.get("weekly_input_tokens", 0)
+            ),
+            weekly_output_tokens=int(
+                limit_item.get("weekly_output_tokens", 0)
+            ),
+            weekly_limits_enabled=bool(
+                limit_item.get("weekly_limits_enabled", False)
+            ),
+            monthly_usd_micro=int(limit_item.get("monthly_usd_micro", 0)),
+            monthly_input_tokens=int(
+                limit_item.get("monthly_input_tokens", 0)
+            ),
+            monthly_output_tokens=int(
+                limit_item.get("monthly_output_tokens", 0)
+            ),
+            monthly_limits_enabled=bool(
+                limit_item.get("monthly_limits_enabled", False)
+            ),
             version=int(snapshot.get("version", 0)),
             created_at=snapshot.get("created_at"),
             updated_at=snapshot.get("updated_at"),
@@ -954,9 +1188,7 @@ class QuotaStore:
         *,
         user_id: str,
         name: str,
-        daily_usd: float,
-        daily_input_tokens: int,
-        daily_output_tokens: int,
+        limits: dict[str, dict[str, float | int] | None],
         actor: str,
         auth_method: str,
         idempotency_key: str,
@@ -974,9 +1206,7 @@ class QuotaStore:
             "name": name,
             "status": "active",
             "status_reason": "",
-            "daily_usd_micro": _usd_to_micro(daily_usd),
-            "daily_input_tokens": daily_input_tokens,
-            "daily_output_tokens": daily_output_tokens,
+            **_limit_attributes(limits),
             "version": 1,
             "created_at": timestamp,
             "updated_at": timestamp,
@@ -1039,6 +1269,7 @@ class QuotaStore:
         auth_method: str,
         idempotency_key: str,
         request_hash: str,
+        reconciled_status: tuple[str, str, str] | None = None,
         now: datetime | None = None,
     ) -> AdminMutationResult:
         replay = self._idempotency_result(idempotency_key, request_hash)
@@ -1056,25 +1287,50 @@ class QuotaStore:
         }
         sets = ["#version = :next", "updated_at = :updated"]
         next_item = dict(current_item)
-        if "daily_usd" in limits:
-            value = _usd_to_micro(limits["daily_usd"])
-            values[":daily_usd"] = value
-            sets.append("daily_usd_micro = :daily_usd")
-            next_item["daily_usd_micro"] = value
-        if "daily_input_tokens" in limits:
-            value = int(limits["daily_input_tokens"])
-            values[":daily_input_tokens"] = value
-            sets.append("daily_input_tokens = :daily_input_tokens")
-            next_item["daily_input_tokens"] = value
-        if "daily_output_tokens" in limits:
-            value = int(limits["daily_output_tokens"])
-            values[":daily_output_tokens"] = value
-            sets.append("daily_output_tokens = :daily_output_tokens")
-            next_item["daily_output_tokens"] = value
+        for attribute, value in _limit_attributes(limits).items():
+            placeholder = f":{attribute}"
+            values[placeholder] = value
+            sets.append(f"{attribute} = {placeholder}")
+            next_item[attribute] = value
+        status_changed = False
+        if reconciled_status is not None:
+            desired_status, desired_reason, desired_origin = reconciled_status
+            status_changed = (
+                desired_status != current.status
+                or desired_reason != current.status_reason
+                or desired_origin != current.status_origin
+            )
+            if status_changed:
+                values.update(
+                    {
+                        ":status": desired_status,
+                        ":status_reason": desired_reason,
+                        ":status_origin": desired_origin,
+                    }
+                )
+                sets.extend(
+                    [
+                        "#status = :status",
+                        "status_reason = :status_reason",
+                        "status_origin = :status_origin",
+                        "status_changed_at = :updated",
+                    ]
+                )
+                next_item.update(
+                    {
+                        "status": desired_status,
+                        "status_reason": desired_reason,
+                        "status_origin": desired_origin,
+                        "status_changed_at": now.isoformat(),
+                    }
+                )
         next_item.update(
             {"version": expected_version + 1, "updated_at": now.isoformat()}
         )
         updated = self._to_user(next_item)
+        names = {"#version": "version"}
+        if status_changed:
+            names["#status"] = "status"
         transaction = [
             {
                 "Update": {
@@ -1084,11 +1340,33 @@ class QuotaStore:
                     "ConditionExpression": self._version_condition(
                         expected_version
                     ),
-                    "ExpressionAttributeNames": {"#version": "version"},
+                    "ExpressionAttributeNames": names,
                     "ExpressionAttributeValues": self._serialize(values),
                 }
             },
-            *self._admin_metadata_items(
+        ]
+        if status_changed:
+            transaction.append(
+                {
+                    "Put": {
+                        "TableName": self._users.name,
+                        "Item": self._serialize(
+                            {
+                                "user_id": f"REVOCATION#{user_id}",
+                                "maps_to": user_id,
+                                "desired_status": updated.status,
+                                "source_identity": str(
+                                    current_item.get("source_identity", "")
+                                ),
+                                "updated_at": now.isoformat(),
+                                "expires_at": window_ttl_epoch(now),
+                            }
+                        ),
+                    }
+                }
+            )
+        transaction.extend(
+            self._admin_metadata_items(
                 user=updated,
                 before=current,
                 event_type="user.limits.updated",
@@ -1098,8 +1376,8 @@ class QuotaStore:
                 idempotency_key=idempotency_key,
                 request_hash=request_hash,
                 now=now,
-            ),
-        ]
+            )
+        )
         try:
             self._client.transact_write_items(TransactItems=transaction)
         except ClientError as exc:
@@ -1234,6 +1512,21 @@ class QuotaStore:
             daily_usd_micro=int(item.get("daily_usd_micro", 0)),
             daily_input_tokens=int(item.get("daily_input_tokens", 0)),
             daily_output_tokens=int(item.get("daily_output_tokens", 0)),
+            daily_limits_enabled=bool(
+                item.get("daily_limits_enabled", True)
+            ),
+            weekly_usd_micro=int(item.get("weekly_usd_micro", 0)),
+            weekly_input_tokens=int(item.get("weekly_input_tokens", 0)),
+            weekly_output_tokens=int(item.get("weekly_output_tokens", 0)),
+            weekly_limits_enabled=bool(
+                item.get("weekly_limits_enabled", False)
+            ),
+            monthly_usd_micro=int(item.get("monthly_usd_micro", 0)),
+            monthly_input_tokens=int(item.get("monthly_input_tokens", 0)),
+            monthly_output_tokens=int(item.get("monthly_output_tokens", 0)),
+            monthly_limits_enabled=bool(
+                item.get("monthly_limits_enabled", False)
+            ),
             version=int(item.get("version", 0)),
             created_at=(
                 str(item["created_at"]) if item.get("created_at") else None
@@ -1281,20 +1574,101 @@ class QuotaStore:
             "requests": int(item.get("requests", 0)),
         }
 
-    def is_over_budget(self, user: UserRecord) -> bool:
-        usage = self.get_window_usage(user.user_id)
-        cost_micro = int(round(usage["cost_usd"] * MICRO))
-        return bool(
-            (user.daily_usd_micro and cost_micro >= user.daily_usd_micro)
-            or (
-                user.daily_input_tokens
-                and usage["input_tokens"] >= user.daily_input_tokens
-            )
-            or (
-                user.daily_output_tokens
-                and usage["output_tokens"] >= user.daily_output_tokens
-            )
+    def _daily_usage_rows(
+        self, user_id: str, start: str, end: str
+    ) -> list[dict]:
+        response = self._usage.query(
+            KeyConditionExpression=(
+                "user_id = :user_id AND #window BETWEEN :start AND :end"
+            ),
+            ExpressionAttributeNames={"#window": "window"},
+            ExpressionAttributeValues={
+                ":user_id": user_id,
+                ":start": start,
+                ":end": end,
+            },
+            ConsistentRead=True,
         )
+        rows = list(response.get("Items", []))
+        while response.get("LastEvaluatedKey"):
+            response = self._usage.query(
+                KeyConditionExpression=(
+                    "user_id = :user_id AND #window BETWEEN :start AND :end"
+                ),
+                ExpressionAttributeNames={"#window": "window"},
+                ExpressionAttributeValues={
+                    ":user_id": user_id,
+                    ":start": start,
+                    ":end": end,
+                },
+                ConsistentRead=True,
+                ExclusiveStartKey=response["LastEvaluatedKey"],
+            )
+            rows.extend(response.get("Items", []))
+        return rows
+
+    def get_current_usage(
+        self, user_id: str, now: datetime | None = None
+    ) -> dict[str, dict[str, object]]:
+        windows = calendar_windows(now)
+        start = min(window.start for window in windows.values())
+        end = windows["daily"].start
+        rows = self._daily_usage_rows(
+            user_id, start.date().isoformat(), end.date().isoformat()
+        )
+        return aggregate_daily_rows(rows, now)
+
+    def get_period_usage(
+        self,
+        user_id: str,
+        period: str,
+        window: str | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, object]:
+        bounds = (
+            period_for_start(period, window)
+            if window is not None
+            else calendar_window(period, now)
+        )
+        end_date = bounds.end.date() - timedelta(days=1)
+        rows = self._daily_usage_rows(
+            user_id,
+            bounds.start.date().isoformat(),
+            end_date.isoformat(),
+        )
+        return aggregate_daily_rows(rows, bounds.start)[period]
+
+    def evaluate_user_quota(
+        self, user: UserRecord, now: datetime | None = None
+    ) -> QuotaEvaluation:
+        usage = self.get_current_usage(user.user_id, now)
+        return evaluate_limits(user.period_limits, usage, now)
+
+    def status_after_limit_change(
+        self,
+        user: UserRecord,
+        limits: dict[str, dict[str, float | int] | None],
+        now: datetime | None = None,
+    ) -> tuple[str, str, str]:
+        internal_limits = limits_from_item(_limit_attributes(limits))
+        evaluation = evaluate_limits(
+            internal_limits, self.get_current_usage(user.user_id, now), now
+        )
+        automatic = self._automatic_status_owned(user)
+        if not user.active and not automatic:
+            return user.status, user.status_reason, user.status_origin
+        if evaluation.over_budget:
+            return "blocked", quota_reason(evaluation), "automatic"
+        if not user.active and automatic:
+            return (
+                "active",
+                "auto: current calendar periods are under quota",
+                "automatic",
+            )
+        return user.status, user.status_reason, user.status_origin
+
+    def is_over_budget(self, user: UserRecord) -> bool:
+        return self.evaluate_user_quota(user).over_budget
 
     @staticmethod
     def _automatic_status_owned(user: UserRecord) -> bool:
@@ -1316,7 +1690,38 @@ class QuotaStore:
             changed = self.set_user_status(
                 current.user_id,
                 "active",
-                "auto: current window is under quota",
+                "auto: current calendar periods are under quota",
+                expected_version=current.version,
+                expected_status=current.status,
+                expected_reason=current.status_reason,
+            )
+            refreshed = self.get_user(current.user_id)
+            assert refreshed is not None
+            if changed:
+                return refreshed
+            current = refreshed
+        return current
+
+    def reconcile_limits(self, user: UserRecord) -> UserRecord:
+        """Immediately align an automatic status after a limit mutation."""
+        current = user
+        for _ in range(3):
+            evaluation = self.evaluate_user_quota(current)
+            automatic = self._automatic_status_owned(current)
+            if evaluation.over_budget:
+                if not current.active:
+                    return current
+                desired_status = "blocked"
+                desired_reason = quota_reason(evaluation)
+            else:
+                if current.active or not automatic:
+                    return current
+                desired_status = "active"
+                desired_reason = "auto: current calendar periods are under quota"
+            changed = self.set_user_status(
+                current.user_id,
+                desired_status,
+                desired_reason,
                 expected_version=current.version,
                 expected_status=current.status,
                 expected_reason=current.status_reason,
@@ -1477,7 +1882,32 @@ class QuotaStore:
         history = [
             {
                 "user_id": user_id,
+                "period": "daily",
                 "window": str(item["window"]),
+                "window_start": calendar_window(
+                    "daily",
+                    datetime.combine(
+                        datetime.fromisoformat(str(item["window"])).date(),
+                        datetime.min.time(),
+                        tzinfo=timezone.utc,
+                    ),
+                ).start.isoformat(),
+                "window_end": calendar_window(
+                    "daily",
+                    datetime.combine(
+                        datetime.fromisoformat(str(item["window"])).date(),
+                        datetime.min.time(),
+                        tzinfo=timezone.utc,
+                    ),
+                ).end.isoformat(),
+                "resets_at": calendar_window(
+                    "daily",
+                    datetime.combine(
+                        datetime.fromisoformat(str(item["window"])).date(),
+                        datetime.min.time(),
+                        tzinfo=timezone.utc,
+                    ),
+                ).end.isoformat(),
                 "cost_usd": int(item.get("cost_micro", 0)) / MICRO,
                 "input_tokens": int(item.get("input_tokens", 0)),
                 "output_tokens": int(item.get("output_tokens", 0)),
@@ -1487,6 +1917,99 @@ class QuotaStore:
         ]
         last = response.get("LastEvaluatedKey")
         return history, self._encode_cursor(last, cursor_context)
+
+    def get_period_usage_history_page(
+        self,
+        user_id: str,
+        *,
+        period: str,
+        start: str,
+        end: str,
+        limit: int,
+        cursor: str | None = None,
+    ) -> tuple[list[dict], str | None]:
+        if period == "daily":
+            return self.get_usage_history_page(
+                user_id,
+                start=start,
+                end=end,
+                limit=limit,
+                cursor=cursor,
+            )
+        start_bounds = period_for_start(period, start)
+        end_bounds = period_for_start(period, end)
+        rows = self._daily_usage_rows(
+            user_id,
+            start_bounds.start.date().isoformat(),
+            (end_bounds.end.date() - timedelta(days=1)).isoformat(),
+        )
+        grouped: dict[str, dict] = {}
+        for item in rows:
+            raw_window = str(item.get("window", ""))
+            try:
+                occurred = datetime.combine(
+                    datetime.fromisoformat(raw_window).date(),
+                    datetime.min.time(),
+                    tzinfo=timezone.utc,
+                )
+            except ValueError:
+                continue
+            bounds = calendar_window(period, occurred)
+            group = grouped.setdefault(
+                bounds.key,
+                {
+                    "user_id": user_id,
+                    "period": period,
+                    "window": bounds.key,
+                    "window_start": bounds.start.isoformat(),
+                    "window_end": bounds.end.isoformat(),
+                    "resets_at": bounds.end.isoformat(),
+                    "cost_micro": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "requests": 0,
+                },
+            )
+            for field in (
+                "cost_micro",
+                "input_tokens",
+                "output_tokens",
+                "requests",
+            ):
+                group[field] += int(item.get(field, 0))
+        ordered = [grouped[key] for key in sorted(grouped, reverse=True)]
+        cursor_context = {
+            "kind": "period-usage-history",
+            "user_id": user_id,
+            "period": period,
+            "start": start,
+            "end": end,
+        }
+        key = self._decode_cursor(
+            cursor,
+            key_fields={"window"},
+            context=cursor_context,
+        )
+        offset = 0
+        if key is not None:
+            windows = [item["window"] for item in ordered]
+            if key["window"] not in windows:
+                raise ValueError("invalid cursor")
+            offset = windows.index(key["window"]) + 1
+        page = ordered[offset : offset + limit]
+        has_more = offset + limit < len(ordered)
+        next_cursor = self._encode_cursor(
+            {"window": page[-1]["window"]}
+            if page and has_more
+            else None,
+            cursor_context,
+        )
+        public = []
+        for value in page:
+            item = dict(value)
+            cost_micro = int(item.pop("cost_micro"))
+            public.append({**item, "cost_usd": cost_micro / MICRO})
+        return public, next_cursor
 
     @staticmethod
     def _json_safe(value):
@@ -1503,6 +2026,8 @@ class QuotaStore:
 
     @staticmethod
     def _public_audit_event(item: dict) -> dict:
+        before = item.get("before")
+        after = item.get("after")
         return {
             "user_id": str(item.get("subject_id", "")),
             "event_key": str(item.get("event_key", "")),
@@ -1512,8 +2037,20 @@ class QuotaStore:
             "reason": str(item.get("reason", "")),
             "request_id": str(item.get("request_id", "")),
             "created_at": str(item.get("created_at", "")),
-            "before": QuotaStore._json_safe(item.get("before")),
-            "after": QuotaStore._json_safe(item.get("after")),
+            "before": (
+                QuotaStore._user_snapshot(
+                    QuotaStore._snapshot_to_user(before)
+                )
+                if isinstance(before, dict)
+                else None
+            ),
+            "after": (
+                QuotaStore._user_snapshot(
+                    QuotaStore._snapshot_to_user(after)
+                )
+                if isinstance(after, dict)
+                else None
+            ),
         }
 
     def list_admin_audit_page(

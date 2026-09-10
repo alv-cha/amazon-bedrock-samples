@@ -50,6 +50,9 @@ from constructs import Construct
 from .configuration import DeploymentConfig
 
 METRICS_NAMESPACE = "BedrockSpendControls"
+PROJECT_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..")
+)
 
 # Tag key stamped on workload inference profiles (cost allocation + audit).
 WORKLOAD_TAG_KEY = "bedrock-spend-controls-workload"
@@ -500,6 +503,15 @@ class SpendControlsStack(Stack):
         adapter_layer = lambda_.LayerVersion.from_layer_version_arn(
             self, "WebAdapterLayer", adapter_layer_arn,
         )
+        quota_periods_layer = lambda_.LayerVersion(
+            self,
+            "QuotaPeriodsLayer",
+            code=lambda_.Code.from_asset(
+                os.path.join(PROJECT_DIR, "quota_periods_layer")
+            ),
+            compatible_runtimes=[lambda_.Runtime.PYTHON_3_12],
+            description="Shared UTC quota-period calculations",
+        )
 
         broker_api_fn = lambda_.Function(
             # Keep the original construct ID so updating an existing
@@ -510,7 +522,7 @@ class SpendControlsStack(Stack):
             memory_size=1024,
             timeout=Duration.minutes(5),
             handler="run.sh",
-            layers=[adapter_layer],
+            layers=[adapter_layer, quota_periods_layer],
             snap_start=lambda_.SnapStartConf.ON_PUBLISHED_VERSIONS if use_snapstart else None,
             code=lambda_.Code.from_asset(
                 "../gateway",
@@ -544,13 +556,7 @@ class SpendControlsStack(Stack):
                 "ADMIN_KEY_SECRET_ARN": admin_secret.secret_arn,
                 "EMERGENCY_KEY_SECRET_ARN": emergency_secret.secret_arn,
                 "AUTO_PROVISION_USERS": str(config.auto_provision_users).lower(),
-                "DEFAULT_DAILY_USD": str(config.default_daily_usd),
-                "DEFAULT_DAILY_INPUT_TOKENS": str(
-                    config.default_daily_input_tokens
-                ),
-                "DEFAULT_DAILY_OUTPUT_TOKENS": str(
-                    config.default_daily_output_tokens
-                ),
+                "DEFAULT_LIMITS_JSON": config.default_limits_json,
                 # Workload roster for the admin API: granularity labeling
                 # and enforcement_ready surfacing (static config, no tokens).
                 "WORKLOAD_ENFORCEMENT_JSON": json.dumps(
@@ -609,18 +615,12 @@ class SpendControlsStack(Stack):
             },
         )
 
+        # TransactWriteItems is authorized through the item-level actions
+        # (dynamodb:PutItem/UpdateItem/DeleteItem/ConditionCheckItem) that
+        # grant_read_write_data already attaches; no extra policy is needed.
         users_table.grant_read_write_data(broker_api_fn)
         usage_table.grant_read_data(broker_api_fn)
         admin_audit_table.grant_read_write_data(broker_api_fn)
-        broker_api_fn.add_to_role_policy(
-            iam.PolicyStatement(
-                actions=["dynamodb:TransactWriteItems"],
-                resources=[
-                    users_table.table_arn,
-                    admin_audit_table.table_arn,
-                ],
-            )
-        )
         admin_secret.grant_read(broker_api_fn)
         emergency_secret.grant_read(broker_api_fn)
 
@@ -923,6 +923,7 @@ class SpendControlsStack(Stack):
                     "x-amz-content-sha256",
                     "x-amz-date",
                     "x-amz-security-token",
+                    "x-quota-emergency-key",
                     "x-quota-user-token",
                 ],
                 allow_methods=["GET", "POST", "PUT"],
@@ -931,7 +932,11 @@ class SpendControlsStack(Stack):
                 ],
                 expose_headers=[
                     "etag",
+                    "x-quota-breached-dimension",
+                    "x-quota-breached-period",
                     "x-quota-limit-usd",
+                    "x-quota-enabled-periods",
+                    "x-quota-resets-at",
                     "x-quota-window",
                     "x-request-id",
                 ],
@@ -1219,6 +1224,7 @@ class SpendControlsStack(Stack):
             timeout=Duration.minutes(2),
             handler="handler.handler",
             code=lambda_.Code.from_asset("../usage_processor"),
+            layers=[quota_periods_layer],
             environment={
                 "USERS_TABLE": users_table.table_name,
                 "USAGE_TABLE": usage_table.table_name,
@@ -1237,15 +1243,12 @@ class SpendControlsStack(Stack):
                     if workload_profiles
                     else "{}"
                 ),
-                "DEFAULT_DAILY_USD": str(config.default_daily_usd),
-                "DEFAULT_DAILY_INPUT_TOKENS": str(
-                    config.default_daily_input_tokens
-                ),
-                "DEFAULT_DAILY_OUTPUT_TOKENS": str(
-                    config.default_daily_output_tokens
-                ),
+                "DEFAULT_LIMITS_JSON": config.default_limits_json,
             },
         )
+        # TransactWriteItems needs no dedicated policy: the item-level
+        # actions granted by grant_read_write_data authorize transactional
+        # writes on both tables.
         users_table.grant_read_write_data(usage_processor_fn)
         usage_table.grant_read_write_data(usage_processor_fn)
         alert_topic.grant_publish(usage_processor_fn)
@@ -1253,7 +1256,7 @@ class SpendControlsStack(Stack):
 
         # CloudWatch Logs subscriptions are at-least-once. The processor uses
         # the Bedrock requestId as a DynamoDB idempotency key and updates the
-        # daily aggregate in the same transaction.
+        # canonical daily usage ledger in the same transaction.
         logs.SubscriptionFilter(
             self, "InvocationUsageSubscription",
             log_group=invocation_log_group,
@@ -1561,6 +1564,7 @@ class SpendControlsStack(Stack):
                 reserved_concurrent_executions=1,
                 handler="handler.handler",
                 code=lambda_.Code.from_asset("../workload_enforcer"),
+                layers=[quota_periods_layer],
                 environment={
                     "USERS_TABLE": users_table.table_name,
                     "USAGE_TABLE": usage_table.table_name,

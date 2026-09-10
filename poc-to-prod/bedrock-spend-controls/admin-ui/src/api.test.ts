@@ -5,6 +5,8 @@ import {
   ApiError,
   api,
   transport,
+  type CurrentUsage,
+  type QuotaLimits,
   type UserRow,
 } from "./api";
 
@@ -34,6 +36,18 @@ function response(body: BodyInit | null, status = 200, headers: Record<string, s
   return new Response(body, { status, headers });
 }
 
+const limits: QuotaLimits = {
+  daily: { usd: 10, input_tokens: 100, output_tokens: 50 },
+  weekly: null,
+  monthly: null,
+};
+
+const currentUsage: CurrentUsage = {
+  daily: { period: "daily", window: "2026-09-02", window_start: "2026-09-02T00:00:00+00:00", window_end: "2026-09-03T00:00:00+00:00", resets_at: "2026-09-03T00:00:00+00:00", cost_usd: 2, input_tokens: 20, output_tokens: 10, requests: 3 },
+  weekly: { period: "weekly", window: "2026-08-31", window_start: "2026-08-31T00:00:00+00:00", window_end: "2026-09-07T00:00:00+00:00", resets_at: "2026-09-07T00:00:00+00:00", cost_usd: 2, input_tokens: 20, output_tokens: 10, requests: 3 },
+  monthly: { period: "monthly", window: "2026-09-01", window_start: "2026-09-01T00:00:00+00:00", window_end: "2026-10-01T00:00:00+00:00", resets_at: "2026-10-01T00:00:00+00:00", cost_usd: 2, input_tokens: 20, output_tokens: 10, requests: 3 },
+};
+
 const user: UserRow = {
   user_id: "tenant/alice",
   name: "Alice",
@@ -43,8 +57,9 @@ const user: UserRow = {
   version: 7,
   created_at: "2026-09-01T10:00:00Z",
   updated_at: "2026-09-01T10:00:00Z",
-  limits: { daily_usd: 10, daily_input_tokens: 100, daily_output_tokens: 50 },
+  limits,
   today: { cost_usd: 2, input_tokens: 20, output_tokens: 10, requests: 3 },
+  current_usage: currentUsage,
 };
 
 describe("transport", () => {
@@ -173,16 +188,17 @@ describe("mutation requests", () => {
       "00000000-0000-4000-8000-000000000099",
     );
     const routeUser = { ...user, user_id: "tenant/alice/usage-history/audit/limits/status" };
-    const { today: _today, ...canonical } = routeUser;
-    const updatedLimits = {
-      daily_usd: 12,
-      daily_input_tokens: 120,
-      daily_output_tokens: 60,
+    const { today: _today, current_usage: _currentUsage, ...canonical } = routeUser;
+    const updatedLimits: QuotaLimits = {
+      daily: { usd: 12, input_tokens: 120, output_tokens: 60 },
+      weekly: null,
+      monthly: null,
     };
     const fetch = vi.fn()
-      .mockResolvedValueOnce(response(JSON.stringify({ user: canonical }), 200, { "Content-Type": "application/json", ETag: '"7"' }))
+      .mockResolvedValueOnce(response(JSON.stringify({ user: canonical, current_usage: currentUsage }), 200, { "Content-Type": "application/json", ETag: '"7"' }))
       .mockResolvedValueOnce(response(JSON.stringify({
         user_id: routeUser.user_id,
+        period: "daily",
         start: "2026-09-01",
         end: "2026-09-02",
         usage: [],
@@ -218,7 +234,7 @@ describe("mutation requests", () => {
       end: "2026-09-02",
     });
     await api.listUserAuditPage(cfg, clientSession, routeUser.user_id);
-    await api.setLimits(cfg, clientSession, routeUser, updatedLimits);
+    await api.setLimits(cfg, clientSession, routeUser, { limits: updatedLimits });
     await api.setStatus(
       cfg,
       clientSession,
@@ -252,6 +268,70 @@ describe("mutation requests", () => {
       });
     }
   });
+
+  it("changes the runtime lease dial without redeploying", async () => {
+    const fetch = vi.fn().mockResolvedValue(response(JSON.stringify({
+      permission_lease_seconds: 60,
+      source: "runtime",
+      generation: 3,
+      actor: "admin@example.test",
+      reason: "incident response",
+      updated_at: "2026-09-09T10:00:00Z",
+    }), 200, { "Content-Type": "application/json" }));
+
+    await api.setEnforcement(
+      cfg,
+      sessionWith(fetch),
+      60,
+      "  incident response  ",
+      2,
+    );
+
+    const [url, init] = fetch.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("https://gateway.example.test/admin/enforcement");
+    expect(init.method).toBe("PUT");
+    expect(init.headers).toMatchObject({
+      "If-Match": '"2"',
+      "Idempotency-Key": expect.any(String),
+    });
+    expect(JSON.parse(String(init.body))).toEqual({
+      permission_lease_seconds: 60,
+      reason: "incident response",
+    });
+  });
+
+  it("sends the break-glass key only in the emergency request header", async () => {
+    const fetch = vi.fn().mockResolvedValue(response(JSON.stringify({
+      state: "activating",
+      desired_active: true,
+      generation: 1,
+      requested_at: "2026-09-09T10:00:00Z",
+      idempotent: false,
+      retry: false,
+    }), 202, { "Content-Type": "application/json" }));
+
+    await api.setEmergencyStop(cfg, sessionWith(fetch), {
+      action: "activate",
+      confirmation: "STOP_ALL_BEDROCK_SESSIONS",
+      reason: "  incident response  ",
+      emergencyKey: "break-glass-secret",
+    });
+
+    const [url, init] = fetch.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("https://gateway.example.test/admin/emergency-stop");
+    expect(init.method).toBe("POST");
+    expect(init.headers).toMatchObject({
+      "X-Quota-Emergency-Key": "break-glass-secret",
+      "X-Quota-User-Token": "jwt-token",
+    });
+    const body = JSON.parse(String(init.body));
+    expect(body).toEqual({
+      action: "activate",
+      confirmation: "STOP_ALL_BEDROCK_SESSIONS",
+      reason: "incident response",
+    });
+    expect(JSON.stringify(body)).not.toContain("break-glass-secret");
+  });
 });
 
 
@@ -281,7 +361,7 @@ describe("paginated operational endpoints", () => {
 
   it("creates with a UUID idempotency key and rejects a mismatched canonical identity", async () => {
     vi.spyOn(globalThis.crypto, "randomUUID").mockReturnValue("00000000-0000-4000-8000-000000000002");
-    const { today: _today, ...canonical } = user;
+    const { today: _today, current_usage: _currentUsage, ...canonical } = user;
     const fetch = vi.fn().mockResolvedValue(response(JSON.stringify({
       user_id: user.user_id,
       provisioned: true,
@@ -292,7 +372,7 @@ describe("paginated operational endpoints", () => {
     const result = await api.createUser(cfg, sessionWith(fetch), {
       user_id: `  ${user.user_id}  `,
       name: "  Alice  ",
-      ...canonical.limits,
+      limits: canonical.limits,
     });
 
     expect(result.etag).toBe('"1"');
@@ -309,21 +389,22 @@ describe("paginated operational endpoints", () => {
     await expect(api.createUser(cfg, sessionWith(mismatched), {
       user_id: user.user_id,
       name: "Alice",
-      ...canonical.limits,
+      limits: canonical.limits,
     })).rejects.toMatchObject({ code: "invalid_response" });
   });
 
   it("validates detail and usage response identity consistency", async () => {
-    const { today: _today, ...canonical } = user;
-    const detailFetch = vi.fn().mockResolvedValue(response(JSON.stringify({ user: canonical }), 200, { "Content-Type": "application/json" }));
+    const { today: _today, current_usage: _currentUsage, ...canonical } = user;
+    const detailFetch = vi.fn().mockResolvedValue(response(JSON.stringify({ user: canonical, current_usage: currentUsage }), 200, { "Content-Type": "application/json" }));
     await expect(api.getUser(cfg, sessionWith(detailFetch), "tenant/bob"))
       .rejects.toMatchObject({ code: "invalid_response" });
 
     const usageFetch = vi.fn().mockResolvedValue(response(JSON.stringify({
       user_id: user.user_id,
+      period: "daily",
       start: "2026-08-04",
       end: "2026-09-02",
-      usage: [{ user_id: "tenant/bob", window: "2026-09-02", cost_usd: 1, input_tokens: 2, output_tokens: 3, requests: 4 }],
+      usage: [{ user_id: "tenant/bob", period: "daily", window: "2026-09-02", window_start: "2026-09-02T00:00:00+00:00", window_end: "2026-09-03T00:00:00+00:00", resets_at: "2026-09-03T00:00:00+00:00", cost_usd: 1, input_tokens: 2, output_tokens: 3, requests: 4 }],
       next_cursor: null,
     }), 200, { "Content-Type": "application/json" }));
     await expect(api.usageHistory(cfg, sessionWith(usageFetch), user.user_id, {
@@ -342,7 +423,7 @@ describe("paginated operational endpoints", () => {
       version: user.version,
       created_at: user.created_at,
       updated_at: user.updated_at,
-      limits: { daily_usd_micro: 10_000_000, daily_input_tokens: 100, daily_output_tokens: 50 },
+      limits: { daily: { usd_micro: 10_000_000, input_tokens: 100, output_tokens: 50 }, weekly: null, monthly: null },
     };
     const event = {
       user_id: user.user_id,
@@ -368,8 +449,12 @@ describe("paginated operational endpoints", () => {
 
 describe("USD normalization", () => {
   it("normalizes create and limit writes to the backend micro-dollar precision before validation", async () => {
-    const { today: _today, ...base } = user;
-    const normalizedLimits = { ...base.limits, daily_usd: 0.123457 };
+    const { today: _today, current_usage: _currentUsage, ...base } = user;
+    const normalizedLimits: QuotaLimits = {
+      daily: { ...base.limits.daily!, usd: 0.123457 },
+      weekly: { usd: 0.234568, input_tokens: 200, output_tokens: 100 },
+      monthly: { usd: 0.345679, input_tokens: 300, output_tokens: 150 },
+    };
     const created = { ...base, version: 1, limits: normalizedLimits };
     const createFetch = vi.fn().mockResolvedValue(response(JSON.stringify({
       user_id: base.user_id,
@@ -381,11 +466,16 @@ describe("USD normalization", () => {
     await expect(api.createUser(cfg, sessionWith(createFetch), {
       user_id: base.user_id,
       name: base.name,
-      daily_usd: 0.1234567,
-      daily_input_tokens: base.limits.daily_input_tokens,
-      daily_output_tokens: base.limits.daily_output_tokens,
+      limits: {
+        daily: { ...base.limits.daily!, usd: 0.1234567 },
+        weekly: { usd: 0.2345678, input_tokens: 200, output_tokens: 100 },
+        monthly: { usd: 0.3456789, input_tokens: 300, output_tokens: 150 },
+      },
     })).resolves.toMatchObject({ data: { user: { limits: normalizedLimits } } });
-    expect(JSON.parse(String((createFetch.mock.calls[0][1] as RequestInit).body)).daily_usd).toBe(0.123457);
+    const createBody = JSON.parse(String((createFetch.mock.calls[0][1] as RequestInit).body));
+    expect(createBody.limits.daily.usd).toBe(0.123457);
+    expect(createBody.limits.weekly.usd).toBe(0.234568);
+    expect(createBody.limits.monthly.usd).toBe(0.345679);
 
     const updated = { ...base, version: base.version + 1, limits: normalizedLimits };
     const limitsFetch = vi.fn().mockImplementation(() => Promise.resolve(response(JSON.stringify({
@@ -395,20 +485,26 @@ describe("USD normalization", () => {
       user: updated,
     }), 200, { "Content-Type": "application/json" })));
     await expect(api.setLimits(cfg, sessionWith(limitsFetch), base, {
-      ...base.limits,
-      daily_usd: 0.1234567,
+      limits: {
+        daily: { ...base.limits.daily!, usd: 0.1234567 },
+        weekly: { usd: 0.2345678, input_tokens: 200, output_tokens: 100 },
+        monthly: { usd: 0.3456789, input_tokens: 300, output_tokens: 150 },
+      },
     })).resolves.toMatchObject({ data: { user: { limits: normalizedLimits } } });
     const bodyWithoutReason = JSON.parse(String((limitsFetch.mock.calls[0][1] as RequestInit).body));
-    expect(bodyWithoutReason.daily_usd).toBe(0.123457);
+    expect(bodyWithoutReason.limits.daily.usd).toBe(0.123457);
     expect(bodyWithoutReason).not.toHaveProperty("reason");
 
     await expect(api.setLimits(cfg, sessionWith(limitsFetch), base, {
-      ...base.limits,
-      daily_usd: 0.1234567,
+      limits: {
+        daily: { ...base.limits.daily!, usd: 0.1234567 },
+        weekly: { usd: 0.2345678, input_tokens: 200, output_tokens: 100 },
+        monthly: { usd: 0.3456789, input_tokens: 300, output_tokens: 150 },
+      },
       reason: "  Annual allocation  ",
     })).resolves.toMatchObject({ data: { user: { limits: normalizedLimits } } });
     expect(JSON.parse(String((limitsFetch.mock.calls[1][1] as RequestInit).body))).toEqual({
-      ...normalizedLimits,
+      limits: normalizedLimits,
       reason: "Annual allocation",
     });
   });

@@ -37,7 +37,7 @@ function bruno(leased: boolean): UserRow {
     version: 1,
     created_at: justNow,
     updated_at: justNow,
-    limits: { daily_usd: 0.35, daily_input_tokens: 0, daily_output_tokens: 0 },
+    limits: { daily: { usd: 0.35, input_tokens: 0, output_tokens: 0 }, weekly: null, monthly: null },
     lease: leased ? {
       active: true,
       expires_at: inOneMinute,
@@ -47,6 +47,11 @@ function bruno(leased: boolean): UserRow {
       lease_seconds: 60,
     } : null,
     today: { cost_usd: 0, input_tokens: 0, output_tokens: 0, requests: 0 },
+    current_usage: {
+      daily: { period: "daily", window: justNow.slice(0, 10), window_start: justNow, window_end: inOneMinute, resets_at: inOneMinute, cost_usd: 0, input_tokens: 0, output_tokens: 0, requests: 0 },
+      weekly: { period: "weekly", window: justNow.slice(0, 10), window_start: justNow, window_end: inOneMinute, resets_at: inOneMinute, cost_usd: 0, input_tokens: 0, output_tokens: 0, requests: 0 },
+      monthly: { period: "monthly", window: justNow.slice(0, 10), window_start: justNow, window_end: inOneMinute, resets_at: inOneMinute, cost_usd: 0, input_tokens: 0, output_tokens: 0, requests: 0 },
+    },
   };
 }
 

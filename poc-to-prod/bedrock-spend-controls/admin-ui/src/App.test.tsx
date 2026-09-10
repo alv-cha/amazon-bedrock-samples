@@ -11,7 +11,7 @@ import {
   StatusDialog,
   UsersPanel,
 } from "./App";
-import { ApiError, api, type AdminUser, type AuditEvent, type Operations, type Summary, type UserRow } from "./api";
+import { ApiError, api, type AdminUser, type AuditEvent, type CurrentUsage, type Operations, type QuotaPeriod, type Summary, type UserRow } from "./api";
 import type { Session } from "./auth";
 import type { AdminConfig } from "./config";
 
@@ -108,6 +108,29 @@ const operations: Operations = {
   cloudwatch: { status: "available" },
 };
 
+function currentUsageRow(period: QuotaPeriod, overrides = {}) {
+  const starts = { daily: "2026-09-02", weekly: "2026-08-31", monthly: "2026-09-01" };
+  const ends = { daily: "2026-09-03", weekly: "2026-09-07", monthly: "2026-10-01" };
+  return {
+    period,
+    window: starts[period],
+    window_start: `${starts[period]}T00:00:00+00:00`,
+    window_end: `${ends[period]}T00:00:00+00:00`,
+    resets_at: `${ends[period]}T00:00:00+00:00`,
+    cost_usd: 5,
+    input_tokens: 50,
+    output_tokens: 10,
+    requests: 4,
+    ...overrides,
+  };
+}
+
+const currentUsage: CurrentUsage = {
+  daily: currentUsageRow("daily"),
+  weekly: currentUsageRow("weekly", { cost_usd: 7, requests: 6 }),
+  monthly: currentUsageRow("monthly", { cost_usd: 9, requests: 8 }),
+};
+
 const alice: UserRow = {
   user_id: "tenant/alice",
   name: "Alice Example",
@@ -117,12 +140,17 @@ const alice: UserRow = {
   version: 1,
   created_at: "2026-09-01T10:00:00Z",
   updated_at: "2026-09-01T10:00:00Z",
-  limits: { daily_usd: 10, daily_input_tokens: 100, daily_output_tokens: 20 },
+  limits: {
+    daily: { usd: 10, input_tokens: 100, output_tokens: 20 },
+    weekly: { usd: 20, input_tokens: 200, output_tokens: 40 },
+    monthly: null,
+  },
   today: { cost_usd: 5, input_tokens: 50, output_tokens: 10, requests: 4 },
+  current_usage: currentUsage,
 };
 
 function canonical(overrides: Partial<AdminUser> = {}): AdminUser {
-  const { today: _today, ...base } = alice;
+  const { today: _today, current_usage: _currentUsage, ...base } = alice;
   return { ...base, ...overrides };
 }
 
@@ -136,13 +164,18 @@ function UsersHarness({ summaryRefresh = vi.fn().mockResolvedValue(undefined) }:
       loading={false}
       onSummaryRefresh={summaryRefresh}
       onUserChanged={(updated) => setUsers((current) => current.map((item) =>
-        item.user_id === updated.user_id ? { ...updated, today: item.today } : item,
+        item.user_id === updated.user_id ? { ...updated, today: item.today, current_usage: item.current_usage } : item,
       ))}
       session={session}
       stale={false}
       users={users}
     />
   );
+}
+
+// The dashboard opens on Overview; user management lives on its own tab.
+async function openTab(actor: ReturnType<typeof userEvent.setup>, name: "Overview" | "Users" | "Operations" | "Audit log") {
+  await actor.click(screen.getByRole("button", { name }));
 }
 
 describe("quota presentation", () => {
@@ -167,6 +200,18 @@ describe("quota presentation", () => {
     expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuetext", "12 units of 10 units used (120 percent)");
     expect(document.querySelector(".progress-critical")).toBeInTheDocument();
   });
+
+  it("switches the displayed calendar usage while surfacing highest utilization", async () => {
+    const actor = userEvent.setup();
+    render(<UsersHarness />);
+
+    expect(screen.getByText("Highest: Daily 50%")).toBeInTheDocument();
+    await actor.selectOptions(screen.getByLabelText("Usage period"), "weekly");
+    expect(screen.getByRole("columnheader", { name: "Weekly USD" })).toBeInTheDocument();
+    expect(screen.getByText("$7.000000")).toBeInTheDocument();
+    await actor.selectOptions(screen.getByLabelText("Usage period"), "monthly");
+    expect(screen.getAllByText("Disabled").length).toBeGreaterThanOrEqual(3);
+  });
 });
 
 describe("limit safety dialog", () => {
@@ -175,11 +220,11 @@ describe("limit safety dialog", () => {
     const onSave = vi.fn();
     render(<LimitsDialog apiError="" busy={false} onClose={vi.fn()} onSave={onSave} user={alice} />);
 
-    expect(screen.getByText(/Enter 0 for Unlimited/)).toBeInTheDocument();
-    const usd = screen.getByLabelText("USD limit");
+    expect(screen.getByText(/Enter 0 for an Unlimited/)).toBeInTheDocument();
+    const usd = screen.getByLabelText("Daily USD limit");
     await actor.clear(usd);
     await actor.type(usd, "0");
-    const input = screen.getByLabelText("Input token limit");
+    const input = screen.getByLabelText("Daily input token limit");
     await actor.clear(input);
     await actor.type(input, "40");
 
@@ -199,9 +244,11 @@ describe("limit safety dialog", () => {
     await actor.click(save);
 
     expect(onSave).toHaveBeenCalledWith({
-      daily_usd: 0,
-      daily_input_tokens: 40,
-      daily_output_tokens: 20,
+      limits: {
+        daily: { usd: 0, input_tokens: 40, output_tokens: 20 },
+        weekly: alice.limits.weekly,
+        monthly: null,
+      },
       reason: "Capacity exception review",
     });
   });
@@ -211,20 +258,22 @@ describe("limit safety dialog", () => {
     const onSave = vi.fn();
     render(<LimitsDialog apiError="" busy={false} onClose={vi.fn()} onSave={onSave} user={alice} />);
 
-    const input = screen.getByLabelText("Input token limit");
+    const input = screen.getByLabelText("Daily input token limit");
     await actor.clear(input);
     await actor.type(input, "40");
     const save = screen.getByRole("button", { name: "Save limits" });
-    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", { name: /should change from a finite value to Unlimited/ })).not.toBeInTheDocument();
     expect(save).toBeDisabled();
     await actor.type(screen.getByLabelText(/Reason/), "Below-usage test");
     expect(save).toBeEnabled();
     await actor.click(save);
 
     expect(onSave).toHaveBeenCalledWith({
-      daily_usd: 10,
-      daily_input_tokens: 40,
-      daily_output_tokens: 20,
+      limits: {
+        daily: { usd: 10, input_tokens: 40, output_tokens: 20 },
+        weekly: alice.limits.weekly,
+        monthly: null,
+      },
       reason: "Below-usage test",
     });
   });
@@ -234,7 +283,7 @@ describe("limit safety dialog", () => {
     const onSave = vi.fn();
     render(<LimitsDialog apiError="" busy={false} onClose={vi.fn()} onSave={onSave} user={alice} />);
 
-    const input = screen.getByLabelText("Input token limit");
+    const input = screen.getByLabelText("Daily input token limit");
     await actor.clear(input);
     await actor.type(input, "101");
     const reason = screen.getByLabelText(/Reason/);
@@ -243,10 +292,35 @@ describe("limit safety dialog", () => {
     await actor.click(screen.getByRole("button", { name: "Save limits" }));
 
     expect(onSave).toHaveBeenCalledWith({
-      daily_usd: 10,
-      daily_input_tokens: 101,
-      daily_output_tokens: 20,
+      limits: {
+        daily: { usd: 10, input_tokens: 101, output_tokens: 20 },
+        weekly: alice.limits.weekly,
+        monthly: null,
+      },
       reason: "Annual allocation",
+    });
+  });
+
+  it("requires confirmation and a reason when enabling an all-Unlimited period", async () => {
+    const actor = userEvent.setup();
+    const onSave = vi.fn();
+    render(<LimitsDialog apiError="" busy={false} onClose={vi.fn()} onSave={onSave} user={alice} />);
+
+    await actor.click(screen.getByRole("checkbox", { name: "Monthly" }));
+    expect(screen.getByText(/include usage accumulated since their UTC boundary/)).toBeInTheDocument();
+    const save = screen.getByRole("button", { name: "Save limits" });
+    expect(save).toBeDisabled();
+    await actor.click(screen.getByRole("checkbox", { name: /monthly usd.*Unlimited/i }));
+    await actor.type(screen.getByLabelText(/Reason/), "Enable monthly accounting");
+    await actor.click(save);
+
+    expect(onSave).toHaveBeenCalledWith({
+      limits: {
+        daily: alice.limits.daily,
+        weekly: alice.limits.weekly,
+        monthly: { usd: 0, input_tokens: 0, output_tokens: 0 },
+      },
+      reason: "Enable monthly accounting",
     });
   });
 });
@@ -259,6 +333,7 @@ describe("canonical local reconciliation", () => {
     expect(mergeCanonicalUser([latestUsage], updated)[0]).toEqual({
       ...updated,
       today: latestUsage.today,
+      current_usage: latestUsage.current_usage,
     });
   });
 
@@ -269,6 +344,7 @@ describe("canonical local reconciliation", () => {
     expect(mergeRefreshedUsers([current], [staleRefresh])[0]).toEqual({
       ...current,
       today: staleRefresh.today,
+      current_usage: staleRefresh.current_usage,
     });
   });
 });
@@ -413,27 +489,38 @@ describe("independent dashboard refresh state", () => {
     vi.spyOn(api, "operations").mockResolvedValue(operations);
     render(<Dashboard cfg={cfg} onSignOut={vi.fn()} session={session} />);
 
+    await openTab(actor, "Users");
     expect(await screen.findByText("Alice Example")).toBeInTheDocument();
     await actor.click(screen.getByRole("button", { name: "Refresh data" }));
 
+    expect(screen.queryByText("Cached users · refresh failed")).not.toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: /until a fresh enforcement summary loads/ })).toBeDisabled();
+
+    await openTab(actor, "Overview");
     expect(await screen.findByText("Cached summary · refresh failed")).toBeInTheDocument();
     expect(screen.getByText("The quota service is temporarily unavailable. Try again.")).toBeInTheDocument();
-    expect(screen.queryByText("Cached users · refresh failed")).not.toBeInTheDocument();
-    expect(screen.queryByText(/Cached from/)).not.toBeInTheDocument();
     expect(within(screen.getByLabelText("Quota summary")).getByText("1")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /until a fresh enforcement summary loads/ })).toBeDisabled();
+
+    await openTab(actor, "Operations");
+    expect(screen.queryByText(/Cached from/)).not.toBeInTheDocument();
   });
 
   it("shows users as unavailable rather than as a verified empty population", async () => {
+    const actor = userEvent.setup();
     vi.spyOn(api, "summary").mockResolvedValue(summary);
     vi.spyOn(api, "listUsersPage").mockRejectedValue(new ApiError("Users unavailable", 503, "service_unavailable"));
     vi.spyOn(api, "operations").mockResolvedValue(operations);
     render(<Dashboard cfg={cfg} onSignOut={vi.fn()} session={session} />);
 
+    await openTab(actor, "Users");
     expect(await screen.findByText("Users unavailable")).toBeInTheDocument();
     expect(screen.queryByText("No users yet")).not.toBeInTheDocument();
+
+    await openTab(actor, "Overview");
     expect(screen.getByLabelText("Quota summary")).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Operations" })).toBeInTheDocument();
+
+    await openTab(actor, "Operations");
+    expect(screen.getByRole("heading", { name: "Operations", level: 2 })).toBeInTheDocument();
   });
 });
 
@@ -457,11 +544,14 @@ function auditFor(user: UserRow): AuditEvent {
     version: user.version,
     created_at: user.created_at,
     updated_at: user.updated_at,
-    limits: {
-      daily_usd_micro: user.limits.daily_usd * 1_000_000,
-      daily_input_tokens: user.limits.daily_input_tokens,
-      daily_output_tokens: user.limits.daily_output_tokens,
-    },
+    limits: Object.fromEntries((["daily", "weekly", "monthly"] as const).map((period) => {
+      const limits = user.limits[period];
+      return [period, limits ? {
+        usd_micro: limits.usd * 1_000_000,
+        input_tokens: limits.input_tokens,
+        output_tokens: limits.output_tokens,
+      } : null];
+    })) as unknown as AuditEvent["after"]["limits"],
   };
   return {
     user_id: user.user_id,
@@ -489,6 +579,7 @@ describe("server-side user pagination", () => {
     vi.spyOn(api, "summary").mockResolvedValue(summary);
     vi.spyOn(api, "operations").mockResolvedValue(operations);
     render(<Dashboard cfg={cfg} onSignOut={vi.fn()} session={session} />);
+    await openTab(actor, "Users");
 
     expect(await screen.findByRole("button", { name: "Alice Example" })).toBeInTheDocument();
     expect(listUsers).toHaveBeenCalledTimes(1);
@@ -521,6 +612,7 @@ describe("server-side user pagination", () => {
       .mockResolvedValueOnce({ users: [alice], next_cursor: "cursor-one" })
       .mockRejectedValueOnce(new ApiError("Unavailable", 503, "service_unavailable"));
     render(<Dashboard cfg={cfg} onSignOut={vi.fn()} session={session} />);
+    await openTab(actor, "Users");
 
     await screen.findByRole("button", { name: "Alice Example" });
     await actor.click(screen.getByRole("button", { name: "Next" }));
@@ -537,8 +629,9 @@ describe("dashboard operational navigation", () => {
     vi.spyOn(api, "operations").mockResolvedValue(operations);
     vi.spyOn(api, "listUsersPage").mockResolvedValue({ users: [alice], next_cursor: null });
     const audit = vi.spyOn(api, "listAuditPage").mockResolvedValue({ events: [auditFor(alice)], next_cursor: null });
-    vi.spyOn(api, "getUser").mockResolvedValue({ data: { user: canonical() }, etag: '"1"', requestId: null, status: 200 });
+    vi.spyOn(api, "getUser").mockResolvedValue({ data: { user: canonical(), current_usage: currentUsage }, etag: '"1"', requestId: null, status: 200 });
     render(<Dashboard cfg={cfg} onSignOut={vi.fn()} session={session} />);
+    await openTab(actor, "Users");
 
     await screen.findByRole("button", { name: "Alice Example" });
     expect(audit).not.toHaveBeenCalled();
@@ -557,6 +650,7 @@ describe("dashboard operational navigation", () => {
       .mockResolvedValueOnce({ users: [bob], next_cursor: null });
     vi.spyOn(api, "listAuditPage").mockResolvedValue({ events: [auditFor(bob)], next_cursor: null });
     render(<Dashboard cfg={cfg} onSignOut={vi.fn()} session={session} />);
+    await openTab(actor, "Users");
 
     await screen.findByRole("button", { name: "Alice Example" });
     await actor.click(screen.getByRole("button", { name: "Audit log" }));
@@ -570,12 +664,14 @@ describe("create and canonical detail synchronization", () => {
   it("adds a successful create with zero today usage and can open its details", async () => {
     const actor = userEvent.setup();
     const created = canonical({ user_id: "tenant/new", name: "New User", version: 1 });
+    const zeroUsage = Object.fromEntries((["daily", "weekly", "monthly"] as const).map((period) => [period, { ...currentUsage[period], cost_usd: 0, input_tokens: 0, output_tokens: 0, requests: 0 }])) as unknown as CurrentUsage;
     vi.spyOn(api, "summary").mockResolvedValue({ ...summary, enforcement: { ...summary.enforcement, total_users: 0 } });
     vi.spyOn(api, "operations").mockResolvedValue(operations);
     vi.spyOn(api, "listUsersPage").mockResolvedValue({ users: [], next_cursor: null });
     vi.spyOn(api, "createUser").mockResolvedValue({ data: { user_id: created.user_id, provisioned: true, limits: created.limits, user: created }, etag: '"1"', requestId: "create-new", status: 200 });
-    vi.spyOn(api, "getUser").mockResolvedValue({ data: { user: created }, etag: '"1"', requestId: null, status: 200 });
+    vi.spyOn(api, "getUser").mockResolvedValue({ data: { user: created, current_usage: zeroUsage }, etag: '"1"', requestId: null, status: 200 });
     render(<Dashboard cfg={cfg} onSignOut={vi.fn()} session={session} />);
+    await openTab(actor, "Users");
 
     await screen.findByText("No users yet");
     await actor.click(screen.getByRole("button", { name: "Create user" }));
@@ -597,9 +693,10 @@ describe("create and canonical detail synchronization", () => {
     vi.spyOn(api, "summary").mockResolvedValue(summary);
     vi.spyOn(api, "operations").mockResolvedValue(operations);
     vi.spyOn(api, "listUsersPage").mockResolvedValue({ users: [alice], next_cursor: null });
-    vi.spyOn(api, "getUser").mockResolvedValue({ data: { user: canonical() }, etag: '"1"', requestId: null, status: 200 });
+    vi.spyOn(api, "getUser").mockResolvedValue({ data: { user: canonical(), current_usage: currentUsage }, etag: '"1"', requestId: null, status: 200 });
     vi.spyOn(api, "setStatus").mockResolvedValue({ data: { user_id: alice.user_id, status: "blocked", reason: "Policy request", user: updated }, etag: '"2"', requestId: "status-two", status: 200 });
     render(<Dashboard cfg={cfg} onSignOut={vi.fn()} session={session} />);
+    await openTab(actor, "Users");
 
     await actor.click(await screen.findByRole("button", { name: "Alice Example" }));
     await actor.click(screen.getByRole("button", { name: "Block user" }));
@@ -633,6 +730,7 @@ describe("additional canonical and modal safety", () => {
       .mockResolvedValueOnce({ users: [alice], next_cursor: null });
     vi.spyOn(api, "setStatus").mockResolvedValue({ data: { user_id: alice.user_id, status: "blocked", reason: "Policy request", user: updated }, etag: '"2"', requestId: "status-filter", status: 200 });
     render(<Dashboard cfg={cfg} onSignOut={vi.fn()} session={session} />);
+    await openTab(actor, "Users");
 
     await screen.findByRole("button", { name: "Alice Example" });
     await actor.selectOptions(screen.getByLabelText("Filter users"), "active");
@@ -650,8 +748,9 @@ describe("additional canonical and modal safety", () => {
     vi.spyOn(api, "summary").mockResolvedValue(summary);
     vi.spyOn(api, "operations").mockResolvedValue(operations);
     vi.spyOn(api, "listUsersPage").mockResolvedValue({ users: [alice], next_cursor: null });
-    vi.spyOn(api, "getUser").mockResolvedValue({ data: { user: canonical() }, etag: '"1"', requestId: null, status: 200 });
+    vi.spyOn(api, "getUser").mockResolvedValue({ data: { user: canonical(), current_usage: currentUsage }, etag: '"1"', requestId: null, status: 200 });
     render(<Dashboard cfg={cfg} onSignOut={vi.fn()} session={session} />);
+    await openTab(actor, "Users");
 
     const opener = await screen.findByRole("button", { name: "Alice Example" });
     await actor.click(opener);
@@ -673,18 +772,19 @@ describe("filtered detail and precision edge cases", () => {
   it("does not evict a newer filtered row when an older detail response has another status", async () => {
     const actor = userEvent.setup();
     const current = { ...bob, version: 3 };
-    let resolveDetail!: (value: { data: { user: AdminUser }; etag: string; requestId: null; status: number }) => void;
-    const delayedDetail = new Promise<{ data: { user: AdminUser }; etag: string; requestId: null; status: number }>((resolve) => { resolveDetail = resolve; });
+    let resolveDetail!: (value: { data: { user: AdminUser; current_usage: CurrentUsage }; etag: string; requestId: null; status: number }) => void;
+    const delayedDetail = new Promise<{ data: { user: AdminUser; current_usage: CurrentUsage }; etag: string; requestId: null; status: number }>((resolve) => { resolveDetail = resolve; });
     vi.spyOn(api, "summary").mockResolvedValue(summary);
     vi.spyOn(api, "operations").mockResolvedValue(operations);
     vi.spyOn(api, "listUsersPage").mockResolvedValue({ users: [current], next_cursor: null });
     vi.spyOn(api, "getUser").mockReturnValue(delayedDetail);
     render(<Dashboard cfg={cfg} onSignOut={vi.fn()} session={session} />);
+    await openTab(actor, "Users");
 
     await screen.findByRole("button", { name: "Bob Example" });
     await actor.selectOptions(screen.getByLabelText("Filter users"), "blocked");
     await actor.click(await screen.findByRole("button", { name: "Bob Example" }));
-    resolveDetail({ data: { user: canonical({ user_id: bob.user_id, name: bob.name, status: "active", version: 2 }) }, etag: '"2"', requestId: null, status: 200 });
+    resolveDetail({ data: { user: canonical({ user_id: bob.user_id, name: bob.name, status: "active", version: 2 }), current_usage: currentUsage }, etag: '"2"', requestId: null, status: 200 });
 
     await waitFor(() => expect(screen.getByRole("button", { name: "Bob Example" })).toBeInTheDocument());
     expect(screen.getAllByText("blocked", { selector: ".status-badge" })).toHaveLength(2);
@@ -695,18 +795,25 @@ describe("filtered detail and precision edge cases", () => {
     const onSave = vi.fn();
     render(<LimitsDialog apiError="" busy={false} onClose={vi.fn()} onSave={onSave} user={{
       ...alice,
-      limits: { ...alice.limits, daily_usd: 0.123457 },
+      limits: { ...alice.limits, daily: { ...alice.limits.daily!, usd: 0.123457 } },
       today: { ...alice.today, cost_usd: 0.1 },
+      current_usage: { ...alice.current_usage, daily: { ...alice.current_usage.daily, cost_usd: 0.1 } },
     }} />);
 
-    const usd = screen.getByLabelText("USD limit");
+    const usd = screen.getByLabelText("Daily USD limit");
     expect(usd).toHaveAttribute("step", "0.000001");
     expect((usd as HTMLInputElement).checkValidity()).toBe(true);
-    const input = screen.getByLabelText("Input token limit");
+    const input = screen.getByLabelText("Daily input token limit");
     await actor.clear(input);
     await actor.type(input, "101");
     await actor.click(screen.getByRole("button", { name: "Save limits" }));
-    expect(onSave).toHaveBeenCalledWith({ daily_usd: 0.123457, daily_input_tokens: 101, daily_output_tokens: 20 });
+    expect(onSave).toHaveBeenCalledWith({
+      limits: {
+        daily: { usd: 0.123457, input_tokens: 101, output_tokens: 20 },
+        weekly: alice.limits.weekly,
+        monthly: null,
+      },
+    });
   });
 
   it("disables drawer status changes until a fresh enforcement summary is available", async () => {
@@ -714,8 +821,9 @@ describe("filtered detail and precision edge cases", () => {
     vi.spyOn(api, "summary").mockRejectedValue(new ApiError("Summary unavailable", 503, "service_unavailable"));
     vi.spyOn(api, "operations").mockResolvedValue(operations);
     vi.spyOn(api, "listUsersPage").mockResolvedValue({ users: [alice], next_cursor: null });
-    vi.spyOn(api, "getUser").mockResolvedValue({ data: { user: canonical() }, etag: '"1"', requestId: null, status: 200 });
+    vi.spyOn(api, "getUser").mockResolvedValue({ data: { user: canonical(), current_usage: currentUsage }, etag: '"1"', requestId: null, status: 200 });
     render(<Dashboard cfg={cfg} onSignOut={vi.fn()} session={session} />);
+    await openTab(actor, "Users");
 
     await actor.click(await screen.findByRole("button", { name: "Alice Example" }));
     const drawer = screen.getByRole("dialog", { name: "Alice Example" });
@@ -748,6 +856,7 @@ describe("workload mode", () => {
     vi.spyOn(api, "summary").mockResolvedValue(summary);
     vi.spyOn(api, "operations").mockResolvedValue(operations);
     render(<Dashboard cfg={cfg} onSignOut={vi.fn()} session={session} />);
+    await openTab(actor, "Users");
 
     expect(await screen.findByRole("button", { name: "Alice Example" })).toBeInTheDocument();
     expect(screen.getAllByText("workload")).toHaveLength(2);

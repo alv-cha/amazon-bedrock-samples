@@ -22,6 +22,8 @@ _DEPLOYMENT_KEYS = {
     "allowed_model_arns",
     "alert_email",
     "auto_provision_users",
+    "default_limits",
+    # Accepted only to migrate pre-calendar-period deployment files.
     "default_daily_input_tokens",
     "default_daily_output_tokens",
     "default_daily_usd",
@@ -61,9 +63,15 @@ _DEFAULTS = {
     "allowed_model_arns": ["*"],
     "alert_email": "",
     "auto_provision_users": True,
-    "default_daily_input_tokens": 1_000_000,
-    "default_daily_output_tokens": 200_000,
-    "default_daily_usd": 1.0,
+    "default_limits": {
+        "daily": {
+            "usd": 1.0,
+            "input_tokens": 1_000_000,
+            "output_tokens": 200_000,
+        },
+        "weekly": None,
+        "monthly": None,
+    },
     "invocation_log_group_name": "",
     "invoker_principal_arns": [],
     "jwt_audience": "",
@@ -116,6 +124,20 @@ class WorkloadConfig:
 
 
 @dataclass(frozen=True)
+class QuotaLimitConfig:
+    usd: float
+    input_tokens: int
+    output_tokens: int
+
+    def as_dict(self) -> dict[str, float | int]:
+        return {
+            "usd": self.usd,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+        }
+
+
+@dataclass(frozen=True)
 class DeploymentConfig:
     adapter_layer_arn: str
     admin_jwt_claim: str
@@ -124,9 +146,9 @@ class DeploymentConfig:
     allowed_model_arns: tuple[str, ...]
     alert_email: str
     auto_provision_users: bool
-    default_daily_input_tokens: int
-    default_daily_output_tokens: int
-    default_daily_usd: float
+    default_daily_limits: QuotaLimitConfig
+    default_weekly_limits: QuotaLimitConfig | None
+    default_monthly_limits: QuotaLimitConfig | None
     deprecated_options: tuple[str, ...]
     invocation_log_group_name: str
     invoker_principal_arns: tuple[str, ...]
@@ -148,6 +170,25 @@ class DeploymentConfig:
     vended_ttl_seconds: int
     warn_threshold: float
     workloads: tuple[WorkloadConfig, ...]
+
+    @property
+    def default_limits_json(self) -> str:
+        return json.dumps(
+            {
+                "daily": self.default_daily_limits.as_dict(),
+                "weekly": (
+                    self.default_weekly_limits.as_dict()
+                    if self.default_weekly_limits is not None
+                    else None
+                ),
+                "monthly": (
+                    self.default_monthly_limits.as_dict()
+                    if self.default_monthly_limits is not None
+                    else None
+                ),
+            },
+            sort_keys=True,
+        )
 
     @classmethod
     def from_node(cls, node: Node) -> "DeploymentConfig":
@@ -251,6 +292,26 @@ class DeploymentConfig:
         )
         if legacy_allowlist_explicit:
             deprecated_options += ("mode_a_allowed_model_arns",)
+
+        legacy_limit_keys = (
+            "default_daily_usd",
+            "default_daily_input_tokens",
+            "default_daily_output_tokens",
+        )
+        legacy_limit_explicit = tuple(
+            name
+            for name in legacy_limit_keys
+            if node.try_get_context(name) is not None or name in deployment
+        )
+        nested_limits_explicit = (
+            node.try_get_context("default_limits") is not None
+            or "default_limits" in deployment
+        )
+        if legacy_limit_explicit and nested_limits_explicit:
+            raise ValueError(
+                "default_limits is incompatible with legacy default_daily_* keys"
+            )
+        deprecated_options += legacy_limit_explicit
 
         invoker_arns = _string_list(
             "invoker_principal_arns", value("invoker_principal_arns")
@@ -359,6 +420,35 @@ class DeploymentConfig:
                 "shared admin secret"
             )
 
+        if legacy_limit_explicit:
+            daily_defaults = _DEFAULTS["default_limits"]["daily"]
+            default_limits_raw = {
+                "daily": {
+                    "usd": value("default_daily_usd")
+                    if "default_daily_usd" in legacy_limit_explicit
+                    else daily_defaults["usd"],
+                    "input_tokens": value("default_daily_input_tokens")
+                    if "default_daily_input_tokens" in legacy_limit_explicit
+                    else daily_defaults["input_tokens"],
+                    "output_tokens": value("default_daily_output_tokens")
+                    if "default_daily_output_tokens" in legacy_limit_explicit
+                    else daily_defaults["output_tokens"],
+                },
+                "weekly": None,
+                "monthly": None,
+            }
+        else:
+            default_limits_raw = value("default_limits")
+        default_limits = _quota_default_limits(default_limits_raw)
+        usage_retention_days = _positive_int(
+            "usage_retention_days", value("usage_retention_days")
+        )
+        if usage_retention_days < 31:
+            raise ValueError(
+                "usage_retention_days must be at least 31 so current monthly "
+                "quota evaluation cannot lose retained daily usage"
+            )
+
         return cls(
             adapter_layer_arn=_string(
                 "adapter_layer_arn", value("adapter_layer_arn")
@@ -371,17 +461,9 @@ class DeploymentConfig:
             auto_provision_users=_boolean(
                 "auto_provision_users", value("auto_provision_users")
             ),
-            default_daily_input_tokens=_positive_int(
-                "default_daily_input_tokens",
-                value("default_daily_input_tokens"),
-            ),
-            default_daily_output_tokens=_positive_int(
-                "default_daily_output_tokens",
-                value("default_daily_output_tokens"),
-            ),
-            default_daily_usd=_positive_float(
-                "default_daily_usd", value("default_daily_usd")
-            ),
+            default_daily_limits=default_limits["daily"],
+            default_weekly_limits=default_limits["weekly"],
+            default_monthly_limits=default_limits["monthly"],
             deprecated_options=deprecated_options,
             invocation_log_group_name=existing_log_group,
             invoker_principal_arns=tuple(invoker_arns),
@@ -400,9 +482,7 @@ class DeploymentConfig:
             revocation_policy_shards=revocation_policy_shards,
             revocation_reconcile_minutes=revocation_reconcile_minutes,
             snapstart=_boolean("snapstart", value("snapstart")),
-            usage_retention_days=_positive_int(
-                "usage_retention_days", value("usage_retention_days")
-            ),
+            usage_retention_days=usage_retention_days,
             vend_rate_limit_per_minute=vend_rate_limit_per_minute,
             vended_ttl_seconds=vended_ttl_seconds,
             warn_threshold=warn_threshold,
@@ -597,6 +677,58 @@ def _boolean(name: str, raw: Any) -> bool:
     raise ValueError(f"{name} must be true or false; got {raw!r}")
 
 
+def _quota_default_limits(
+    raw: Any,
+) -> dict[str, QuotaLimitConfig | None]:
+    if not isinstance(raw, dict):
+        raise ValueError("default_limits must be an object")
+    periods = {"daily", "weekly", "monthly"}
+    unknown = sorted(set(raw) - periods)
+    if unknown:
+        raise ValueError(
+            "Invalid default_limits: unknown " + ", ".join(unknown)
+        )
+    if "daily" not in raw:
+        raise ValueError("Invalid default_limits: missing daily")
+
+    result: dict[str, QuotaLimitConfig | None] = {}
+    expected = {"usd", "input_tokens", "output_tokens"}
+    for period in ("daily", "weekly", "monthly"):
+        value = raw.get(period)
+        if value is None:
+            if period == "daily":
+                raise ValueError("default_limits.daily must be enabled")
+            result[period] = None
+            continue
+        if not isinstance(value, dict):
+            raise ValueError(f"default_limits.{period} must be an object or null")
+        unknown_fields = sorted(set(value) - expected)
+        missing_fields = sorted(expected - set(value))
+        if unknown_fields or missing_fields:
+            details = []
+            if missing_fields:
+                details.append("missing " + ", ".join(missing_fields))
+            if unknown_fields:
+                details.append("unknown " + ", ".join(unknown_fields))
+            raise ValueError(
+                f"Invalid default_limits.{period}: " + "; ".join(details)
+            )
+        result[period] = QuotaLimitConfig(
+            usd=_non_negative_float(
+                f"default_limits.{period}.usd", value["usd"]
+            ),
+            input_tokens=_non_negative_int(
+                f"default_limits.{period}.input_tokens",
+                value["input_tokens"],
+            ),
+            output_tokens=_non_negative_int(
+                f"default_limits.{period}.output_tokens",
+                value["output_tokens"],
+            ),
+        )
+    return result
+
+
 def _positive_float(name: str, raw: Any) -> float:
     if isinstance(raw, bool):
         raise ValueError(f"{name} must be a positive number; got {raw!r}")
@@ -608,6 +740,24 @@ def _positive_float(name: str, raw: Any) -> float:
         ) from exc
     if not math.isfinite(value) or value <= 0:
         raise ValueError(f"{name} must be a positive number; got {raw!r}")
+    return value
+
+
+def _non_negative_float(name: str, raw: Any) -> float:
+    if isinstance(raw, bool):
+        raise ValueError(
+            f"{name} must be a non-negative number; got {raw!r}"
+        )
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{name} must be a non-negative number; got {raw!r}"
+        ) from exc
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(
+            f"{name} must be a non-negative number; got {raw!r}"
+        )
     return value
 
 

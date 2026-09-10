@@ -1,21 +1,20 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  Activity,
   AlertCircle,
-  BellRing,
   Check,
   ChevronDown,
   CircleDollarSign,
-  Database,
   Gauge,
   Layers3,
   Lock,
   LogOut,
   Pencil,
   RefreshCw,
+  ScrollText,
   Search,
   ShieldAlert,
   ShieldCheck,
+  SlidersHorizontal,
   Unlock,
   Users,
   X,
@@ -28,7 +27,10 @@ import {
   apiErrorMessage,
   isAdminUser,
   type AdminUser,
+  type CurrentUsage,
   type Operations,
+  type QuotaLimits,
+  type QuotaPeriod,
   type SetLimitsRequest,
   type Summary,
   type TransportResponse,
@@ -36,9 +38,11 @@ import {
   type UserStatus,
 } from "./api";
 import { CreateUserWizard, GlobalAuditView, LiveLeases, UserDetailDrawer } from "./OperationalUi";
+import { OperationsView } from "./Operations";
 import { useModalLifecycle } from "./modal";
 
 export type UserFilter = "all" | "active" | "blocked" | "users" | "workloads";
+export type DashboardView = "overview" | "users" | "operations" | "audit";
 
 export function matchesUserFilter(user: AdminUser, filter: UserFilter): boolean {
   if (filter === "active" || filter === "blocked") return user.status === filter;
@@ -47,10 +51,39 @@ export function matchesUserFilter(user: AdminUser, filter: UserFilter): boolean 
   return true;
 }
 const USER_PAGE_SIZE = 25;
+const QUOTA_PERIODS: QuotaPeriod[] = ["daily", "weekly", "monthly"];
+
+function periodBounds(period: QuotaPeriod, now = new Date()): { start: Date; end: Date } {
+  const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  if (period === "weekly") start.setUTCDate(start.getUTCDate() - ((start.getUTCDay() + 6) % 7));
+  if (period === "monthly") start.setUTCDate(1);
+  const end = new Date(start);
+  if (period === "daily") end.setUTCDate(end.getUTCDate() + 1);
+  else if (period === "weekly") end.setUTCDate(end.getUTCDate() + 7);
+  else end.setUTCMonth(end.getUTCMonth() + 1);
+  return { start, end };
+}
+
+function emptyCurrentUsage(): CurrentUsage {
+  return Object.fromEntries(QUOTA_PERIODS.map((period) => {
+    const { start, end } = periodBounds(period);
+    return [period, {
+      period,
+      window: start.toISOString().slice(0, 10),
+      window_start: start.toISOString(),
+      window_end: end.toISOString(),
+      resets_at: end.toISOString(),
+      cost_usd: 0,
+      input_tokens: 0,
+      output_tokens: 0,
+      requests: 0,
+    }];
+  })) as unknown as CurrentUsage;
+}
 
 export function mergeCanonicalUser(rows: UserRow[], updated: AdminUser): UserRow[] {
   return rows.map((user) => user.user_id === updated.user_id && updated.version >= user.version
-    ? { ...updated, today: user.today }
+    ? { ...updated, today: user.today, current_usage: user.current_usage }
     : user);
 }
 
@@ -58,7 +91,9 @@ export function mergeRefreshedUsers(current: UserRow[], refreshed: UserRow[]): U
   const currentById = new Map(current.map((user) => [user.user_id, user]));
   return refreshed.map((user) => {
     const cached = currentById.get(user.user_id);
-    return cached && cached.version > user.version ? { ...cached, today: user.today } : user;
+    return cached && cached.version > user.version
+      ? { ...cached, today: user.today, current_usage: user.current_usage }
+      : user;
   });
 }
 
@@ -181,7 +216,7 @@ export function Dashboard({
   session: Session;
   onSignOut: () => void;
 }) {
-  const [view, setView] = useState<"overview" | "audit">("overview");
+  const [view, setView] = useState<DashboardView>("overview");
   const [summary, setSummary] = useState<Summary | null>(null);
   const [operations, setOperations] = useState<Operations | null>(null);
   const [users, setUsers] = useState<UserRow[]>([]);
@@ -316,6 +351,7 @@ export function Dashboard({
       const row: UserRow = {
         ...created,
         today: { cost_usd: 0, input_tokens: 0, output_tokens: 0, requests: 0 },
+        current_usage: emptyCurrentUsage(),
       };
       setUsers((current) => [row, ...current.filter((user) => user.user_id !== created.user_id)]);
       if (openDetails) setSelectedUserId(created.user_id);
@@ -324,7 +360,7 @@ export function Dashboard({
   }
 
   function openAuditTarget(userId: string) {
-    setView("overview");
+    setView("users");
     if (users.some((user) => user.user_id === userId)) {
       setSelectedUserId(userId);
       return;
@@ -336,6 +372,12 @@ export function Dashboard({
   useEffect(() => { void refresh(); }, []);
 
   const refreshing = summaryLoading || usersLoading || operationsLoading;
+  const tabs: Array<{ id: DashboardView; label: string; icon: React.ReactNode }> = [
+    { id: "overview", label: "Overview", icon: <Gauge aria-hidden="true" size={15} /> },
+    { id: "users", label: "Users", icon: <Users aria-hidden="true" size={15} /> },
+    { id: "operations", label: "Operations", icon: <SlidersHorizontal aria-hidden="true" size={15} /> },
+    { id: "audit", label: "Audit log", icon: <ScrollText aria-hidden="true" size={15} /> },
+  ];
 
   return (
     <div className="app-shell">
@@ -352,13 +394,17 @@ export function Dashboard({
 
       <nav aria-label="Primary" className="primary-nav">
         <div>
-          <button aria-current={view === "overview" ? "page" : undefined} onClick={() => setView("overview")} type="button">Overview</button>
-          <button aria-current={view === "audit" ? "page" : undefined} onClick={() => setView("audit")} type="button">Audit log</button>
+          {tabs.map((tab) => (
+            <button aria-current={view === tab.id ? "page" : undefined} key={tab.id} onClick={() => setView(tab.id)} type="button">
+              {tab.icon}
+              {tab.label}
+            </button>
+          ))}
         </div>
       </nav>
 
       <main className="dashboard">
-        {view === "overview" ? (
+        {view === "overview" && (
           <>
             <div className="page-heading">
               <div><p className="eyebrow">Amazon Bedrock</p><h1>Quota overview</h1></div>
@@ -373,8 +419,15 @@ export function Dashboard({
             )}
             {summary ? <SummaryPanel summary={summary} /> : summaryLoading ? <SummarySkeleton /> : <UnavailableState label="Summary unavailable" />}
 
-            <OperationsPanel cfg={cfg} error={operationsError} loading={operationsLoading} operations={operations} session={session} stale={operationsStale} />
+            {operations && <LiveLeases cfg={cfg} configuration={operations.configuration} session={session} />}
+          </>
+        )}
 
+        {view === "users" && (
+          <>
+            <div className="page-heading">
+              <div><p className="eyebrow">Amazon Bedrock</p><h1>User management</h1></div>
+            </div>
             <UsersPanel
               cfg={cfg}
               enforcement={!summaryStale ? summary?.enforcement ?? null : null}
@@ -398,7 +451,26 @@ export function Dashboard({
               users={users}
             />
           </>
-        ) : (
+        )}
+
+        {view === "operations" && (
+          <>
+            <div className="page-heading">
+              <div><p className="eyebrow">Amazon Bedrock</p><h1>Operations</h1></div>
+            </div>
+            <OperationsView
+              cfg={cfg}
+              error={operationsError}
+              loading={operationsLoading}
+              onChanged={() => { void refreshOperations(); void refreshSummary(); }}
+              operations={operations}
+              session={session}
+              stale={operationsStale}
+            />
+          </>
+        )}
+
+        {view === "audit" && (
           <>
             <div className="page-heading"><div><p className="eyebrow">Amazon Bedrock</p><h1>Administrative history</h1></div></div>
             <GlobalAuditView cfg={cfg} onTargetUser={openAuditTarget} session={session} />
@@ -484,200 +556,6 @@ function SummaryPanel({ summary }: { summary: Summary }) {
   );
 }
 
-function OperationsPanel({
-  cfg,
-  error,
-  loading,
-  operations,
-  session,
-  stale,
-}: {
-  cfg: AdminConfig;
-  error: string;
-  loading: boolean;
-  operations: Operations | null;
-  session: Session;
-  stale: boolean;
-}) {
-  if (loading && !operations) {
-    return (
-      <section className="operations-panel" aria-label="Loading operational status">
-        <LoadingState label="Loading operational status" />
-      </section>
-    );
-  }
-
-  if (!operations) {
-    return (
-      <section className="operations-panel" aria-labelledby="operations-title">
-        <div className="panel-heading operations-heading">
-          <div>
-            <p className="eyebrow">Read-only</p>
-            <h2 id="operations-title">Operations</h2>
-            <p>Operational status is unavailable; quota administration remains independent.</p>
-          </div>
-        </div>
-        {error && <ErrorMessage message={error} />}
-      </section>
-    );
-  }
-
-  const config = operations.configuration;
-  const emergency = operations.emergency;
-  const metrics = operations.metrics;
-  const qualificationTone = stale
-    ? "gray"
-    : operations.qualification.status.includes("baseline")
-      ? "green"
-      : operations.qualification.status.includes("pending") || operations.qualification.status.includes("experimental")
-        ? "amber"
-        : "gray";
-  const emergencyQualificationPending =
-    operations.qualification.emergency_status.includes("pending") ||
-    operations.qualification.emergency_status.includes("unknown");
-  const emergencyTone = emergency.state === "active"
-    ? "red"
-    : stale
-      ? "gray"
-      : emergencyQualificationPending
-        ? "amber"
-        : emergency.state === "inactive" && emergency.converged
-          ? "green"
-          : "amber";
-  const reconciliationTone = stale
-    ? "gray"
-    : metrics.reconciliation_status === "current"
-      ? "green"
-      : metrics.reconciliation_status === "degraded"
-        ? "red"
-        : metrics.reconciliation_status === "not_applicable"
-          ? "gray"
-          : "amber";
-  const cloudwatchTone = !stale && operations.cloudwatch.status === "available" && metrics.telemetry_status === "complete"
-    ? "green"
-    : operations.cloudwatch.status === "partial"
-      ? "amber"
-      : "gray";
-
-  return (
-    <section className="operations-panel" aria-labelledby="operations-title">
-      <div className="panel-heading operations-heading">
-        <div>
-          <p className="eyebrow">Read-only</p>
-          <h2 id="operations-title">Operations</h2>
-          <p>Enforcement configuration, reconciliation freshness, alarms, and qualification gates.</p>
-        </div>
-        <div className="operations-heading-meta">
-          <span className={`ops-status ops-status-${stale ? "amber" : "gray"}`}>
-            <span aria-hidden="true" />
-            {stale ? `Cached from ${formatTimestamp(operations.as_of)} · refresh failed` : `Updated ${formatTimestamp(operations.as_of)}`}
-          </span>
-          <span className="read-only-label"><Lock aria-hidden="true" size={13} />No control actions</span>
-        </div>
-      </div>
-      {error && <ErrorMessage message={error} />}
-      <div className="operations-grid">
-        <OperationsCard
-          icon={<ShieldCheck aria-hidden="true" size={19} />}
-          title="Enforcement"
-          status={formatOperationalLabel(config.mode)}
-          tone={qualificationTone}
-        >
-          <OperationsRow label="Qualification" value={formatOperationalLabel(operations.qualification.status)} />
-          <OperationsRow label="STS / fallback" value={`${formatDuration(config.credential_ttl_seconds)} / ${formatDuration(config.post_detection_fallback_seconds)}`} />
-          <OperationsRow label="Permission lease" value={config.permission_lease_enabled && config.effective_permission_lease_seconds !== null ? `${formatDuration(config.effective_permission_lease_seconds)}${config.permission_lease_source === "runtime" ? " · runtime dial" : " · deployment default"}` : "Not active"} />
-          <OperationsRow label="Revocation layer" value={`Always on · ${config.revocation_policy_shards} shards`} />
-          <OperationsRow label="Refresh / rate" value={`${config.refresh_overlap_seconds}s overlap · ${config.refresh_jitter_seconds}s jitter · ${config.vend_rate_limit_per_minute}/min`} />
-        </OperationsCard>
-
-        <OperationsCard
-          icon={<ShieldAlert aria-hidden="true" size={19} />}
-          title="Emergency stop"
-          status={formatOperationalLabel(emergency.state)}
-          tone={emergencyTone}
-        >
-          <OperationsRow label="Converged" value={emergency.converged ? "Yes" : "No"} />
-          <OperationsRow label="Qualification" value={formatOperationalLabel(operations.qualification.emergency_status)} />
-          <OperationsRow label="Generation" value={`${emergency.applied_generation} / ${emergency.generation}`} />
-          <OperationsRow label="Requested" value={formatTimestamp(emergency.requested_at)} />
-          <OperationsRow label="Applied" value={formatTimestamp(emergency.applied_at)} />
-        </OperationsCard>
-
-        <OperationsCard
-          icon={<Database aria-hidden="true" size={19} />}
-          title="Revocation"
-          status={config.revocation_enabled ? formatOperationalLabel(metrics.reconciliation_status) : "Not applicable"}
-          tone={reconciliationTone}
-        >
-          <OperationsRow label="Policy capacity" value={config.revocation_enabled ? `${config.revocation_policy_shards} × ${config.revocation_policy_max_characters.toLocaleString()} chars` : "Not deployed"} />
-          <OperationsRow label="Desired identities" value={metrics.revoked_identities_desired === null ? "No data" : metrics.revoked_identities_desired.toLocaleString()} />
-          <OperationsRow label="Last reconciliation" value={formatTimestamp(metrics.last_reconciliation_at)} />
-          <OperationsRow label="Recent failures / overflow" value={`${metrics.recent_sync_failure_count ?? "No data"} / ${metrics.recent_overflow_count ?? "No data"}`} />
-        </OperationsCard>
-
-        <OperationsCard
-          icon={<Activity aria-hidden="true" size={19} />}
-          title="Telemetry"
-          status={formatOperationalLabel(operations.cloudwatch.status)}
-          tone={cloudwatchTone}
-        >
-          <OperationsRow label="Detection p95" value={formatMilliseconds(metrics.detection_lag_p95_ms)} />
-          <OperationsRow label="Evidence" value={formatOperationalLabel(metrics.telemetry_status)} />
-          <OperationsRow label="Metric sample" value={formatTimestamp(metrics.detection_lag_timestamp)} />
-          <OperationsRow label="Metric namespace" value={metrics.namespace} />
-          <OperationsRow label="Emergency failures" value={metrics.recent_emergency_failure_count === null ? "No data" : metrics.recent_emergency_failure_count.toLocaleString()} />
-        </OperationsCard>
-      </div>
-
-      <LiveLeases cfg={cfg} configuration={config} session={session} />
-
-      <div className="alarm-strip" aria-label="Operational alarms">
-        <div className="alarm-title"><BellRing aria-hidden="true" size={16} /><strong>Alarms and DLQs</strong></div>
-        {operations.alarms.length ? operations.alarms.map((alarm) => (
-          <span className={`ops-status ops-status-${alarmTone(alarm.state)}`} key={alarm.key} title={alarm.updated_at ? `Updated ${formatTimestamp(alarm.updated_at)}` : "No state timestamp"}>
-            <span aria-hidden="true" />
-            {formatOperationalLabel(alarm.key)}: {formatOperationalLabel(alarm.state)}
-          </span>
-        )) : <span className="operations-muted">No alarm metadata configured.</span>}
-      </div>
-    </section>
-  );
-}
-
-function OperationsCard({
-  children,
-  icon,
-  status,
-  title,
-  tone,
-}: {
-  children: React.ReactNode;
-  icon: React.ReactNode;
-  status: string;
-  title: string;
-  tone: string;
-}) {
-  return (
-    <article className="operations-card">
-      <div className="operations-card-heading">
-        <div className="operations-card-title">{icon}<strong>{title}</strong></div>
-        <span className={`ops-status ops-status-${tone}`}><span aria-hidden="true" />{status}</span>
-      </div>
-      <dl>{children}</dl>
-    </article>
-  );
-}
-
-function OperationsRow({ label, value }: { label: string; value: string }) {
-  return <div><dt>{label}</dt><dd title={value}>{value}</dd></div>;
-}
-
-function alarmTone(state: string): string {
-  if (state === "OK") return "green";
-  if (state === "ALARM") return "red";
-  return "gray";
-}
-
 function formatOperationalLabel(value: string): string {
   return value.replaceAll("_", " ");
 }
@@ -685,17 +563,6 @@ function formatOperationalLabel(value: string): string {
 function formatDuration(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
   return `${seconds / 60} min`;
-}
-
-function formatMilliseconds(value: number | null): string {
-  if (value === null) return "No data";
-  return value >= 1000 ? `${(value / 1000).toFixed(2)}s` : `${Math.round(value)}ms`;
-}
-
-function formatTimestamp(value: string | null): string {
-  if (!value) return "No data";
-  const timestamp = new Date(value);
-  return Number.isNaN(timestamp.getTime()) ? "Invalid timestamp" : timestamp.toLocaleString();
 }
 
 export function UsersPanel({
@@ -746,6 +613,7 @@ export function UsersPanel({
   const [editing, setEditing] = useState<UserRow | null>(null);
   const [statusChanging, setStatusChanging] = useState<UserRow | null>(null);
   const [busyUsers, setBusyUsers] = useState<Set<string>>(() => new Set());
+  const [period, setPeriod] = useState<QuotaPeriod>("daily");
   const [actionError, setActionError] = useState("");
   const [notice, setNotice] = useState("");
   const selectedUser = selectedUserId ? users.find((user) => user.user_id === selectedUserId) ?? null : null;
@@ -766,7 +634,11 @@ export function UsersPanel({
 
   function applyCanonicalUser(existing: UserRow, canonical: AdminUser): UserRow {
     onUserChanged(canonical);
-    return { ...canonical, today: existing.today };
+    return {
+      ...canonical,
+      today: existing.today,
+      current_usage: existing.current_usage,
+    };
   }
 
   async function mutate(
@@ -840,6 +712,7 @@ export function UsersPanel({
           {stale && users.length > 0 && <span className="ops-status ops-status-amber"><span aria-hidden="true" />Cached users · refresh failed</span>}
           <button className="button button-primary" onClick={() => { setActionError(""); setNotice(""); setCreating(true); }} type="button">Create user</button>
           <div className="user-tools">
+            <div className="select-wrap"><select aria-label="Usage period" value={period} onChange={(event) => setPeriod(event.target.value as QuotaPeriod)}><option value="daily">Daily window</option><option value="weekly">Weekly window</option><option value="monthly">Monthly window</option></select><ChevronDown aria-hidden="true" size={16} /></div>
             <form className="search-form" onSubmit={(event) => { event.preventDefault(); onSearch(searchDraft.trim()); }}>
               <div className="search-field"><Search aria-hidden="true" size={17} /><input aria-label="Search users" placeholder="Search users" type="search" value={searchDraft} onChange={(event) => setSearchDraft(event.target.value)} /></div>
               <button className="button button-secondary" disabled={loading} type="submit">Search</button>
@@ -852,10 +725,11 @@ export function UsersPanel({
       {error && <ErrorMessage message={error} />}
       {actionError && !editing && !statusChanging && <ErrorMessage message={actionError} dismiss={() => setActionError("")} />}
       {notice && <SuccessMessage message={notice} dismiss={() => setNotice("")} />}
+      <p className="period-display-note">Showing {period} usage. All enabled calendar periods are enforced concurrently.</p>
 
       <div aria-label="Users on current page" className="table-scroll" role="region" tabIndex={0}>
         <table>
-          <thead><tr><th>User</th><th>Status</th><th>USD usage</th><th>Input tokens</th><th>Output tokens</th><th>Requests</th><th><span className="sr-only">Actions</span></th></tr></thead>
+          <thead><tr><th>User</th><th>Status</th><th>{periodLabel(period)} USD</th><th>{periodLabel(period)} input</th><th>{periodLabel(period)} output</th><th>Requests</th><th><span className="sr-only">Actions</span></th></tr></thead>
           <tbody>{loading && users.length === 0 ? <TableSkeleton /> : users.map((user) => (
             <UserTableRow
               busy={busyUsers.has(user.user_id)}
@@ -863,6 +737,7 @@ export function UsersPanel({
               onEdit={() => edit(user)}
               onOpen={() => onSelectedUserChange(user.user_id)}
               onRequestStatus={() => changeStatus(user)}
+              period={period}
               statusActionAvailable={enforcement !== null}
               user={user}
             />
@@ -885,6 +760,7 @@ function UserTableRow({
   onEdit,
   onOpen,
   onRequestStatus,
+  period,
   statusActionAvailable,
   user,
 }: {
@@ -892,10 +768,14 @@ function UserTableRow({
   onEdit: () => void;
   onOpen: () => void;
   onRequestStatus: () => void;
+  period: QuotaPeriod;
   statusActionAvailable: boolean;
   user: UserRow;
 }) {
   const isActive = user.status === "active";
+  const usage = user.current_usage[period];
+  const limits = user.limits[period];
+  const highest = highestUtilization(user);
 
   return (
     <tr>
@@ -905,6 +785,7 @@ function UserTableRow({
           <div>
             <button className="user-name-button" disabled={busy} onClick={onOpen} title={user.name} type="button">{displayName(user)}</button>
             <span title={user.user_id}>{user.user_id}</span>
+            {highest && <span className={`highest-utilization highest-${highest.level}`}>Highest: {periodLabel(highest.period)} {highest.percent}%</span>}
             {user.granularity === "workload" && (
               <span className="granularity-stack">
                 <span className="status-badge status-workload">workload</span>
@@ -935,26 +816,29 @@ function UserTableRow({
       </td>
       <td>
         <QuotaUsage
-          current={user.today.cost_usd}
+          current={usage.cost_usd}
+          enabled={limits !== null}
           format={(value) => formatUsd(value, 6)}
-          limit={user.limits.daily_usd}
+          limit={limits?.usd ?? 0}
         />
       </td>
       <td>
         <QuotaUsage
-          current={user.today.input_tokens}
+          current={usage.input_tokens}
+          enabled={limits !== null}
           format={formatCompact}
-          limit={user.limits.daily_input_tokens}
+          limit={limits?.input_tokens ?? 0}
         />
       </td>
       <td>
         <QuotaUsage
-          current={user.today.output_tokens}
+          current={usage.output_tokens}
+          enabled={limits !== null}
           format={formatCompact}
-          limit={user.limits.daily_output_tokens}
+          limit={limits?.output_tokens ?? 0}
         />
       </td>
-      <td className="request-count">{user.today.requests.toLocaleString()}</td>
+      <td className="request-count">{usage.requests.toLocaleString()}</td>
       <td>
         <div className="row-actions">
           <IconButton disabled={busy} label={`Edit limits for ${displayName(user)}`} onClick={onEdit}>
@@ -984,13 +868,23 @@ function UserTableRow({
 
 export function QuotaUsage({
   current,
+  enabled = true,
   format,
   limit,
 }: {
   current: number;
+  enabled?: boolean;
   format: (value: number) => string;
   limit: number;
 }) {
+  if (!enabled) {
+    return (
+      <div className="quota-usage quota-disabled">
+        <div><strong>{format(current)}</strong><span>period disabled</span></div>
+        <span className="unlimited-label">Disabled</span>
+      </div>
+    );
+  }
   if (limit === 0) {
     return (
       <div className="quota-usage quota-unlimited">
@@ -1031,6 +925,46 @@ export function QuotaUsage({
   );
 }
 
+type PeriodLimitDraft = {
+  enabled: boolean;
+  usd: string;
+  input_tokens: string;
+  output_tokens: string;
+};
+
+type LimitDraft = Record<QuotaPeriod, PeriodLimitDraft>;
+
+function limitDraft(limits: QuotaLimits): LimitDraft {
+  return Object.fromEntries(QUOTA_PERIODS.map((period) => {
+    const value = limits[period];
+    return [period, {
+      enabled: value !== null,
+      usd: String(value?.usd ?? 0),
+      input_tokens: String(value?.input_tokens ?? 0),
+      output_tokens: String(value?.output_tokens ?? 0),
+    }];
+  })) as unknown as LimitDraft;
+}
+
+function parseLimitDraft(draft: LimitDraft): QuotaLimits | null {
+  const parsed: Partial<QuotaLimits> = {};
+  for (const period of QUOTA_PERIODS) {
+    const value = draft[period];
+    if (!value.enabled) {
+      parsed[period] = null;
+      continue;
+    }
+    const usd = value.usd.trim() === "" ? Number.NaN : Number(value.usd);
+    const input = value.input_tokens.trim() === "" ? Number.NaN : Number(value.input_tokens);
+    const output = value.output_tokens.trim() === "" ? Number.NaN : Number(value.output_tokens);
+    if (!Number.isFinite(usd) || usd < 0 || !Number.isInteger(input) || input < 0 || !Number.isInteger(output) || output < 0) return null;
+    parsed[period] = { usd, input_tokens: input, output_tokens: output };
+  }
+  return Object.values(parsed).some((value) => value !== null)
+    ? parsed as QuotaLimits
+    : null;
+}
+
 export function LimitsDialog({
   apiError,
   busy,
@@ -1044,9 +978,7 @@ export function LimitsDialog({
   onSave: (limits: SetLimitsRequest) => void;
   user: UserRow;
 }) {
-  const [dailyUsd, setDailyUsd] = useState(String(user.limits.daily_usd));
-  const [dailyInput, setDailyInput] = useState(String(user.limits.daily_input_tokens));
-  const [dailyOutput, setDailyOutput] = useState(String(user.limits.daily_output_tokens));
+  const [draft, setDraft] = useState<LimitDraft>(() => limitDraft(user.limits));
   const [reason, setReason] = useState("");
   const [unlimitedConfirmed, setUnlimitedConfirmed] = useState(false);
   const [error, setError] = useState("");
@@ -1054,31 +986,27 @@ export function LimitsDialog({
   const firstFieldRef = useRef<HTMLInputElement>(null);
   useModalLifecycle(busy, onClose, dialogRef, firstFieldRef);
 
-  const usd = dailyUsd.trim() === "" ? Number.NaN : Number(dailyUsd);
-  const input = dailyInput.trim() === "" ? Number.NaN : Number(dailyInput);
-  const output = dailyOutput.trim() === "" ? Number.NaN : Number(dailyOutput);
-  const parsedLimits =
-    Number.isFinite(usd) && usd >= 0 &&
-    Number.isInteger(input) && input >= 0 &&
-    Number.isInteger(output) && output >= 0
-      ? { daily_usd: usd, daily_input_tokens: input, daily_output_tokens: output }
-      : null;
+  const parsedLimits = parseLimitDraft(draft);
+  const periodChanges = parsedLimits ? QUOTA_PERIODS.filter((period) => (user.limits[period] === null) !== (parsedLimits[period] === null)).map((period) => `${period} period`) : [];
+  const unlimitedFields: string[] = [];
+  const belowUsageFields: string[] = [];
+  if (parsedLimits) {
+    for (const period of QUOTA_PERIODS) {
+      const previous = user.limits[period];
+      const next = parsedLimits[period];
+      if (!next) continue;
+      const usage = user.current_usage[period];
+      for (const dimension of ["usd", "input_tokens", "output_tokens"] as const) {
+        if ((!previous || previous[dimension] > 0) && next[dimension] === 0) unlimitedFields.push(`${period} ${dimension.replaceAll("_", " ")}`);
+        const current = dimension === "usd" ? usage.cost_usd : usage[dimension];
+        if (next[dimension] > 0 && next[dimension] < current) belowUsageFields.push(`${period} ${dimension.replaceAll("_", " ")}`);
+      }
+    }
+  }
+  const reasonRequired = periodChanges.length > 0 || unlimitedFields.length > 0 || belowUsageFields.length > 0;
 
-  const unlimitedFields = parsedLimits ? [
-    user.limits.daily_usd > 0 && parsedLimits.daily_usd === 0 ? "USD" : "",
-    user.limits.daily_input_tokens > 0 && parsedLimits.daily_input_tokens === 0 ? "input tokens" : "",
-    user.limits.daily_output_tokens > 0 && parsedLimits.daily_output_tokens === 0 ? "output tokens" : "",
-  ].filter(Boolean) : [];
-
-  const belowUsageFields = parsedLimits ? [
-    parsedLimits.daily_usd > 0 && parsedLimits.daily_usd < user.today.cost_usd ? "USD" : "",
-    parsedLimits.daily_input_tokens > 0 && parsedLimits.daily_input_tokens < user.today.input_tokens ? "input tokens" : "",
-    parsedLimits.daily_output_tokens > 0 && parsedLimits.daily_output_tokens < user.today.output_tokens ? "output tokens" : "",
-  ].filter(Boolean) : [];
-  const reasonRequired = unlimitedFields.length > 0 || belowUsageFields.length > 0;
-
-  function changed(setter: (value: string) => void, value: string) {
-    setter(value);
+  function changed(period: QuotaPeriod, patch: Partial<PeriodLimitDraft>) {
+    setDraft((current) => ({ ...current, [period]: { ...current[period], ...patch } }));
     setUnlimitedConfirmed(false);
     setError("");
   }
@@ -1086,7 +1014,9 @@ export function LimitsDialog({
   function submit(event: React.FormEvent) {
     event.preventDefault();
     if (!parsedLimits) {
-      setError("Enter a non-negative USD amount and whole token values. Fields cannot be blank.");
+      setError(Object.values(draft).some((value) => value.enabled)
+        ? "Enter a non-negative USD amount and whole token values. Fields cannot be blank."
+        : "Enable at least one calendar quota period.");
       return;
     }
     if (unlimitedFields.length > 0 && !unlimitedConfirmed) {
@@ -1099,7 +1029,7 @@ export function LimitsDialog({
       return;
     }
     onSave({
-      ...parsedLimits,
+      limits: parsedLimits,
       ...(trimmedReason ? { reason: trimmedReason } : {}),
     });
   }
@@ -1120,7 +1050,7 @@ export function LimitsDialog({
       >
         <div className="dialog-header">
           <div>
-            <p className="eyebrow">Daily allowance</p>
+            <p className="eyebrow">Calendar allowances</p>
             <h2 id="limits-title">Edit quota limits</h2>
           </div>
           <IconButton label="Close dialog" disabled={busy} onClick={onClose}>
@@ -1135,56 +1065,32 @@ export function LimitsDialog({
           </div>
         </div>
         <form onSubmit={submit}>
-          <p className="field-help" id="limits-zero-help">Enter 0 for Unlimited. Current usage remains visible in the users table.</p>
-          <div className="field-grid">
-            <label>
-              <span>USD limit</span>
-              <div className="number-input">
-                <span aria-hidden="true">$</span>
-                <input
-                  aria-describedby="limits-zero-help"
-                  aria-label="USD limit"
-                  disabled={busy}
-                  min="0"
-                  ref={firstFieldRef}
-                  step="0.000001"
-                  type="number"
-                  value={dailyUsd}
-                  onChange={(event) => changed(setDailyUsd, event.target.value)}
-                />
-              </div>
-            </label>
-            <label>
-              <span>Input token limit</span>
-              <input
-                aria-describedby="limits-zero-help"
-                aria-label="Input token limit"
-                disabled={busy}
-                min="0"
-                step="1"
-                type="number"
-                value={dailyInput}
-                onChange={(event) => changed(setDailyInput, event.target.value)}
-              />
-            </label>
-            <label>
-              <span>Output token limit</span>
-              <input
-                aria-describedby="limits-zero-help"
-                aria-label="Output token limit"
-                disabled={busy}
-                min="0"
-                step="1"
-                type="number"
-                value={dailyOutput}
-                onChange={(event) => changed(setDailyOutput, event.target.value)}
-              />
-            </label>
+          <p className="field-help" id="limits-zero-help">Calendar windows use UTC. Enter 0 for an Unlimited dimension. Weekly and monthly limits include usage already recorded since the current period began.</p>
+          <div className="quota-limit-matrix">
+            {QUOTA_PERIODS.map((period, index) => (
+              <fieldset className="quota-period-card" key={period}>
+                <legend>
+                  <label className="quota-period-toggle">
+                    <input checked={draft[period].enabled} disabled={busy} onChange={(event) => changed(period, { enabled: event.target.checked })} type="checkbox" />
+                    <span>{periodLabel(period)}</span>
+                  </label>
+                  <small>Resets {formatTimestamp(user.current_usage[period].resets_at)}</small>
+                </legend>
+                <div className="field-grid">
+                  <label><span>{periodLabel(period)} USD limit</span><div className="number-input"><span aria-hidden="true">$</span><input aria-describedby="limits-zero-help" aria-label={`${periodLabel(period)} USD limit`} disabled={busy || !draft[period].enabled} min="0" ref={index === 0 ? firstFieldRef : undefined} step="0.000001" type="number" value={draft[period].usd} onChange={(event) => changed(period, { usd: event.target.value })} /></div></label>
+                  <label><span>{periodLabel(period)} input token limit</span><input aria-describedby="limits-zero-help" aria-label={`${periodLabel(period)} input token limit`} disabled={busy || !draft[period].enabled} min="0" step="1" type="number" value={draft[period].input_tokens} onChange={(event) => changed(period, { input_tokens: event.target.value })} /></label>
+                  <label><span>{periodLabel(period)} output token limit</span><input aria-describedby="limits-zero-help" aria-label={`${periodLabel(period)} output token limit`} disabled={busy || !draft[period].enabled} min="0" step="1" type="number" value={draft[period].output_tokens} onChange={(event) => changed(period, { output_tokens: event.target.value })} /></label>
+                </div>
+              </fieldset>
+            ))}
           </div>
+          {periodChanges.length > 0 && (
+            <div className="safety-warning" role="status"><ShieldAlert aria-hidden="true" size={18} /><span>Enabling or disabling {formatList(periodChanges)} changes enforcement immediately. Newly enabled periods include usage accumulated since their UTC boundary.</span></div>
+          )}
           {belowUsageFields.length > 0 && (
             <div className="safety-warning" role="status">
               <ShieldAlert aria-hidden="true" size={18} />
-              <span>The new finite {formatList(belowUsageFields)} limit is below today&apos;s usage. Additional use may be blocked immediately.</span>
+              <span>The new finite {formatList(belowUsageFields)} limit is below current-period usage. Additional use may be blocked immediately.</span>
             </div>
           )}
           {unlimitedFields.length > 0 && (
@@ -1218,7 +1124,7 @@ export function LimitsDialog({
           </label>
           <p className="field-help" id="limits-reason-help">
             {reasonRequired
-              ? "Required for Unlimited limits or finite limits below today's usage. "
+              ? "Required for period enable/disable, Unlimited limits, or finite limits below current-period usage. "
               : "Optional for this limit change. "}
             When provided, the trimmed reason is stored with the immutable limit-change audit event.
           </p>
@@ -1317,10 +1223,11 @@ export function StatusDialog({
             <div><span>Next status</span><strong>{nextStatus}</strong></div>
           </div>
           <dl className="usage-snapshot" aria-label="Current usage and limits">
-            <div><dt>USD today</dt><dd>{formatUsd(user.today.cost_usd, 6)} of {formatLimit(user.limits.daily_usd, (value) => formatUsd(value, 6))}</dd></div>
-            <div><dt>Input tokens</dt><dd>{formatCompact(user.today.input_tokens)} of {formatLimit(user.limits.daily_input_tokens, formatCompact)}</dd></div>
-            <div><dt>Output tokens</dt><dd>{formatCompact(user.today.output_tokens)} of {formatLimit(user.limits.daily_output_tokens, formatCompact)}</dd></div>
-            <div><dt>Requests today</dt><dd>{user.today.requests.toLocaleString()}</dd></div>
+            {QUOTA_PERIODS.map((period) => {
+              const limits = user.limits[period];
+              const usage = user.current_usage[period];
+              return <div key={period}><dt>{periodLabel(period)}</dt><dd>{limits ? `${formatUsd(usage.cost_usd, 4)} / ${formatLimit(limits.usd, (value) => formatUsd(value, 4))} · ${formatCompact(usage.input_tokens)} / ${formatLimit(limits.input_tokens, formatCompact)} input · ${formatCompact(usage.output_tokens)} / ${formatLimit(limits.output_tokens, formatCompact)} output` : "Disabled"}</dd></div>;
+            })}
           </dl>
           <div className={`enforcement-warning${blocking ? " enforcement-warning-destructive" : ""}`} id="status-enforcement-message">
             <ShieldAlert aria-hidden="true" size={18} />
@@ -1367,7 +1274,7 @@ export function statusEnforcementMessage(
   nextStatus: UserStatus,
 ): string {
   if (nextStatus === "active") {
-    return "Unblocking allows new credentials to be issued. Configured daily limits continue to apply.";
+    return "Unblocking allows new credentials to be issued. All configured calendar limits continue to apply.";
   }
   const window = formatDuration(enforcement.post_detection_fallback_seconds);
   return `Blocking prevents new credentials from being issued and requests active-session revocation. Existing permissions expire with their lease (up to ${window} after detection); revocation usually cuts them earlier, so bounded overspend is limited to whichever ends first.`;
@@ -1532,6 +1439,37 @@ function initials(user: UserRow): string {
   const parts = source.split(/\s+/).filter(Boolean);
   if (parts.length > 1) return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
   return source.slice(0, 2).toUpperCase();
+}
+
+function highestUtilization(user: UserRow): { period: QuotaPeriod; percent: number; level: string } | null {
+  let highest: { period: QuotaPeriod; ratio: number } | null = null;
+  for (const period of QUOTA_PERIODS) {
+    const limits = user.limits[period];
+    if (!limits) continue;
+    const usage = user.current_usage[period];
+    const ratios = [
+      limits.usd > 0 ? usage.cost_usd / limits.usd : 0,
+      limits.input_tokens > 0 ? usage.input_tokens / limits.input_tokens : 0,
+      limits.output_tokens > 0 ? usage.output_tokens / limits.output_tokens : 0,
+    ];
+    const ratio = Math.max(...ratios);
+    if (highest === null || ratio > highest.ratio) highest = { period, ratio };
+  }
+  if (highest === null) return null;
+  return {
+    period: highest.period,
+    percent: Math.round(highest.ratio * 100),
+    level: highest.ratio >= 1 ? "critical" : highest.ratio >= 0.8 ? "warning" : "normal",
+  };
+}
+
+function periodLabel(period: QuotaPeriod): string {
+  return period[0].toUpperCase() + period.slice(1);
+}
+
+function formatTimestamp(value: string): string {
+  const timestamp = new Date(value);
+  return Number.isNaN(timestamp.getTime()) ? "Invalid timestamp" : timestamp.toLocaleString();
 }
 
 function formatUsd(value: number, digits = 2): string {
