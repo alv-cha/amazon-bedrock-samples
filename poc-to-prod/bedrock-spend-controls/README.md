@@ -131,7 +131,10 @@ the same operations in the user detail drawer under "Per-model budgets".
 
 ## Architecture
 
-[Editable architecture diagram](assets/architecture.drawio)
+[Editable architecture diagram](assets/architecture.drawio) — page 1 is the
+runtime architecture; page 2 is the data-flow diagram with the seven trust
+boundaries used by the threat model (also rendered as
+[`assets/data-flow.png`](assets/data-flow.png)).
 
 ```text
 User JWT -> AWS_IAM broker -> DynamoDB quota check -> short-lived STS
@@ -293,7 +296,13 @@ CLI/Logs Insights checks, remediation, and how to re-run or reconcile a
 component by hand. [`docs/cost-estimate.md`](docs/cost-estimate.md) prices
 the deployed resources for a demo and a 1 000-user production scenario, and
 [`docs/threat-model.md`](docs/threat-model.md) is the STRIDE review of the
-seven trust boundaries with the status of each mitigation.
+seven trust boundaries — assets, assumptions, a data-flow diagram, and 31
+threats written in the AWS threat grammar with priority, mitigation, code
+references, and status — and
+[`docs/threat-model.tc.json`](docs/threat-model.tc.json) is the same model
+exported for [Threat Composer](https://github.com/awslabs/threat-composer),
+regenerated from `docs/threat-model.json` by
+`tools/threat_composer_export.py` (a test fails when the three drift).
 
 An admin API limit of `0` disables that one dimension and is displayed as
 **Unlimited**. A `null` period is disabled. The UI requires explicit
@@ -699,7 +708,9 @@ decision.
 | `admin-ui/` | Static React administration console |
 | `examples/` | SigV4 admin client and lazy credential provider for application code |
 | `qualification/` | Guarded probes to measure enforcement latency in your own account before trusting an overspend bound |
-| `tests/` | Unit, API, infrastructure, qualification-probe, and pricing tests |
+| `tools/` | Price-catalog export, unpriced-usage report, cost estimate, threat-model export (Threat Composer), and data-flow diagram rendering |
+| `docs/` | Runbooks per component and alarm, threat model (Markdown, JSON, Threat Composer), and the cost estimate |
+| `tests/` | Unit, API, infrastructure, qualification-probe, pricing, and documentation-consistency tests |
 
 ## Verification and security scanning
 
