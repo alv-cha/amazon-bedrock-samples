@@ -758,7 +758,8 @@ path. Runbook: `docs/runbooks/components/auto-block-sweeper.md`.
 
 - AWS CLI and an authorized profile.
 - Node.js and npm.
-- Python 3.12 or later, with `pip` available (interpreter module or PATH).
+- Python 3.12 or later, with a `pip3` command available: the one in the
+  project virtualenv is preferred, otherwise the first on `PATH`.
 - No container runtime is required: the broker bundles on the host with
   pinned manylinux wheels. Docker or Finch is used only as an automatic
   fallback if host pip bundling fails (set `CDK_DOCKER=finch` for Finch).

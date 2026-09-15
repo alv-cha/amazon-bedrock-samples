@@ -1,6 +1,7 @@
 """Control-plane API tests for the runtime-only credential broker."""
 
 import json
+import os
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -14,7 +15,7 @@ import app.main as gateway
 from app.broker import BrokerError, VendedCredentials, session_name_for
 from app.quota import MICRO, QuotaStore, current_window
 
-SECRET = "test-jwt-secret"  # nosec B105  # test-only HS256 key, matches conftest
+SECRET = os.environ["JWT_SHARED_SECRET"]  # per-session HS256 key from conftest
 ADMIN = {"Authorization": "Bearer admin-secret"}
 EMERGENCY = {"X-Quota-Emergency-Key": "emergency-secret"}
 # What every period reports when no thresholds list has been configured.

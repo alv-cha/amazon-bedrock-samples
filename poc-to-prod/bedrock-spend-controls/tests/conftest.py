@@ -8,6 +8,7 @@ AWS credentials.
 
 import copy
 import os
+import secrets
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,8 +26,10 @@ os.environ.setdefault("AWS_REGION", "us-east-1")
 os.environ.setdefault("USERS_TABLE", "users-test")
 os.environ.setdefault("USAGE_TABLE", "usage-test")
 os.environ.setdefault("ADMIN_AUDIT_TABLE", "admin-audit-test")
-# HS256 dev-mode JWT verification for tests (no IdP / network needed).
-os.environ.setdefault("JWT_SHARED_SECRET", "test-jwt-secret")
+# HS256 dev-mode JWT verification for tests (no IdP / network needed). The
+# key is generated per session so no signing secret lives in the repository;
+# test modules read it back from the environment when they mint tokens.
+os.environ.setdefault("JWT_SHARED_SECRET", secrets.token_urlsafe(32))
 
 from botocore.exceptions import ClientError  # noqa: E402
 

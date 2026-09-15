@@ -13,7 +13,6 @@ Resources:
 """
 
 import hashlib
-import importlib.util
 import json
 import os
 import shutil
@@ -85,46 +84,46 @@ class GatewayLocalBundling:
         self._source_dir = source_dir
 
     @staticmethod
-    def _pip_launcher() -> list[str] | None:
-        """Locate a host pip: this interpreter's module, then the PATH.
+    def _pip_search_path() -> str:
+        """PATH for the pip child: this interpreter's bin directory first.
 
-        The --platform/--python-version pins below make the produced wheels
-        independent of whichever host interpreter runs pip (including
-        pip-less uv/venv setups where only a PATH pip3 exists).
+        Running the CDK app from a project virtualenv therefore uses that
+        virtualenv's ``pip3`` even when it is not activated; pip-less
+        interpreters (bare uv venvs) fall through to whatever ``pip3`` the
+        shell would find. The --platform/--python-version pins below make
+        the produced wheels independent of which host pip runs.
         """
-        if importlib.util.find_spec("pip") is not None:
-            return [sys.executable, "-m", "pip"]
-        for name in ("pip3", "pip"):
-            executable = shutil.which(name)
-            if executable:
-                return [executable]
-        return None
+        return os.pathsep.join(
+            [os.path.dirname(sys.executable), os.environ.get("PATH", "")]
+        )
 
     def try_bundle(self, output_dir: str, *, image, **_kwargs) -> bool:
         del image  # The container image is only the fallback path.
-        launcher = self._pip_launcher()
-        if launcher is None:
+        search_path = self._pip_search_path()
+        if shutil.which("pip3", path=search_path) is None:
             print(
-                "No host pip found; falling back to container bundling.",
+                "No host pip3 found; falling back to container bundling.",
                 file=sys.stderr,
             )
             return False
-        command = [
-            *launcher, "install",
-            "-r", os.path.join(self._source_dir, "requirements.txt"),
-            "--platform", "manylinux2014_x86_64",
-            "--implementation", "cp",
-            "--python-version", "3.12",
-            "--only-binary=:all:",
-            "--target", output_dir,
-            "--quiet", "--disable-pip-version-check",
-        ]
-        # argv is fully static apart from paths derived from this file's
-        # location and the CDK-provided asset output directory; there is no
-        # shell and no operator- or network-controlled input.
+        # The program is the constant "pip3", resolved through PATH by the
+        # OS. Every other argument is a pip option, a path next to this file,
+        # or the asset output directory CDK hands us: there is no shell and
+        # no operator- or network-controlled input.
         try:
-            subprocess.run(  # nosec B603  # nosemgrep
-                command, check=True, shell=False,
+            subprocess.run(  # nosec B603 B607  # constant program resolved via PATH, argv list, no shell
+                [
+                    "pip3", "install",
+                    "-r", os.path.join(self._source_dir, "requirements.txt"),
+                    "--platform", "manylinux2014_x86_64",
+                    "--implementation", "cp",
+                    "--python-version", "3.12",
+                    "--only-binary=:all:",
+                    "--target", output_dir,
+                    "--quiet", "--disable-pip-version-check",
+                ],
+                check=True, shell=False,
+                env={**os.environ, "PATH": search_path},
             )
         except (OSError, subprocess.CalledProcessError) as exc:
             print(

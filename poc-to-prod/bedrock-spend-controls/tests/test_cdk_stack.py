@@ -1682,27 +1682,32 @@ def test_gateway_local_bundling_avoids_container_runtime(
     output.mkdir()
 
     commands = []
+    lookups = []
 
-    def fake_run(command, check, shell):
+    def fake_run(command, check, shell, env):
         assert check is True
         assert shell is False  # argv list, never a shell string
-        commands.append(command)
+        commands.append((command, env))
+
+    def fake_which(name, path=None):
+        lookups.append((name, path))
+        return "/fake/bin/pip3"
 
     monkeypatch.setattr(stack_module.subprocess, "run", fake_run)
-    monkeypatch.setattr(
-        stack_module.GatewayLocalBundling,
-        "_pip_launcher",
-        staticmethod(lambda: [stack_module.sys.executable, "-m", "pip"]),
-    )
+    monkeypatch.setattr(stack_module.shutil, "which", fake_which)
     bundler = stack_module.GatewayLocalBundling(str(source))
 
     assert bundler.try_bundle(str(output), image=None) is True
+    # The program is a constant resolved through PATH, and that PATH puts
+    # the CDK interpreter's own bin directory first so a project virtualenv
+    # wins over a system pip.
+    ((pip_command, env),) = commands
+    assert pip_command[:2] == ["pip3", "install"]
+    venv_bin = os.path.dirname(stack_module.sys.executable)
+    assert env["PATH"].split(os.pathsep)[0] == venv_bin
+    assert lookups == [("pip3", env["PATH"])]
     # Pinned to the Lambda target, not the host: x86_64 manylinux wheels
     # for CPython 3.12 into the asset output.
-    (pip_command,) = commands
-    assert pip_command[:4] == [
-        stack_module.sys.executable, "-m", "pip", "install"
-    ]
     for flag in (
         "manylinux2014_x86_64", "3.12", "--only-binary=:all:", str(output)
     ):
@@ -1717,14 +1722,12 @@ def test_gateway_local_bundling_falls_back_when_host_pip_fails(
     source = tmp_path / "gateway"
     source.mkdir()
 
-    def failing_run(command, check, shell):
+    def failing_run(command, check, shell, env):
         raise stack_module.subprocess.CalledProcessError(1, command)
 
     monkeypatch.setattr(stack_module.subprocess, "run", failing_run)
     monkeypatch.setattr(
-        stack_module.GatewayLocalBundling,
-        "_pip_launcher",
-        staticmethod(lambda: ["pip3"]),
+        stack_module.shutil, "which", lambda name, path=None: "/fake/bin/pip3"
     )
     bundler = stack_module.GatewayLocalBundling(str(source))
 
@@ -1736,9 +1739,8 @@ def test_gateway_local_bundling_falls_back_without_any_host_pip(
 ):
     """pip-less hosts (for example bare uv venvs) defer to the container."""
     monkeypatch.setattr(
-        stack_module.importlib.util, "find_spec", lambda name: None
+        stack_module.shutil, "which", lambda name, path=None: None
     )
-    monkeypatch.setattr(stack_module.shutil, "which", lambda name: None)
     bundler = stack_module.GatewayLocalBundling(str(tmp_path))
 
     assert bundler.try_bundle(str(tmp_path / "out"), image=None) is False

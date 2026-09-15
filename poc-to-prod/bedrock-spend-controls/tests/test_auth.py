@@ -1,6 +1,7 @@
 """JWT verification tests: HS256 dev mode and the RS256/JWKS path."""
 
 import io
+import os
 import time
 
 import jwt as pyjwt
@@ -10,7 +11,7 @@ import app.auth as auth_module
 from app.auth import JwtError, JwtVerifier, discover_jwks_url, extract_user_token
 from app.config import Settings
 
-SECRET = "test-jwt-secret"  # nosec B105  # test-only HS256 key, matches conftest
+SECRET = os.environ["JWT_SHARED_SECRET"]  # per-session HS256 key from conftest
 
 
 def make_jwt(sub="alice", secret=SECRET, exp_in=3600, extra=None, algorithm="HS256", key=None):

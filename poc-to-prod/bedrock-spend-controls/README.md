@@ -726,23 +726,33 @@ done)
 ```
 
 The same static analysis that runs on the hosted repository can be
-reproduced locally; the sample is kept clean against it:
+reproduced locally; the sample is kept clean against it. The Semgrep run
+below is deliberately stricter than the defaults: `--disable-nosem` ignores
+inline suppressions and the empty `.semgrepignore` keeps `tests/` in scope,
+which is how AWS's security review tooling scans submitted code. Every
+security rule passes under those conditions; the only error-severity results
+are the `return-in-init` parser false positives described below.
 
 ```bash
+touch .semgrepignore   # opt out of Semgrep's default tests/ exclusion
 semgrep scan --config r/python --config r/typescript --config r/javascript \
-  --config r/generic --config p/security-audit --config p/gitleaks \
-  --exclude cdk.out --exclude node_modules --exclude dist .
+  --config r/generic --config p/security-audit --config p/secrets \
+  --config p/jwt --disable-nosem \
+  --exclude cdk.out --exclude node_modules --exclude dist --exclude .venv .
 bandit -r gateway usage_processor cdk/stacks tools examples tests \
   enforcement_dispatcher emergency_processor revocation_processor \
-  workload_enforcer reconciliation_processor quota_periods_layer --skip B101
+  workload_enforcer reconciliation_processor quota_periods_layer \
+  auto_block_sweeper --skip B101
 gitleaks git .   # tracked history; build artifacts are git-ignored
 ```
 
-Remaining findings are intentional and documented inline: the few `nosec`
-and `nosemgrep` markers each carry a justification (host-side `pip` argv
-for asset bundling, the Lambda entrypoint's `0o755` mode, `https`-only
-`urlopen` calls, the `ce:GetCostAndUsage` wildcard resource that Cost
-Explorer requires, and test-only fixture secrets). The React
+Remaining findings are warning-level and intentional, and the code says why
+at each site: the Lambda entrypoint's `0o755` mode, the two `https`-only
+`urlopen` calls, and the `ce:GetCostAndUsage` wildcard resource that Cost
+Explorer requires. The host-side `pip` bundler runs a constant program
+name (`pip3`) with an argument list and no shell, and the test suite signs
+its HS256 tokens with a key generated per session rather than one committed
+to the repository, so neither needs a suppression. The React
 `jsx-not-internationalized` advisories are accepted — the administration
 console is a single-locale sample and is not internationalized. Semgrep's
 `return-not-in-function` / `return-in-init` findings on
