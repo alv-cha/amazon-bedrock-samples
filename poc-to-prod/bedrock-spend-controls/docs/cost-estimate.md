@@ -33,7 +33,8 @@ Schedule-driven invocations are read from the stack: emergency processor
 every 1 min (43 200/month), revocation processor every
 `revocation_reconcile_minutes` = 5 (8 640/month) plus one dispatch per
 status change, workload enforcer every 5 min (when workloads exist), price
-refresher daily, reconciliation daily.
+refresher daily, auto-block sweep nightly (one users-table scan plus one
+2-item transaction per lifted row), reconciliation daily.
 
 DynamoDB request units are derived from the code paths: the metering
 transaction is 3 items (marker Put + subject ledger Update + model ledger
@@ -55,6 +56,7 @@ strongly consistent users-row reads, a ledger Query, and four small writes
 | Lambda: Emergency processor (1-min schedule) — 43,200 inv | 0.08 | 43,200 × (256 MB, 400 ms) |
 | Lambda: Workload enforcer (5-min schedule) — 0 inv | 0.00 | 0 × (256 MB, 600 ms) |
 | Lambda: Price refresher (daily) — 30 inv | 0.00 | 30 × (256 MB, 8000 ms) |
+| Lambda: Auto-block sweep (nightly) — 30 inv | 0.00 | 30 × (256 MB, 2000 ms) |
 | Lambda: Reconciliation (daily) — 0 inv | 0.00 | 0 × (256 MB, 3000 ms) |
 | DynamoDB writes — 0.2 M WRU | 0.14 | on-demand, transactions billed 2x |
 | DynamoDB reads — 0.7 M RRU | 0.08 | on-demand, strongly consistent |
@@ -64,7 +66,7 @@ strongly consistent users-row reads, a ledger Query, and four small writes
 | CloudWatch Logs storage: invocation logs — 0.00 GB-mo | 0.00 | 14-day retention (stack default) |
 | CloudWatch Logs ingest: Lambda/EMF logs — 0.02 GB | 0.01 | 900 B per EMF record |
 | CloudWatch custom metrics — 1,205 metric-months | 361.50 | EMF; per-UserId dimensions dominate |
-| CloudWatch alarms — 8 | 0.80 | standard resolution |
+| CloudWatch alarms — 9 | 0.90 | standard resolution |
 | CloudWatch dashboard — 1 | 0.00 | first 3 dashboards free |
 | CloudWatch GetMetricData — 18,000 metrics | 0.18 | Operations/Overview tabs |
 | SNS — email notifications | 0.00 | first 1 000 email deliveries/month free |
@@ -76,8 +78,7 @@ strongly consistent users-row reads, a ledger Query, and four small writes
 | CloudFront — 4,500 HTTPS requests | 0.00 | admin UI static assets; data transfer negligible |
 | S3 — admin UI bucket | 0.01 | <1 GB |
 | Cognito user pool — demo IdP | 0.00 | <10 k MAU free |
-| **Total** | **363.90** | |
-
+| **Total** | **364.01** | |
 
 
 ### Production: 1 000 users, 1 000 000 invocations / month, 300 s lease
@@ -91,8 +92,9 @@ strongly consistent users-row reads, a ledger Query, and four small writes
 | Lambda: Emergency processor (1-min schedule) — 43,200 inv | 0.08 | 43,200 × (256 MB, 400 ms) |
 | Lambda: Workload enforcer (5-min schedule) — 8,640 inv | 0.02 | 8,640 × (256 MB, 600 ms) |
 | Lambda: Price refresher (daily) — 30 inv | 0.00 | 30 × (256 MB, 8000 ms) |
+| Lambda: Auto-block sweep (nightly) — 30 inv | 0.00 | 30 × (256 MB, 2000 ms) |
 | Lambda: Reconciliation (daily) — 30 inv | 0.00 | 30 × (256 MB, 3000 ms) |
-| DynamoDB writes — 12.9 M WRU | 8.06 | on-demand, transactions billed 2x |
+| DynamoDB writes — 12.9 M WRU | 8.07 | on-demand, transactions billed 2x |
 | DynamoDB reads — 17.1 M RRU | 2.14 | on-demand, strongly consistent |
 | DynamoDB storage — 8.50 GB | 0.00 | first 25 GB free |
 | DynamoDB Streams — 10,000 reads | 0.00 | first 2.5 M free |
@@ -100,7 +102,7 @@ strongly consistent users-row reads, a ledger Query, and four small writes
 | CloudWatch Logs storage: invocation logs — 0.33 GB-mo | 0.01 | 14-day retention (stack default) |
 | CloudWatch Logs ingest: Lambda/EMF logs — 1.48 GB | 0.74 | 900 B per EMF record |
 | CloudWatch custom metrics — 11,175 metric-months | 3,117.50 | EMF; per-UserId dimensions dominate |
-| CloudWatch alarms — 9 | 0.90 | standard resolution |
+| CloudWatch alarms — 10 | 1.00 | standard resolution |
 | CloudWatch dashboard — 1 | 0.00 | first 3 dashboards free |
 | CloudWatch GetMetricData — 180,000 metrics | 1.80 | Operations/Overview tabs |
 | SNS — email notifications | 0.00 | first 1 000 email deliveries/month free |
@@ -112,7 +114,7 @@ strongly consistent users-row reads, a ledger Query, and four small writes
 | CloudFront — 45,000 HTTPS requests | 0.04 | admin UI static assets; data transfer negligible |
 | S3 — admin UI bucket | 0.01 | <1 GB |
 | Cognito user pool — demo IdP | 0.00 | <10 k MAU free |
-| **Total** | **3,141.96** | |
+| **Total** | **3,142.07** | |
 
 ## What dominates and how to reduce it
 

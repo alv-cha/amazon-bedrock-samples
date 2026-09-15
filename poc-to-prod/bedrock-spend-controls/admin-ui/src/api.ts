@@ -287,6 +287,22 @@ export function isWorkload(user: Pick<AdminUser, "user_id" | "granularity">): bo
   return user.granularity === "workload" || user.user_id.startsWith("workload:");
 }
 
+/** Copy for an automatic (quota-driven) block on a JWT user, shown wherever
+ * the operator could mistake it for a manual freeze. It names both lift
+ * paths so "still blocked" is understood as "still over quota". */
+export const AUTOMATIC_BLOCK_HINT =
+  "Automatic block: it lifts by itself once the current windows are under quota, re-checked at the user's next credential request and by the nightly sweep (00:05 UTC). Unblocking now only skips that wait.";
+
+/** Mirrors the backend's automatic-ownership rule: origin `automatic`, or a
+ * legacy row (no origin) whose reason carries the `auto:` marker. */
+export function isAutomaticBlock(
+  user: Pick<AdminUser, "status" | "status_origin" | "status_reason">,
+): boolean {
+  if (user.status !== "blocked") return false;
+  if (user.status_origin === "automatic") return true;
+  return (!user.status_origin || user.status_origin === "legacy") && user.status_reason.startsWith("auto:");
+}
+
 export interface ModelBudgetResponse {
   user_id: string;
   model_id: string;
@@ -590,6 +606,26 @@ export interface Operations {
   };
   alarms: Array<{ key: string; state: string; updated_at: string | null }>;
   cloudwatch: { status: string; error_code?: string };
+  /** Nightly lift of automatic JWT-user blocks; absent on brokers older than the sweeper. */
+  auto_block_sweep?: AutoBlockSweep;
+}
+
+export interface AutoBlockSweepRun {
+  ran_at: string;
+  dry_run: boolean;
+  evaluated: number;
+  lifted: number;
+  still_blocked: number;
+  admin_blocked: number;
+  raced: number;
+  lifted_users: string[];
+  failures: Array<{ user_id: string; error: string }>;
+}
+
+export interface AutoBlockSweep {
+  schedule: string;
+  status: "ok" | "failed" | "never_ran" | string;
+  last_run: AutoBlockSweepRun | null;
 }
 
 export const USAGE_METRIC_KEYS = ["cost_usd", "requests", "input_tokens", "output_tokens"] as const;

@@ -153,6 +153,10 @@ let enforcement = { permission_lease_seconds: 300, source: "runtime", generation
 let emergency = { state: "inactive", desired_active: false, generation: 0, applied_generation: 0, requested_at: null as string | null, applied_at: null as string | null, converged: true };
 
 const mode = new URLSearchParams(location.search).get("recon") ?? "on";
+// ?sweep=ok (default) | failed | never — the nightly auto-block sweep card.
+const sweepMode = new URLSearchParams(location.search).get("sweep") ?? "ok";
+const sweepRun = { ran_at: iso(new Date(Date.UTC(NOW.getUTCFullYear(), NOW.getUTCMonth(), NOW.getUTCDate(), 0, 5, 4))), dry_run: false, evaluated: 3, lifted: 2, still_blocked: 1, admin_blocked: 0, raced: 0, lifted_users: ["dev-team-1", "dev-team-4"], failures: sweepMode === "failed" ? [{ user_id: "dev-team-7", error: "ProvisionedThroughputExceededException" }] : [] };
+const autoBlockSweep = { schedule: "00:05 UTC daily", status: sweepMode === "never" ? "never_ran" : sweepMode === "failed" ? "failed" : "ok", last_run: sweepMode === "never" ? null : sweepRun };
 const reconRun = (day: string, est: number, billed: number, tagInactive: boolean) => ({
   day, run_at: `${dateOnly(new Date(new Date(day).getTime() + 2 * 86_400_000))}T06:00:12+00:00`, region: "us-east-1",
   service_names: ["Amazon Bedrock", "Amazon Bedrock Service"],
@@ -210,10 +214,12 @@ Object.assign(api as Record<string, unknown>, {
       { key: "emergency_stop_failure", state: "OK", updated_at: iso(daysAgo(7)) },
       { key: "emergency_stop_dlq", state: "OK", updated_at: iso(daysAgo(7)) },
       { key: "workload_enforcement_failure", state: "OK", updated_at: iso(daysAgo(2)) },
+      { key: "auto_block_sweep_failure", state: sweepMode === "failed" ? "ALARM" : sweepMode === "never" ? "INSUFFICIENT_DATA" : "OK", updated_at: sweepMode === "never" ? null : sweepRun.ran_at },
       { key: "pricing_fallback", state: "INSUFFICIENT_DATA", updated_at: null },
       ...(mode === "off" ? [] : [{ key: "reconciliation_delta", state: mode === "alarm" ? "ALARM" : "OK", updated_at: iso(new Date(NOW.getTime() - 2 * 3_600_000)) }]),
     ],
     cloudwatch: { status: "available" },
+    auto_block_sweep: autoBlockSweep,
   }; },
 
   reconciliation: async (_c: unknown, _s: unknown, limit = 14) => { await delay(); return mode === "off"

@@ -7,7 +7,7 @@ it; status is **Mitigated** (control exists and is tested), **Accepted**
 listed so it is not forgotten). A machine-readable copy is in
 [`threat-model.json`](threat-model.json) for diffing between reviews.
 
-Reviewed: 2026-09-14, against the `per-user-quotas` branch after the
+Reviewed: 2026-09-15, against the `per-user-quotas` branch after the
 multi-dimension pricing, thresholds/rate-limit, model-budget, and
 reconciliation changes.
 
@@ -212,8 +212,11 @@ new identities in that shard are not IAM-cut.
 clearing it (`revocation_processor/handler.py` shard loop, `overflow`
 branch), alarms (`RevocationPolicyOverflowAlarm`), and the lease still
 bounds the new identities; the shard count is immutable to prevent rehash
-gaps (`configuration.py`). **Status: Mitigated (fail-safe), capacity
-Accepted** — see the overflow runbook.
+gaps (`configuration.py`); the nightly auto-block sweep (T-31) evicts
+identities whose automatic block is already stale, so capacity is consumed
+by *currently* over-quota subjects rather than by everyone ever blocked.
+**Status: Mitigated (fail-safe), capacity Accepted** — see the overflow
+runbook.
 
 **T-18 · Elevation · Enforcement processors escalate via IAM.**
 A compromised processor uses its IAM permissions to grant itself or the
@@ -237,6 +240,29 @@ bound does not apply.
 A third stream consumer would throttle the two enforcement readers.
 *Mitigation:* dispatcher fan-out design; synth-level comment and test
 (`test_cdk_stack.py` asserts exactly two `EventSourceMapping`s).
+**Status: Mitigated.**
+
+**T-31 · Tampering / Denial of service · Nightly sweep lifts a block that
+should have held.** The auto-block sweeper (`AutoBlockSweeperFn`) writes
+`active` to blocked user rows on a schedule, without a human in the loop. A
+bug in its criterion, a stale read, or a compromised function would unblock
+subjects that are still over quota — or unblock an admin freeze.
+*Mitigation:* the criterion is the broker's own (`row_enforcement.over_budget`
+in the shared layer, exercised by the workload-enforcer suite as well); only
+automatic-origin rows are candidates and `status_origin: admin` is never
+written by it; every lift is a `TransactWriteItems` conditional on the
+observed `version`, `status`, and `status_reason`, so a concurrent admin block
+or usage-processor re-block wins and the sweep counts a race instead of
+overwriting; the `REVOCATION#` sentinel rides in the same transaction so the
+row and the deny shards cannot disagree; the function has no `iam:*` and
+cannot widen anything beyond flipping status; a lifted subject that is in
+fact over quota is re-blocked at its next vend or metered request through the
+existing paths (`refresh_auto_status` / `_evaluate_quota`). Tests:
+`tests/test_auto_block_sweeper.py` (admin never touched, monthly budget
+holds through a daily reset, race counted not retried, sentinel written).
+*Residual:* a failed pass leaves stale automatic blocks — an availability
+issue for those users and slow shard growth, never under-enforcement —
+visible for a day through `AutoBlockSweepFailureAlarm` and the console card.
 **Status: Mitigated.**
 
 ### B6 — Admin UI / API → admin mutations
@@ -347,7 +373,7 @@ already been compromised at the account level.
 
 | Status | Count | IDs |
 |---|---|---|
-| Mitigated | 18 | T-03, T-04, T-05, T-06, T-07, T-08 (vended sessions), T-09, T-13*, T-14, T-17*, T-18, T-20, T-21, T-23, T-25, T-28, T-29, T-30 |
+| Mitigated | 19 | T-03, T-04, T-05, T-06, T-07, T-08 (vended sessions), T-09, T-13*, T-14, T-17*, T-18, T-20, T-21, T-23, T-25, T-28, T-29, T-30, T-31 |
 | Accepted | 12 | T-01, T-02, T-10, T-11, T-12, T-15, T-16*, T-19, T-22, T-24, T-26, T-27 |
 | Open | 0 | — |
 

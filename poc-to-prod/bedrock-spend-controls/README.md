@@ -70,8 +70,10 @@ with a rate limit; reaching either limit blocks the subject through the
 same automatic path as a calendar breach with a distinct reason
 (`auto: rpm rate limit reached in minute ...`) and SNS subject
 (`BLOCKED <subject> reason=rpm`). Rate blocks are `status_origin:
-automatic`, so they lift on their own at the next vend or enforcer pass
-once the current minute is under the limit; no manual unblock is needed.
+automatic`, so they lift on their own once the current minute is under the
+limit — at the next vend, the workload enforcer's 5-minute pass, or the
+nightly auto-block sweep (00:05 UTC) for users who never come back; no
+manual unblock is needed.
 Cached tokens never count toward `tpm`. `default_limits.rate` sets the
 deployment default.
 
@@ -232,6 +234,7 @@ outside this direct-to-Runtime architecture.
 | Invocation logging | Trusted principal ARN, model, request ID, and tokens |
 | Usage processor | Event-driven pricing, deduplication, counters, blocking, detection-lag metric |
 | Revocation processor | Always-on sharded `SourceIdentity` deny reconciliation |
+| Auto-block sweeper | Nightly (00:05 UTC) lift of automatic blocks for users who never vend again, keeping the deny shards from filling with stale identities |
 | Emergency processor | Operator-controlled role-wide deny state machine |
 | Spend reconciliation processor (opt-in) | Daily ledger-vs-Cost-Explorer comparison, aggregate and per workload |
 | CloudWatch/SNS | Operational metrics, alarms, warnings, and block notifications |

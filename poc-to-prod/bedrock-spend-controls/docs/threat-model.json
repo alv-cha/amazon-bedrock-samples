@@ -1,6 +1,6 @@
 {
   "title": "Bedrock Spend Controls threat model",
-  "reviewed": "2026-09-14",
+  "reviewed": "2026-09-15",
   "branch": "per-user-quotas",
   "method": "STRIDE per trust boundary",
   "asset": "The Bedrock bill, bounded per identity, tenant, or workload; correct usage attribution; enforcement within the documented bound (metering lag + min(lease remainder, deny propagation)); authorized and audited administration. Prompt confidentiality is out of scope: the broker never sees inference traffic and payload delivery is disabled.",
@@ -393,10 +393,11 @@
       ],
       "title": "Revocation shard overflow",
       "description": "Blocking many identities fills a 6144-character shard; new identities in that shard are not IAM-cut.",
-      "mitigation": "Processor keeps the last-good deny set rather than clearing it; RevocationPolicyOverflowAlarm; lease still bounds new identities; shard count immutable to prevent rehash gaps.",
+      "mitigation": "Processor keeps the last-good deny set rather than clearing it; RevocationPolicyOverflowAlarm; lease still bounds new identities; shard count immutable to prevent rehash gaps. The nightly auto-block sweep (T-31) evicts identities whose automatic block is already stale, so shard capacity is consumed only by currently over-quota subjects.",
       "code_references": [
         "revocation_processor/handler.py",
-        "cdk/stacks/configuration.py"
+        "cdk/stacks/configuration.py",
+        "auto_block_sweeper/handler.py"
       ],
       "tests": [
         "tests/test_revocation_processor.py::test_policy_overflow_fails_open_for_that_shard_and_alerts"
@@ -459,6 +460,32 @@
         "tests/test_cdk_stack.py::test_revocation_layer_is_always_deployed"
       ],
       "residual_risk": null,
+      "status": "Mitigated"
+    },
+    {
+      "id": "T-31",
+      "boundary": "B5",
+      "stride": [
+        "Tampering",
+        "Denial of service"
+      ],
+      "title": "Nightly sweep lifts a block that should have held",
+      "description": "AutoBlockSweeperFn writes active to blocked user rows on a schedule without a human in the loop. A bug in its criterion, a stale read, or a compromised function would unblock subjects still over quota, or unblock an admin freeze.",
+      "mitigation": "Criterion is the broker's own (row_enforcement.over_budget in the shared layer, also exercised by the workload-enforcer suite); only automatic-origin rows are candidates and status_origin admin is never written; each lift is a TransactWriteItems conditional on observed version/status/status_reason so a concurrent admin block or re-block wins and the sweep counts a race; the REVOCATION# sentinel rides in the same transaction so row and deny shards cannot disagree; no iam:* permissions; a wrongly lifted subject is re-blocked at its next vend or metered request through the existing paths.",
+      "code_references": [
+        "auto_block_sweeper/handler.py",
+        "quota_periods_layer/python/bedrock_spend_controls/row_enforcement.py",
+        "cdk/stacks/spend_controls_stack.py (AutoBlockSweeperFn)",
+        "docs/runbooks/components/auto-block-sweeper.md"
+      ],
+      "tests": [
+        "tests/test_auto_block_sweeper.py::test_admin_block_is_never_touched",
+        "tests/test_auto_block_sweeper.py::test_daily_reset_does_not_lift_exhausted_monthly_budget",
+        "tests/test_auto_block_sweeper.py::test_lost_race_is_counted_not_retried_and_not_a_failure",
+        "tests/test_auto_block_sweeper.py::test_automatic_block_under_quota_is_lifted_with_sentinel",
+        "tests/test_cdk_stack.py::test_auto_block_sweeper_is_always_deployed_with_nightly_cron_and_no_iam_actuator"
+      ],
+      "residual_risk": "A failed pass leaves stale automatic blocks: availability for those users and slow shard growth, never under-enforcement; visible for a day via AutoBlockSweepFailureAlarm and the console card.",
       "status": "Mitigated"
     },
     {
@@ -679,7 +706,8 @@
       "T-25",
       "T-28",
       "T-29",
-      "T-30"
+      "T-30",
+      "T-31"
     ],
     "Accepted": [
       "T-01",

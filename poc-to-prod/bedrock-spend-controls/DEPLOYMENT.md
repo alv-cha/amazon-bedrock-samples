@@ -153,8 +153,9 @@ that is written only for subjects with a positive `rpm`/`tpm`. A breach uses
 the same automatic block path as a calendar breach (`status_origin:
 automatic`, revocation sentinel, SNS `BLOCKED <subject> reason=rpm|tpm`) and
 lifts automatically once the current minute is under the limit, at the next
-credential vend or workload-enforcer pass. Rate blocks therefore never
-require a manual unblock; a manual admin block still never auto-lifts.
+credential vend, the workload-enforcer pass, or the nightly auto-block sweep.
+Rate blocks therefore never require a manual unblock; a manual admin block
+still never auto-lifts.
 
 Existing rows need no migration: rows without stored thresholds resolve to
 the deployment default, `rate` is absent (off), and the first admin edit
@@ -739,8 +740,17 @@ The quota window changes at `00:00 UTC`; TTL does not reset quotas. TTL only
 removes old usage, request-id markers, and session mappings asynchronously.
 
 An identity automatically blocked in an earlier window is reactivated when it
-next requests credentials and the current window is under quota. A manually
-blocked identity is never automatically reactivated.
+next requests credentials and the current windows are under quota. Identities
+that never come back are reactivated by the nightly **auto-block sweep**
+(`AutoBlockSweeperFn`, `cron(5 0 * * ? *)`, always deployed): it re-evaluates
+every blocked JWT-user row with the broker's own criterion, lifts the
+automatic ones that are under quota, and rewrites the `REVOCATION#` sentinel
+so the Deny shards converge. This keeps stale identities from filling the
+revocation shards. The last pass is shown on the console's Operations page
+("Auto-block sweep" card) and in `GET /admin/operations` →
+`auto_block_sweep`; a failed pass raises `auto_block_sweep_failure`. A
+manually blocked identity is never automatically reactivated, by either
+path. Runbook: `docs/runbooks/components/auto-block-sweeper.md`.
 
 ## Demo/personal account
 

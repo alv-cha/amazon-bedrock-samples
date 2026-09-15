@@ -37,11 +37,14 @@ newly blocked identity with no IAM cut.
    success log line.
 2. **Very long `source_identity` values** (long tenant claims) — fewer fit
    per shard.
-3. **A day-boundary reset that did not lift automatic blocks.** Blocks lift
-   lazily (at the next vend or enforcer pass), so a burst of blocked
-   identities that never vend again stays in the shards until the row's
-   status changes. The row's `status_origin: automatic` block is harmless,
-   but it occupies shard capacity.
+3. **Stale automatic blocks from users who never came back.** The broker
+   lifts an automatic block only at the user's next vend; the nightly
+   [auto-block sweep](../components/auto-block-sweeper.md) (00:05 UTC)
+   covers everyone else. If the sweep has been failing
+   ([auto-block-sweep-failure](auto-block-sweep-failure.md)) or the
+   overflow happened between the reset and 00:05, blocked identities that
+   are already under quota still occupy shard capacity. Run the sweep by
+   hand (step 2 below) before unblocking anyone manually.
 
 ## Remediation
 
@@ -53,9 +56,16 @@ newly blocked identity with no IAM cut.
      | python3 -c 'import json,sys; r=json.load(sys.stdin); print(r["overflow_shards"]); [print(s) for s in r["shards"] if s["overflow"]]'
    ```
    `desired_characters` vs `applied_characters` shows the gap.
-2. **Reduce the blocked set.** Unblock identities that no longer need to be
-   blocked (`PUT /admin/user/status`), or raise limits for identities whose
-   automatic block is stale. Each unblock removes the identity from its
+2. **Reduce the blocked set.** First force a sweep pass so every automatic
+   block that is already under quota lifts on its own (keeping
+   `status_origin: automatic`, so it can re-block and re-lift later):
+   ```bash
+   aws lambda invoke --function-name <AutoBlockSweeperFn> \
+     --payload '{"source":"manual"}' --cli-binary-format raw-in-base64-out /dev/stdout
+   ```
+   Then unblock identities that no longer need to be blocked
+   (`PUT /admin/user/status`), or raise limits for identities whose block
+   is legitimate but too tight. Each lift removes the identity from its
    shard on the next reconcile.
 3. **Shorten exposure meanwhile**: `PUT /admin/enforcement
    {"permission_lease_seconds": 60, ...}`.

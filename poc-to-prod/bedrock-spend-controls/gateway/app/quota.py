@@ -44,6 +44,10 @@ from bedrock_spend_controls.quota_periods import (
     thresholds_from_storage,
     validate_model_id,
 )
+from bedrock_spend_controls.row_enforcement import (
+    RESERVED_USER_ID_PREFIXES as _RESERVED_USER_ID_PREFIXES,
+    WORKLOAD_USER_ID_PREFIX as _WORKLOAD_USER_ID_PREFIX,
+)
 
 from .config import settings
 
@@ -51,21 +55,11 @@ MICRO = 1_000_000
 _SERIALIZER = TypeSerializer()
 ADMIN_AUDIT_SCOPE = "routine-admin"
 IDEMPOTENCY_EVENT_KEY = "REQUEST"
-RESERVED_USER_ID_PREFIXES = (
-    "SESSION#",
-    "VEND#",
-    "REVOCATION#",
-    "CONFIG#",
-    "EMERGENCY_AUDIT#",
-    "RATE#",
-    "RECONCILE#",
-)
-
-# Public namespace for workload-mode quota subjects (apps calling
-# bedrock-runtime with their own IAM credentials, attributed by application
-# inference profile). Workload rows share the users table and admin API but
-# never authenticate through the JWT vend path.
-WORKLOAD_USER_ID_PREFIX = "workload:"
+# Reserved bookkeeping prefixes and the workload namespace live in the shared
+# layer so the scheduled enforcers filter scans with the exact same tuple.
+# Re-exported here because the admin API and tests import them from quota.
+RESERVED_USER_ID_PREFIXES = _RESERVED_USER_ID_PREFIXES
+WORKLOAD_USER_ID_PREFIX = _WORKLOAD_USER_ID_PREFIX
 
 # Runtime-adjustable permission-lease windows (seconds). The dial is a
 # CONFIG#ENFORCEMENT row; the deployment context only sets the default.
@@ -698,6 +692,23 @@ class QuotaStore:
         # store boundary because this state is returned directly by the admin
         # API, including the idempotent activate/recover acknowledgement.
         return self._json_safe(dict(item))
+
+    def get_auto_block_sweep_state(self) -> dict | None:
+        """Last nightly auto-block sweep, as written by the sweeper Lambda.
+
+        Operator visibility only (the console shows "did the job run and
+        what did it do"); never an input to enforcement. ``None`` until the
+        first real pass has completed.
+        """
+        item = self._users.get_item(
+            Key={"user_id": "CONFIG#AUTO_BLOCK_SWEEP"},
+            ConsistentRead=True,
+        ).get("Item")
+        if not item:
+            return None
+        state = self._json_safe(dict(item))
+        state.pop("user_id", None)
+        return state
 
     def get_enforcement_config(self) -> dict:
         """Runtime enforcement dial: the effective permission-lease window.

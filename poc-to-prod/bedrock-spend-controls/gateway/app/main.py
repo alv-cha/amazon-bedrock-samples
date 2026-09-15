@@ -1202,6 +1202,31 @@ def _metric_points(result: dict) -> list[tuple[datetime, float]]:
     return sorted(points, key=lambda point: point[0], reverse=True)
 
 
+AUTO_BLOCK_SWEEP_SCHEDULE = "00:05 UTC daily"
+
+
+def _auto_block_sweep_state() -> dict:
+    """Last nightly auto-block sweep for the operations page.
+
+    ``last_run`` is None until the sweeper has completed one real pass; the
+    UI then says "never ran" rather than showing zeros that look like a
+    healthy pass. Failures on the last pass are surfaced as ``status:
+    failed`` alongside the alarm chip.
+    """
+    last_run = store().get_auto_block_sweep_state()
+    if last_run is None:
+        status = "never_ran"
+    elif last_run.get("failures"):
+        status = "failed"
+    else:
+        status = "ok"
+    return {
+        "schedule": AUTO_BLOCK_SWEEP_SCHEDULE,
+        "status": status,
+        "last_run": last_run,
+    }
+
+
 def _safe_emergency_state() -> dict:
     raw = store().get_emergency_state()
     state = str(raw.get("state", "inactive"))
@@ -1723,6 +1748,7 @@ async def admin_operations(request: Request) -> Response:
                 ),
             },
             "emergency": _safe_emergency_state(),
+            "auto_block_sweep": _auto_block_sweep_state(),
             "qualification": {
                 "status": str(qualification.get("lease", "unknown")),
                 "lease_status": str(qualification.get("lease", "unknown")),

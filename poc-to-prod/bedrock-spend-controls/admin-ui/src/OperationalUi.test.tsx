@@ -368,6 +368,24 @@ describe("user detail drawer", () => {
   });
 });
 
+describe("user detail drawer status hint", () => {
+  it("explains how an automatic block lifts, and says nothing for admin blocks", async () => {
+    const autoBlocked = adminUser({ status: "blocked", status_origin: "automatic", status_reason: "auto: daily USD quota exhausted in 2026-09-14" });
+    vi.spyOn(api, "getUser").mockResolvedValue({ data: { user: autoBlocked, current_usage: currentUsage }, etag: '"1"', requestId: null, status: 200 });
+    const { unmount } = render(<UserDetailDrawer cfg={cfg} onCanonical={vi.fn()} onClose={vi.fn()} onEdit={vi.fn()} onStatus={vi.fn()} session={session} user={{ ...alice, ...autoBlocked }} />);
+    expect(await screen.findByText("Lifts")).toBeInTheDocument();
+    expect(screen.getByText(/nightly sweep \(00:05 UTC\)/)).toBeInTheDocument();
+    unmount();
+
+    const adminBlocked = adminUser({ status: "blocked", status_origin: "admin", status_reason: "incident freeze" });
+    vi.spyOn(api, "getUser").mockResolvedValue({ data: { user: adminBlocked, current_usage: currentUsage }, etag: '"1"', requestId: null, status: 200 });
+    render(<UserDetailDrawer cfg={cfg} onCanonical={vi.fn()} onClose={vi.fn()} onEdit={vi.fn()} onStatus={vi.fn()} session={session} user={{ ...alice, ...adminBlocked }} />);
+    expect(await screen.findByText("incident freeze")).toBeInTheDocument();
+    expect(screen.queryByText("Lifts")).not.toBeInTheDocument();
+    expect(screen.queryByText(/nightly sweep/)).not.toBeInTheDocument();
+  });
+});
+
 describe("global audit", () => {
   it("lazy page component paginates and exposes explicit user targets with concise text", async () => {
     const actor = userEvent.setup();

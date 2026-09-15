@@ -84,8 +84,9 @@ def test_stack_is_event_driven_with_iam_authenticated_function_url():
     template = _template({"manage_invocation_logging": True})
 
     # Emergency reconciliation (1 minute), the daily model price refresh,
-    # and the always-on revocation repair schedule.
-    template.resource_count_is("AWS::Events::Rule", 3)
+    # the always-on revocation repair schedule, and the nightly auto-block
+    # sweep.
+    template.resource_count_is("AWS::Events::Rule", 4)
     template.resource_count_is("AWS::Logs::SubscriptionFilter", 1)
     # Exactly two users-table stream consumers: the emergency processor and
     # the enforcement dispatcher (DynamoDB Streams supports at most two).
@@ -275,8 +276,9 @@ def test_revocation_layer_is_always_deployed():
     # Emergency processor + enforcement dispatcher: never a third stream
     # consumer (DynamoDB Streams supports at most two per shard).
     template.resource_count_is("AWS::Lambda::EventSourceMapping", 2)
-    # Emergency reconcile, revocation reconcile, and daily price refresh.
-    template.resource_count_is("AWS::Events::Rule", 3)
+    # Emergency reconcile, revocation reconcile, daily price refresh, and
+    # the nightly auto-block sweep.
+    template.resource_count_is("AWS::Events::Rule", 4)
     template.resource_count_is("AWS::SQS::Queue", 2)
 
     template.has_resource_properties(
@@ -1104,11 +1106,15 @@ def test_period_helper_layer_and_usage_transaction_permission_are_wired():
         if "BEDROCK_USER_ROLE_ARN"
         in value.get("Properties", {}).get("Environment", {}).get("Variables", {})
     )
+    # WARN_THRESHOLD is shared with the scheduled enforcers; only the broker
+    # and the usage processor auto-provision rows from DEFAULT_LIMITS_JSON.
     processor = next(
         value
         for value in functions.values()
-        if "WARN_THRESHOLD"
+        if "DEFAULT_LIMITS_JSON"
         in value.get("Properties", {}).get("Environment", {}).get("Variables", {})
+        and "BEDROCK_USER_ROLE_ARN"
+        not in value.get("Properties", {}).get("Environment", {}).get("Variables", {})
     )
     for function in (broker, processor):
         assert {"Ref": layer_id} in function["Properties"]["Layers"]
@@ -1576,9 +1582,9 @@ def test_enforcer_wiring_least_privilege_and_schedules():
     template = _template(_WORKLOADS_CONTEXT)
     # Second subscription filter for profile-attributed traffic.
     template.resource_count_is("AWS::Logs::SubscriptionFilter", 2)
-    # Emergency (1m), price refresh (24h), revocation repair (5m), and
-    # workload enforcement (5m).
-    template.resource_count_is("AWS::Events::Rule", 4)
+    # Emergency (1m), price refresh (24h), revocation repair (5m), nightly
+    # auto-block sweep, and workload enforcement (5m).
+    template.resource_count_is("AWS::Events::Rule", 5)
     # Still exactly two stream consumers: workload events arrive via the
     # enforcement dispatcher, never a third event source mapping.
     template.resource_count_is("AWS::Lambda::EventSourceMapping", 2)
@@ -1991,3 +1997,75 @@ def test_lambda_environments_stay_under_the_4kb_service_limit():
         size = sum(len(key) + literal_size(value) for key, value in env.items())
         assert size <= budget, f"{name} environment ~{size} bytes exceeds {budget}-byte budget"
 
+
+def test_auto_block_sweeper_is_always_deployed_with_nightly_cron_and_no_iam_actuator():
+    """The sweep repairs the users-table side of the revocation layer.
+
+    It is not opt-in: the revocation layer is always on and the sweep is what
+    keeps its Deny shards from filling with users who never come back. It
+    needs read/write on the users table (row flip + REVOCATION# sentinel in
+    one transaction) and read on the usage table, but no IAM verbs: the
+    revocation processor owns the policy documents.
+    """
+    template = _template({"manage_invocation_logging": True})
+    functions = template.find_resources("AWS::Lambda::Function")
+    name, sweeper = next(
+        (name, resource["Properties"])
+        for name, resource in functions.items()
+        if name.startswith("AutoBlockSweeperFn")
+    )
+    env = sweeper["Environment"]["Variables"]
+    assert sweeper["Handler"] == "handler.handler"
+    assert sweeper["ReservedConcurrentExecutions"] == 1
+    assert env["WARN_THRESHOLD"] == "0.8"
+    assert env["USAGE_RETENTION_DAYS"] == "35"
+    assert env["METRICS_NAMESPACE"] == "BedrockSpendControls"
+    assert "USERS_TABLE" in env and "USAGE_TABLE" in env and "SNS_TOPIC_ARN" in env
+    layer_id = next(iter(template.find_resources("AWS::Lambda::LayerVersion")))
+    assert {"Ref": layer_id} in sweeper["Layers"]
+
+    # Right after the UTC daily/weekly/monthly windows roll over.
+    schedule = next(
+        resource["Properties"]
+        for resource in template.find_resources("AWS::Events::Rule").values()
+        if resource["Properties"].get("ScheduleExpression") == "cron(5 0 * * ? *)"
+    )
+    assert json.dumps(schedule["Targets"][0]["Arn"]).count(name) == 1
+    assert json.loads(schedule["Targets"][0]["Input"]) == {"source": "aws.events"}
+
+    policies = template.find_resources("AWS::IAM::Policy")
+    sweeper_role_ref = sweeper["Role"]["Fn::GetAtt"][0]
+    sweeper_policy = next(
+        resource["Properties"]["PolicyDocument"]
+        for resource in policies.values()
+        if any(
+            isinstance(role, dict) and role.get("Ref") == sweeper_role_ref
+            for role in resource["Properties"]["Roles"]
+        )
+    )
+    policy_text = json.dumps(sweeper_policy)
+    assert "iam:" not in policy_text
+    assert "UsersTable" in policy_text
+    assert "UsageTable" in policy_text
+    assert "AdminAuditTable" not in policy_text
+    assert "sns:Publish" in policy_text
+    for action in ("dynamodb:Scan", "dynamodb:UpdateItem", "dynamodb:PutItem"):
+        assert action in policy_text
+
+    # A failed nightly pass stays in ALARM until the next pass can clear it.
+    template.has_resource_properties(
+        "AWS::CloudWatch::Alarm",
+        {
+            "MetricName": "AutoBlockSweepFailure",
+            "Namespace": "BedrockSpendControls",
+            "Statistic": "Sum",
+            "Period": 86_400,
+            "Threshold": 1,
+            "EvaluationPeriods": 1,
+            "TreatMissingData": "notBreaching",
+        },
+    )
+    broker_env = _environment_with(template, "BEDROCK_USER_ROLE_ARN")
+    assert "auto_block_sweep_failure" in json.dumps(
+        broker_env["OPERATIONS_ALARM_NAMES_JSON"]
+    )

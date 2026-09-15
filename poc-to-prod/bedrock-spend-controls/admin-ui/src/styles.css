@@ -440,7 +440,7 @@ textarea:focus-visible {
 
 .operations-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 12px;
   padding: 16px 18px;
 }
@@ -453,9 +453,9 @@ textarea:focus-visible {
   border-radius: 6px;
 }
 
-/* The reconciliation card is the fifth in a four-column grid: give it the
-   whole second row and lay its rows out three abreast so USD figures and
-   workload lists are not truncated. */
+/* Enforcement, Revocation, Telemetry and Auto-block sweep share the first
+   row. The reconciliation card takes the whole second row with its rows
+   three abreast so USD figures and workload lists are not truncated. */
 .operations-card-wide {
   grid-column: 1 / -1;
 }
@@ -3161,6 +3161,10 @@ tbody tr:hover {
 @media (max-width: 1100px) {
   .subject-grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .operations-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 

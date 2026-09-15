@@ -13,7 +13,7 @@ import {
   statusEnforcementMessage,
   UsersPanel,
 } from "./App";
-import { ApiError, api, type AdminUser, type AuditEvent, type CurrentUsage, type Operations, type QuotaPeriod, type Summary, type UsageMetrics, type UserRow, type WorkloadEntry, type WorkloadListResponse } from "./api";
+import { ApiError, api, isAutomaticBlock, type AdminUser, type AuditEvent, type CurrentUsage, type Operations, type QuotaPeriod, type Summary, type UsageMetrics, type UserRow, type WorkloadEntry, type WorkloadListResponse } from "./api";
 import type { Session } from "./auth";
 import type { AdminConfig } from "./config";
 
@@ -1132,6 +1132,27 @@ describe("workload mode", () => {
     // JWT users keep the credential-vend wording.
     expect(statusEnforcementMessage(summary.enforcement, "blocked", alice)).toMatch(/prevents new credentials/);
     expect(statusEnforcementMessage(summary.enforcement, "blocked")).toMatch(/prevents new credentials/);
+  });
+
+  it("tells the operator an automatic block lifts by itself, and stays quiet for admin blocks", () => {
+    const autoBlocked: UserRow = { ...alice, status: "blocked", status_origin: "automatic", status_reason: "auto: daily USD quota exhausted in 2026-09-14" };
+    const adminBlocked: UserRow = { ...alice, status: "blocked", status_origin: "admin", status_reason: "incident freeze" };
+    const legacyAuto: UserRow = { ...alice, status: "blocked", status_origin: "", status_reason: "auto: daily quota exhausted" };
+    const legacyManual: UserRow = { ...alice, status: "blocked", status_origin: "legacy", status_reason: "ops hold" };
+
+    expect(isAutomaticBlock(autoBlocked)).toBe(true);
+    expect(isAutomaticBlock(legacyAuto)).toBe(true);
+    expect(isAutomaticBlock(adminBlocked)).toBe(false);
+    expect(isAutomaticBlock(legacyManual)).toBe(false);
+    expect(isAutomaticBlock({ ...autoBlocked, status: "active" })).toBe(false);
+
+    const unblockAuto = statusEnforcementMessage(summary.enforcement, "active", autoBlocked);
+    expect(unblockAuto).toMatch(/Unblocking allows new credentials/);
+    expect(unblockAuto).toMatch(/nightly sweep \(00:05 UTC\)/);
+    expect(unblockAuto).toMatch(/next credential request/);
+    expect(statusEnforcementMessage(summary.enforcement, "active", adminBlocked)).not.toMatch(/nightly sweep/);
+    // Blocking copy is about what the block does, never about lifting.
+    expect(statusEnforcementMessage(summary.enforcement, "blocked", autoBlocked)).not.toMatch(/nightly sweep/);
   });
 
   it("splits the overview by subject kind and links each group to its tab", async () => {

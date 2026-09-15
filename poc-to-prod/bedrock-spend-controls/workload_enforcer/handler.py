@@ -24,20 +24,10 @@ from urllib.parse import unquote
 
 import boto3
 from botocore.exceptions import ClientError
-from bedrock_spend_controls.quota_periods import (
-    aggregate_daily_rows,
-    calendar_windows,
-    default_thresholds,
-    evaluate_limits,
-    evaluate_model_budgets,
-    limits_from_item,
-    merge_evaluations,
-    model_budgets_from_item,
-    model_ledger_subject,
-    rate_limits_enabled,
-    rate_limits_from_item,
-    rate_row_key,
-    rate_usage_from_item,
+from bedrock_spend_controls.row_enforcement import (
+    AUTO_LIFT_REASON,
+    automatic_owned,
+    over_budget,
 )
 
 BEDROCK_ACTIONS = (
@@ -138,61 +128,13 @@ def _detach(iam, principal_arn: str, policy_name: str) -> bool:
     return True
 
 
-def _automatic_owned(item: dict) -> bool:
-    origin = str(item.get("status_origin", "legacy"))
-    reason = str(item.get("status_reason", ""))
-    return origin == "automatic" or (
-        origin == "legacy" and reason.startswith("auto:")
-    )
-
-
-def _ledger_rows(usage_table, subject: str, start: str, end: str) -> list[dict]:
-    response = usage_table.query(
-        KeyConditionExpression=(
-            "user_id = :user_id AND #window BETWEEN :start AND :end"
-        ),
-        ExpressionAttributeNames={"#window": "window"},
-        ExpressionAttributeValues={
-            ":user_id": subject,
-            ":start": start,
-            ":end": end,
-        },
-        ConsistentRead=True,
-    )
-    return list(response.get("Items", []))
-
-
 def _over_budget(usage_table, item: dict, now: datetime) -> bool:
-    windows = calendar_windows(now)
-    start = min(window.start for window in windows.values()).date().isoformat()
-    end = windows["daily"].start.date().isoformat()
-    user_id = str(item["user_id"])
-    usage = aggregate_daily_rows(_ledger_rows(usage_table, user_id, start, end), now)
-    rate_limits = rate_limits_from_item(item)
-    rate_usage = None
-    if rate_limits_enabled(rate_limits):
-        rate_item = usage_table.get_item(
-            Key=rate_row_key(user_id, now), ConsistentRead=True
-        ).get("Item")
-        rate_usage = rate_usage_from_item(rate_item, now)
-    defaults = default_thresholds(float(os.environ.get("WARN_THRESHOLD", "0.8")))
-    limits = limits_from_item(item, default_thresholds_list=defaults)
-    budgets = model_budgets_from_item(item, default_thresholds_list=defaults)
-    usage_by_model = {
-        model_id: aggregate_daily_rows(
-            _ledger_rows(
-                usage_table, model_ledger_subject(user_id, model_id), start, end
-            ),
-            now,
-        )
-        for model_id in budgets
-    }
-    return merge_evaluations(
-        evaluate_limits(
-            limits, usage, now, rate_limits=rate_limits, rate_usage=rate_usage
-        ),
-        evaluate_model_budgets(budgets, usage_by_model, now),
-    ).over_budget
+    return over_budget(
+        usage_table,
+        item,
+        now,
+        warn_threshold=float(os.environ.get("WARN_THRESHOLD", "0.8")),
+    )
 
 
 def _set_active(users_table, item: dict) -> bool:
@@ -200,7 +142,10 @@ def _set_active(users_table, item: dict) -> bool:
 
     Mirrors the gateway's refresh_auto_status semantics; a conditional
     failure means someone else changed the row first, and the next run
-    re-evaluates from fresh state.
+    re-evaluates from fresh state. No ``REVOCATION#`` sentinel is written:
+    the enforcement dispatcher already fans out on the ``workload:`` key
+    prefix, and workload rows never have a ``source_identity`` for the
+    per-user Deny shards.
     """
     now = datetime.now(timezone.utc).isoformat()
     try:
@@ -218,7 +163,7 @@ def _set_active(users_table, item: dict) -> bool:
             ExpressionAttributeValues={
                 ":active": "active",
                 ":blocked": "blocked",
-                ":reason": "auto: current calendar periods are under quota",
+                ":reason": AUTO_LIFT_REASON,
                 ":origin": "automatic",
                 ":now": now,
                 ":observed_version": int(item.get("version", 0) or 0),
@@ -323,7 +268,7 @@ def handler(event, context, *, dynamodb=None, iam=None, sns=None) -> dict:
         if (
             item is not None
             and status == "blocked"
-            and _automatic_owned(item)
+            and automatic_owned(item)
             and not _over_budget(usage_table, item, now)
         ):
             if _set_active(users_table, item):

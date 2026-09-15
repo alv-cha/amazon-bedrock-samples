@@ -1758,6 +1758,74 @@ class SpendControlsStack(Stack):
         )
 
         # ------------------------------------------------------------------
+        # Auto-block sweep: the broker lifts an automatic block only when the
+        # user next asks for credentials. A user who never comes back would
+        # stay blocked forever and keep a slot in the Deny shards above.
+        # Once a night, right after the UTC calendar windows roll over, this
+        # function re-evaluates every blocked JWT-user row with the broker's
+        # own criterion and lifts the automatic ones that are under quota,
+        # rewriting the REVOCATION# sentinel in the same transaction so the
+        # revocation processor converges the shards through the stream fast
+        # path. Admin blocks and workload rows are never touched.
+        # ------------------------------------------------------------------
+        auto_block_sweeper_fn = lambda_.Function(
+            self,
+            "AutoBlockSweeperFn",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            memory_size=256,
+            timeout=Duration.minutes(2),
+            reserved_concurrent_executions=1,
+            handler="handler.handler",
+            code=lambda_.Code.from_asset("../auto_block_sweeper"),
+            layers=[quota_periods_layer],
+            environment={
+                "USERS_TABLE": users_table.table_name,
+                "USAGE_TABLE": usage_table.table_name,
+                "SNS_TOPIC_ARN": alert_topic.topic_arn,
+                "METRICS_NAMESPACE": METRICS_NAMESPACE,
+                "WARN_THRESHOLD": str(config.warn_threshold),
+                "USAGE_RETENTION_DAYS": str(config.usage_retention_days),
+            },
+        )
+        users_table.grant_read_write_data(auto_block_sweeper_fn)
+        usage_table.grant_read_data(auto_block_sweeper_fn)
+        alert_topic.grant_publish(auto_block_sweeper_fn)
+        events.Rule(
+            self,
+            "AutoBlockSweepSchedule",
+            schedule=events.Schedule.cron(minute="5", hour="0"),
+            targets=[
+                events_targets.LambdaFunction(
+                    auto_block_sweeper_fn,
+                    event=events.RuleTargetInput.from_object(
+                        {"source": "aws.events"}
+                    ),
+                )
+            ],
+        )
+        # One-day period: a failed nightly pass must stay visible until the
+        # next pass has a chance to clear it, not for five minutes.
+        auto_block_sweep_failure_alarm = cw.Alarm(
+            self,
+            "AutoBlockSweepFailureAlarm",
+            metric=cw.Metric(
+                namespace=METRICS_NAMESPACE,
+                metric_name="AutoBlockSweepFailure",
+                statistic="Sum",
+                period=Duration.days(1),
+            ),
+            threshold=1,
+            evaluation_periods=1,
+            treat_missing_data=cw.TreatMissingData.NOT_BREACHING,
+        )
+        auto_block_sweep_failure_alarm.add_alarm_action(
+            cw_actions.SnsAction(alert_topic)
+        )
+        operations_alarms["auto_block_sweep_failure"] = (
+            auto_block_sweep_failure_alarm
+        )
+
+        # ------------------------------------------------------------------
         # Workload enforcement: converge each workload row's status onto its
         # IAM principal. Blocked => attach an inline Deny on the workload
         # role; active => remove it. Fast path arrives via the enforcement

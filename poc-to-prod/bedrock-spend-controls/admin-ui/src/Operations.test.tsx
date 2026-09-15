@@ -1,8 +1,8 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { EmergencyStopCard, EnforcementDialCard, OperationsView, SpendReconciliationCard, leaseWindowLabel, reconciliationTone } from "./Operations";
-import { ApiError, api, type EnforcementConfig, type Operations, type ReconciliationResponse } from "./api";
+import { AutoBlockSweepCard, EmergencyStopCard, EnforcementDialCard, OperationsView, SpendReconciliationCard, leaseWindowLabel, reconciliationTone } from "./Operations";
+import { ApiError, api, type AutoBlockSweep, type EnforcementConfig, type Operations, type ReconciliationResponse } from "./api";
 import type { Session } from "./auth";
 import type { AdminConfig } from "./config";
 
@@ -456,5 +456,61 @@ describe("spend reconciliation card", () => {
     expect(reconciliationTone({ enabled: true, runs: [inactive], latest: inactive }, 10)).toBe("amber");
     const noBill = { ...reconciliationRun, aggregate: { ...reconciliationRun.aggregate, delta_percent: null } };
     expect(reconciliationTone({ enabled: true, runs: [noBill], latest: noBill }, 10)).toBe("gray");
+  });
+});
+
+describe("auto-block sweep card", () => {
+  const run: AutoBlockSweep["last_run"] = {
+    ran_at: "2026-09-15T00:05:04Z",
+    dry_run: false,
+    evaluated: 3,
+    lifted: 2,
+    still_blocked: 1,
+    admin_blocked: 0,
+    raced: 0,
+    lifted_users: ["alice", "bob"],
+    failures: [],
+  };
+
+  it("shows the last nightly pass with lifted and still-blocked counts", () => {
+    render(<AutoBlockSweepCard alarmState="OK" sweep={{ schedule: "00:05 UTC daily", status: "ok", last_run: run }} />);
+    expect(screen.getByText("Auto-block sweep")).toBeInTheDocument();
+    expect(screen.getByText("Ran")).toBeInTheDocument();
+    expect(screen.getByText("00:05 UTC daily")).toBeInTheDocument();
+    expect(screen.getByText("2 / 1")).toBeInTheDocument();
+    expect(screen.getByText("3 blocked")).toBeInTheDocument();
+    expect(screen.getByText("Admin blocks kept")).toBeInTheDocument();
+    expect(screen.queryByText("Failures")).not.toBeInTheDocument();
+  });
+
+  it("says never ran before the first pass instead of showing zeros", () => {
+    render(<AutoBlockSweepCard alarmState={null} sweep={{ schedule: "00:05 UTC daily", status: "never_ran", last_run: null }} />);
+    expect(screen.getByText("Never ran")).toBeInTheDocument();
+    expect(screen.getByText("No pass recorded yet")).toBeInTheDocument();
+    expect(screen.queryByText(/\d+ \/ \d+/)).not.toBeInTheDocument();
+  });
+
+  it("turns red with the failure detail when the last pass failed", () => {
+    const failedRun = { ...run, failures: [{ user_id: "carol", error: "throttled" }] };
+    render(<AutoBlockSweepCard alarmState="ALARM" sweep={{ schedule: "00:05 UTC daily", status: "failed", last_run: failedRun }} />);
+    expect(screen.getByText("Failed")).toHaveClass("ops-status-red");
+    expect(screen.getByText("carol: throttled")).toBeInTheDocument();
+    expect(screen.queryByText(/earlier pass failed/)).not.toBeInTheDocument();
+  });
+
+  it("does not let the one-day alarm call a repaired pass failed", () => {
+    // Failed at 00:05, repaired by a manual pass: the state row says ok, the
+    // alarm still rings for the rest of its one-day period.
+    render(<AutoBlockSweepCard alarmState="ALARM" sweep={{ schedule: "00:05 UTC daily", status: "ok", last_run: run }} />);
+    expect(screen.getByText("Alarm clearing")).toHaveClass("ops-status-amber");
+    expect(screen.getByText(/earlier pass failed today/)).toBeInTheDocument();
+    expect(screen.queryByText("Failed")).not.toBeInTheDocument();
+    expect(screen.queryByText("Failures")).not.toBeInTheDocument();
+  });
+
+  it("reports unknown when the broker predates the sweeper", () => {
+    render(<AutoBlockSweepCard alarmState={null} sweep={undefined} />);
+    expect(screen.getByText("Unknown")).toBeInTheDocument();
+    expect(screen.getByText("Broker does not report the sweep")).toBeInTheDocument();
   });
 });

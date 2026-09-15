@@ -27,6 +27,7 @@ All metrics below live in the `BedrockSpendControls` namespace unless noted.
 | `RevocationSyncFailureAlarm` | `revocation_failure` | `RevocationSyncFailure` Sum ≥ 1 / 5 min | 1 period | [revocation-sync-failure.md](alarms/revocation-sync-failure.md) |
 | `RevocationPolicyOverflowAlarm` | `revocation_overflow` | `RevocationPolicyOverflow` Sum ≥ 1 / 5 min | 1 period | [revocation-policy-overflow.md](alarms/revocation-policy-overflow.md) |
 | `WorkloadEnforcementFailureAlarm` (workload mode only) | `workload_enforcement_failure` | `WorkloadEnforcementFailure` Sum ≥ 1 / 5 min, missing = not breaching | 1 period | [workload-enforcement-failure.md](alarms/workload-enforcement-failure.md) |
+| `AutoBlockSweepFailureAlarm` | `auto_block_sweep_failure` | `AutoBlockSweepFailure` Sum ≥ 1 / 1 day, missing = not breaching | 1 period | [auto-block-sweep-failure.md](alarms/auto-block-sweep-failure.md) |
 | `EnforcementDispatchDlqAlarm` | `enforcement_dispatch_dlq` | SQS `ApproximateNumberOfMessagesVisible` ≥ 1 / 5 min | 1 period | [enforcement-dispatch-dlq.md](alarms/enforcement-dispatch-dlq.md) |
 | `EnforcementDispatchIteratorAgeAlarm` | `enforcement_dispatch_iterator_age` | Lambda `IteratorAge` Maximum ≥ 300 000 ms / 5 min | 1 period | [enforcement-dispatch-iterator-age.md](alarms/enforcement-dispatch-iterator-age.md) |
 | `PricingFallbackAlarm` | `pricing_fallback` | `FallbackPricedRequests` Sum ≥ 1 / 5 min, missing = not breaching | 1 period | [pricing-fallback.md](alarms/pricing-fallback.md) |
@@ -49,6 +50,7 @@ as an SNS message by the enforcer rather than a CloudWatch alarm).
 | Revocation processor | `RevocationProcessorFn` | [revocation-processor.md](components/revocation-processor.md) |
 | Emergency processor | `EmergencyStopProcessorFn` | [emergency-processor.md](components/emergency-processor.md) |
 | Workload enforcer | `WorkloadEnforcerFn` | [workload-enforcer.md](components/workload-enforcer.md) |
+| Auto-block sweeper | `AutoBlockSweeperFn` | [auto-block-sweeper.md](components/auto-block-sweeper.md) |
 | Pricing resolver / refresher | `PriceResolverFn`, `PriceRefreshFn` | [pricing-resolver.md](components/pricing-resolver.md) |
 | Reconciliation processor | `SpendReconciliationFn` (`reconciliation_enabled` only) | [reconciliation-processor.md](components/reconciliation-processor.md) |
 

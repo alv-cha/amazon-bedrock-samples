@@ -757,6 +757,66 @@ def test_operations_gracefully_reports_unavailable_cloudwatch(
     # Revocation is always on: unavailable telemetry is unknown, never N/A.
     assert body["metrics"]["reconciliation_status"] == "unknown"
     assert all(alarm["state"] == "UNAVAILABLE" for alarm in body["alarms"])
+    # The sweep state comes from DynamoDB, not CloudWatch, so it is still
+    # answered; "never ran" until the first real pass writes its row.
+    assert body["auto_block_sweep"] == {
+        "schedule": "00:05 UTC daily",
+        "status": "never_ran",
+        "last_run": None,
+    }
+
+
+def test_operations_reports_the_last_auto_block_sweep(
+    client, fake_dynamodb, monkeypatch
+):
+    api, _, _ = client
+    monkeypatch.setattr(gateway, "_cloudwatch", FakeCloudWatch(results=[], alarms=[]))
+    fake_dynamodb.Table("users-test").put_item(
+        Item={
+            "user_id": "CONFIG#AUTO_BLOCK_SWEEP",
+            "ran_at": "2026-09-15T00:05:04+00:00",
+            "dry_run": False,
+            "evaluated": 3,
+            "lifted": 2,
+            "still_blocked": 1,
+            "admin_blocked": 0,
+            "raced": 0,
+            "lifted_users": ["alice", "bob"],
+            "failures": [],
+        }
+    )
+
+    body = api.get("/admin/operations", headers=ADMIN).json()
+
+    sweep = body["auto_block_sweep"]
+    assert sweep["status"] == "ok"
+    assert sweep["schedule"] == "00:05 UTC daily"
+    assert sweep["last_run"]["ran_at"] == "2026-09-15T00:05:04+00:00"
+    assert sweep["last_run"]["lifted"] == 2
+    assert sweep["last_run"]["still_blocked"] == 1
+    assert sweep["last_run"]["lifted_users"] == ["alice", "bob"]
+    assert "user_id" not in sweep["last_run"]
+    # The bookkeeping row never shows up as a quota subject.
+    users = api.get("/admin/users", headers=ADMIN).json()
+    assert "CONFIG#AUTO_BLOCK_SWEEP" not in json.dumps(users)
+
+    fake_dynamodb.Table("users-test").put_item(
+        Item={
+            "user_id": "CONFIG#AUTO_BLOCK_SWEEP",
+            "ran_at": "2026-09-16T00:05:02+00:00",
+            "dry_run": False,
+            "evaluated": 1,
+            "lifted": 0,
+            "still_blocked": 0,
+            "admin_blocked": 0,
+            "raced": 0,
+            "lifted_users": [],
+            "failures": [{"user_id": "carol", "error": "throttled"}],
+        }
+    )
+    assert api.get("/admin/operations", headers=ADMIN).json()["auto_block_sweep"][
+        "status"
+    ] == "failed"
 
 
 def _usage_metric(name: str, value: str) -> dict:

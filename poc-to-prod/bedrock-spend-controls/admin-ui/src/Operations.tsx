@@ -5,6 +5,7 @@ import {
   BellRing,
   Check,
   Database,
+  MoonStar,
   OctagonX,
   RefreshCw,
   Scale,
@@ -136,6 +137,71 @@ export function reconciliationTone(
   if (percent === null) return "gray";
   if (alarmPercent !== null && Math.abs(percent) > alarmPercent) return "red";
   return "green";
+}
+
+// Nightly lift of automatic JWT-user blocks. The broker only lifts a block
+// when the user next asks for credentials; this card shows whether the sweep
+// that covers users who never come back actually ran, and what it did.
+// Brokers older than the sweeper omit the field, so "unknown" is a real state.
+export function AutoBlockSweepCard({
+  sweep,
+  alarmState,
+}: {
+  sweep: Operations["auto_block_sweep"] | undefined;
+  alarmState: string | null;
+}) {
+  const icon = <MoonStar aria-hidden="true" size={19} />;
+  const title = "Auto-block sweep";
+  if (!sweep) {
+    return (
+      <OperationsCard icon={icon} status="Unknown" title={title} tone="gray">
+        <OperationsRow label="Last run" value="Broker does not report the sweep" />
+      </OperationsCard>
+    );
+  }
+  const run = sweep.last_run;
+  if (!run) {
+    return (
+      <OperationsCard icon={icon} status="Never ran" title={title} tone="gray">
+        <OperationsRow label="Schedule" value={sweep.schedule} />
+        <OperationsRow label="Last run" value="No pass recorded yet" />
+        <OperationsRow label="Lifts" value="Automatic blocks whose windows are under quota" />
+      </OperationsCard>
+    );
+  }
+  // The state row is the truth about the LAST pass; the alarm has a one-day
+  // period, so it keeps ringing after a failed pass has been repaired by a
+  // manual run. Show both without letting the alarm call a good pass failed.
+  const lastFailed = sweep.status === "failed" || run.failures.length > 0;
+  const alarmActive = alarmState === "ALARM";
+  const status = lastFailed ? "Failed" : alarmActive ? "Alarm clearing" : "Ran";
+  const tone = lastFailed ? "red" : alarmActive ? "amber" : "green";
+  return (
+    <OperationsCard icon={icon} status={status} title={title} tone={tone}>
+      <OperationsRow label="Last run" value={formatTimestamp(run.ran_at)} />
+      <OperationsRow label="Schedule" value={sweep.schedule} />
+      <OperationsRow
+        label="Lifted / still blocked"
+        value={`${formatNumber(run.lifted)} / ${formatNumber(run.still_blocked)}`}
+      />
+      <OperationsRow label="Evaluated" value={`${formatNumber(run.evaluated)} blocked`} />
+      <OperationsRow
+        label="Admin blocks kept"
+        value={`${formatNumber(run.admin_blocked)}${run.raced ? ` · ${formatNumber(run.raced)} raced` : ""}`}
+      />
+      {lastFailed && (
+        <OperationsRow
+          label="Failures"
+          value={run.failures.length
+            ? run.failures.map((failure) => `${failure.user_id}: ${failure.error}`).join(" · ")
+            : "See the sweeper log group"}
+        />
+      )}
+      {alarmActive && !lastFailed && (
+        <OperationsRow label="Alarm" value="An earlier pass failed today; the alarm clears within 24 h of it" />
+      )}
+    </OperationsCard>
+  );
 }
 
 // Daily ledger-vs-Cost-Explorer comparison. Reads the stored RECONCILE# rows
@@ -751,6 +817,11 @@ export function OperationsView({
           <OperationsRow label="Metric namespace" value={metrics.namespace} />
           <OperationsRow label="Emergency failures" value={metrics.recent_emergency_failure_count === null ? "No data" : formatNumber(metrics.recent_emergency_failure_count)} />
         </OperationsCard>
+
+        <AutoBlockSweepCard
+          alarmState={operations.alarms.find((alarm) => alarm.key === "auto_block_sweep_failure")?.state ?? null}
+          sweep={operations.auto_block_sweep}
+        />
 
         <SpendReconciliationCard
           alarmState={operations.alarms.find((alarm) => alarm.key === "reconciliation_delta")?.state ?? null}

@@ -17,8 +17,10 @@ import type { AdminConfig } from "./config";
 import type { Session } from "./auth";
 import {
   ApiError,
+  AUTOMATIC_BLOCK_HINT,
   api,
   apiErrorMessage,
+  isAutomaticBlock,
   normalizeUsd,
   thresholdsError,
   type AdminUser,
@@ -602,7 +604,7 @@ export function UserDetailDrawer({
             </button>
           </div>
           {workload && <WorkloadIdentitySection workload={workload} />}
-          <section><h3>Identity and status</h3><dl className="detail-list"><div><dt>Status</dt><dd><span className={`status-badge status-${user.status}`}><span aria-hidden="true" />{user.status}</span></dd></div><div><dt>Status origin</dt><dd>{user.status_origin || "Not provided"}</dd></div><div><dt>Status reason</dt><dd>{user.status_reason || "Not provided"}</dd></div><div><dt>Created</dt><dd>{formatTimestamp(user.created_at)}</dd></div><div><dt>Updated</dt><dd>{formatTimestamp(user.updated_at)}</dd></div><div><dt>Version</dt><dd>{user.version}</dd></div></dl></section>
+          <section><h3>Identity and status</h3><dl className="detail-list"><div><dt>Status</dt><dd><span className={`status-badge status-${user.status}`}><span aria-hidden="true" />{user.status}</span></dd></div><div><dt>Status origin</dt><dd>{user.status_origin || "Not provided"}</dd></div><div><dt>Status reason</dt><dd>{user.status_reason || "Not provided"}</dd></div>{isAutomaticBlock(user) && <div><dt>Lifts</dt><dd>{AUTOMATIC_BLOCK_HINT}</dd></div>}<div><dt>Created</dt><dd>{formatTimestamp(user.created_at)}</dd></div><div><dt>Updated</dt><dd>{formatTimestamp(user.updated_at)}</dd></div><div><dt>Version</dt><dd>{user.version}</dd></div></dl></section>
           <section><h3>Calendar quota windows</h3><div className="detail-periods">{QUOTA_PERIODS.map((period) => { const limits = user.limits[period]; const usage = detailUsage[period]; const thresholds = limits?.thresholds ?? []; const alertOnly = thresholds.length > 0 && thresholds.every((entry) => entry.action !== "block"); return <article className="detail-period" key={period}><div><h4>{periodLabel(period)}</h4><span>Resets {formatTimestamp(usage.resets_at)}</span></div>{limits ? <dl className="detail-list"><div><dt>USD</dt><dd>{formatUsd(usage.cost_usd)} of {formatLimit(limits.usd, (value) => formatUsd(value))}</dd></div><div><dt>Input tokens</dt><dd>{formatNumber(usage.input_tokens)} of {formatLimit(limits.input_tokens, (value) => formatNumber(value))}</dd></div><div><dt>Output tokens</dt><dd>{formatNumber(usage.output_tokens)} of {formatLimit(limits.output_tokens, (value) => formatNumber(value))}</dd></div><div><dt>Requests</dt><dd>{formatNumber(usage.requests)}</dd></div><div><dt>Thresholds</dt><dd>{thresholds.length > 0 ? thresholds.map((entry) => `${formatRatioPercent(entry.at)} ${entry.action}`).join(", ") : "default"}{alertOnly && <span className="ops-status ops-status-amber"> alert-only</span>}</dd></div></dl> : <p className="operations-muted">Disabled</p>}</article>; })}</div></section>
           <section><h3>Rate limits</h3><dl className="detail-list"><div><dt>Requests per minute</dt><dd>{user.rate?.rpm ? formatNumber(user.rate.rpm) : "Unlimited"}</dd></div><div><dt>Tokens per minute</dt><dd>{user.rate?.tpm ? formatNumber(user.rate.tpm) : "Unlimited"}</dd></div></dl></section>
           <ModelBudgetsSection cfg={cfg} onCanonical={onCanonical} session={session} user={user} />

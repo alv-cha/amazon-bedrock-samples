@@ -24,12 +24,14 @@ import {
 import { loadConfig, type AdminConfig } from "./config";
 import { beginSignIn, handleAuthCallback, type Session } from "./auth";
 import {
+  AUTOMATIC_BLOCK_HINT,
   ApiError,
   DEFAULT_THRESHOLDS,
   api,
   apiErrorMessage,
   isAdminUser,
   isAlertOnly,
+  isAutomaticBlock,
   isWorkload,
   thresholdsError,
   type AdminUser,
@@ -1103,6 +1105,7 @@ function WorkloadTableRow({
               <dl>
                 <div><dt>Origin</dt><dd>{subject.status_origin || "Not provided"}</dd></div>
                 <div><dt>Reason</dt><dd>{subject.status_reason || "Not provided"}</dd></div>
+                {isAutomaticBlock(subject) && <div><dt>Lifts</dt><dd>{AUTOMATIC_BLOCK_HINT}</dd></div>}
               </dl>
             </details>
           </div>
@@ -1192,6 +1195,7 @@ function UserTableRow({
             <dl>
               <div><dt>Origin</dt><dd>{user.status_origin || "Not provided"}</dd></div>
               <div><dt>Reason</dt><dd>{user.status_reason || "Not provided"}</dd></div>
+              {isAutomaticBlock(user) && <div><dt>Lifts</dt><dd>{AUTOMATIC_BLOCK_HINT}</dd></div>}
             </dl>
           </details>
         </div>
@@ -1834,7 +1838,7 @@ export function StatusDialog({
 export function statusEnforcementMessage(
   enforcement: Summary["enforcement"],
   nextStatus: UserStatus,
-  user?: Pick<AdminUser, "user_id" | "granularity" | "workload">,
+  user?: Pick<AdminUser, "user_id" | "granularity" | "workload"> & Partial<Pick<AdminUser, "status" | "status_origin" | "status_reason">>,
 ): string {
   if (user && isWorkload(user)) {
     const workload = user.workload;
@@ -1853,7 +1857,10 @@ export function statusEnforcementMessage(
       : "Unblocking removes the inline IAM Deny from the workload role. All configured calendar limits continue to apply.";
   }
   if (nextStatus === "active") {
-    return "Unblocking allows new credentials to be issued. All configured calendar limits continue to apply.";
+    const base = "Unblocking allows new credentials to be issued. All configured calendar limits continue to apply.";
+    return user && user.status !== undefined && isAutomaticBlock(user as Pick<AdminUser, "status" | "status_origin" | "status_reason">)
+      ? `${base} ${AUTOMATIC_BLOCK_HINT}`
+      : base;
   }
   const window = formatDuration(enforcement.post_detection_fallback_seconds);
   return `Blocking prevents new credentials from being issued and requests active-session revocation. Existing permissions expire with their lease (up to ${window} after detection); revocation usually cuts them earlier, so bounded overspend is limited to whichever ends first.`;

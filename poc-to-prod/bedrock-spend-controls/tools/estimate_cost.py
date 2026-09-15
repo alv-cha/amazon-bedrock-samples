@@ -43,6 +43,7 @@ def scenario(name: str, a: dict, p: dict) -> list[tuple[str, float, str]]:
         ("Emergency processor (1-min schedule)", SECONDS_PER_MONTH / 60, 256, 400),
         ("Workload enforcer (5-min schedule)", (SECONDS_PER_MONTH / 300 if a["workloads"] else 0), 256, 600),
         ("Price refresher (daily)", 30, 256, 8000),
+        ("Auto-block sweep (nightly)", 30, 256, 2000),
         ("Reconciliation (daily)", 30 if a["reconciliation_enabled"] else 0, 256, 3000),
     ):
         req, dur = _lambda(p, count, mb, ms)
@@ -70,6 +71,11 @@ def scenario(name: str, a: dict, p: dict) -> list[tuple[str, float, str]]:
     wru += admin_calls * 6
     # Revocation scan: every users row per reconcile pass.
     rru += (SECONDS_PER_MONTH / (a["revocation_reconcile_minutes"] * 60)) * users * 0.5
+    # Nightly auto-block sweep: one filtered scan of the users table (scan
+    # RRUs are charged on rows read, not returned) plus a re-evaluation
+    # Query and a 2-item transaction (2x WRU) per blocked row lifted.
+    rru += 30 * users * 0.5 + 30 * a["status_changes_per_month"] / 30 * 2
+    wru += a["status_changes_per_month"] / 30 * 30 * 0.5 * 4
     rows.append((f"DynamoDB writes — {wru/1e6:,.1f} M WRU", wru * p["ddb_wru"], "on-demand, transactions billed 2x"))
     rows.append((f"DynamoDB reads — {rru/1e6:,.1f} M RRU", rru * p["ddb_rru"], "on-demand, strongly consistent"))
     storage_gb = (users * 2 * 0.002) + (inv * 3 * 0.0000005 * a["usage_retention_days"] / 30)  # ~2 KB per user row, ~0.5 KB per ledger row
