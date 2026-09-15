@@ -84,11 +84,21 @@ class Settings:
         default_factory=lambda: int(_env("REVOCATION_POLICY_MAX_CHARACTERS", "6144")))
     operations_alarm_names_json: str = field(
         default_factory=lambda: _env("OPERATIONS_ALARM_NAMES_JSON", "{}"))
-    # Workload-mode roster for admin surfacing: {workload_id: {name,
-    # enforcement_ready}}. Static deploy config; enforcement itself runs in
-    # the dedicated enforcer Lambda.
-    workload_enforcement_json: str = field(
-        default_factory=lambda: _env("WORKLOAD_ENFORCEMENT_JSON", "{}"))
+    # Workload-mode roster for admin surfacing: {workload_id: {name, model,
+    # profile_arn, role_arn, enforcement_ready}}. Static deploy config that
+    # the stack writes to a Parameter Store parameter (profile ARNs push it
+    # past the 4 KB Lambda environment cap); the inline JSON is the local
+    # dev / test fallback and is only consulted when no parameter is named.
+    # Enforcement itself runs in the dedicated enforcer Lambda.
+    workload_roster_parameter_name: str = field(
+        default_factory=lambda: _env("WORKLOAD_ROSTER_PARAMETER_NAME", ""))
+    workload_roster_json: str = field(
+        default_factory=lambda: _env("WORKLOAD_ROSTER_JSON", "{}"))
+    workload_roster_cache_seconds: int = field(
+        default_factory=lambda: int(_env("WORKLOAD_ROSTER_CACHE_SECONDS", "300")))
+    workload_tag_key: str = field(
+        default_factory=lambda: _env(
+            "WORKLOAD_TAG_KEY", "bedrock-spend-controls-workload"))
     qualification_status_json: str = field(
         default_factory=lambda: _env(
             "QUALIFICATION_STATUS_JSON",
@@ -109,6 +119,22 @@ class Settings:
             '"output_tokens":200000},"weekly":null,"monthly":null}',
         )
     )
+    # Deployment warn ratio. Rows written before per-period thresholds
+    # existed resolve to [{warn_threshold: warn}, {1.0: block}], so their
+    # behaviour is unchanged until an operator configures a list.
+    warn_threshold: float = field(
+        default_factory=lambda: float(_env("WARN_THRESHOLD", "0.8")))
+    # The vended role's model allowlist (IAM resource ARNs or ["*"]). The
+    # admin API rejects a model-scoped budget for a model the subject could
+    # never call through this deployment.
+    allowed_model_arns_json: str = field(
+        default_factory=lambda: _env("ALLOWED_MODEL_ARNS_JSON", '["*"]'))
+    # Daily Cost Explorer reconciliation (opt-in at deploy). The broker only
+    # reads stored RECONCILE# rows for the admin API; it never calls CE.
+    reconciliation_enabled: bool = field(
+        default_factory=lambda: _env("RECONCILIATION_ENABLED", "false").lower() == "true")
+    reconcile_lag_days: int = field(
+        default_factory=lambda: int(_env("RECONCILE_LAG_DAYS", "2")))
     # DynamoDB TTL for daily usage rows. Deletion is asynchronous after this
     # timestamp; it is not the quota-window reset mechanism.
     usage_retention_days: int = field(

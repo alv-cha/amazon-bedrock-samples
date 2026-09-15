@@ -7,11 +7,13 @@ import {
   LimitsDialog,
   mergeCanonicalUser,
   mergeRefreshedUsers,
+  mergeRefreshedWorkloads,
   QuotaUsage,
   StatusDialog,
+  statusEnforcementMessage,
   UsersPanel,
 } from "./App";
-import { ApiError, api, type AdminUser, type AuditEvent, type CurrentUsage, type Operations, type QuotaPeriod, type Summary, type UsageMetrics, type UserRow } from "./api";
+import { ApiError, api, type AdminUser, type AuditEvent, type CurrentUsage, type Operations, type QuotaPeriod, type Summary, type UsageMetrics, type UserRow, type WorkloadEntry, type WorkloadListResponse } from "./api";
 import type { Session } from "./auth";
 import type { AdminConfig } from "./config";
 
@@ -45,8 +47,11 @@ const emptyUsageMetrics: UsageMetrics = {
 
 // Every Dashboard render mounts the Overview usage charts; keep their fetch
 // deterministic by default. restoreMocks unwinds this spy after each test.
+const emptyWorkloads: WorkloadListResponse = { workloads: [], roster_source: "parameter_store", tag_key: "bedrock-spend-controls-workload" };
+
 beforeEach(() => {
   vi.spyOn(api, "usageMetrics").mockResolvedValue(emptyUsageMetrics);
+  vi.spyOn(api, "listWorkloads").mockResolvedValue(emptyWorkloads);
 });
 
 const summary: Summary = {
@@ -191,8 +196,8 @@ function UsersHarness({ summaryRefresh = vi.fn().mockResolvedValue(undefined) }:
 }
 
 // The dashboard opens on Overview; user management lives on its own tab.
-async function openTab(actor: ReturnType<typeof userEvent.setup>, name: "Overview" | "Users" | "Operations" | "Audit log") {
-  await actor.click(screen.getByRole("button", { name }));
+async function openTab(actor: ReturnType<typeof userEvent.setup>, name: "Overview" | "Users" | "Workloads" | "Operations" | "Audit log") {
+  await actor.click(within(screen.getByRole("navigation", { name: "Primary" })).getByRole("button", { name }));
 }
 
 describe("quota presentation", () => {
@@ -225,13 +230,143 @@ describe("quota presentation", () => {
     expect(screen.getByText("Highest: Daily 50%")).toBeInTheDocument();
     await actor.selectOptions(screen.getByLabelText("Usage period"), "weekly");
     expect(screen.getByRole("columnheader", { name: "Weekly USD" })).toBeInTheDocument();
-    expect(screen.getByText("$7.000000")).toBeInTheDocument();
+    expect(screen.getByText("$7,00")).toBeInTheDocument();
     await actor.selectOptions(screen.getByLabelText("Usage period"), "monthly");
     expect(screen.getAllByText("Disabled").length).toBeGreaterThanOrEqual(3);
   });
 });
 
 describe("limit safety dialog", () => {
+  it("round-trips a thresholds list and rpm/tpm through the limits editor", async () => {
+    const actor = userEvent.setup();
+    const onSave = vi.fn();
+    const withThresholds: UserRow = {
+      ...alice,
+      rate: { rpm: 30, tpm: 0 },
+      limits: {
+        ...alice.limits,
+        daily: {
+          usd: 10,
+          input_tokens: 100,
+          output_tokens: 20,
+          thresholds: [
+            { at: 0.5, action: "warn" },
+            { at: 1, action: "block" },
+          ],
+        },
+      },
+    };
+    render(<LimitsDialog apiError="" busy={false} onClose={vi.fn()} onSave={onSave} user={withThresholds} />);
+
+    // Stored thresholds render as percentages in order.
+    expect(screen.getByLabelText("Daily threshold 1 percent")).toHaveValue(50);
+    expect(screen.getByLabelText("Daily threshold 1 action")).toHaveValue("warn");
+    expect(screen.getByLabelText("Daily threshold 2 percent")).toHaveValue(100);
+    expect(screen.getByLabelText("Daily threshold 2 action")).toHaveValue("block");
+    // Weekly has no stored list: the editor shows the default (80 % / 100 %).
+    expect(screen.getByLabelText("Weekly threshold 1 percent")).toHaveValue(80);
+    expect(screen.getByLabelText("Requests per minute limit")).toHaveValue(30);
+    expect(screen.getByLabelText("Tokens per minute limit")).toHaveValue(0);
+
+    // Raise the block level to 150 % and add a 90 % warning before it.
+    const dailyBlock = screen.getByLabelText("Daily threshold 2 percent");
+    await actor.clear(dailyBlock);
+    await actor.type(dailyBlock, "150");
+    await actor.click(within(screen.getByTestId("daily-thresholds")).getByRole("button", { name: "Add threshold" }));
+    const inserted = screen.getByLabelText("Daily threshold 2 percent");
+    await actor.clear(inserted);
+    await actor.type(inserted, "90");
+    expect(screen.getByLabelText("Daily threshold 3 action")).toHaveValue("block");
+
+    // Change the rate limits.
+    const rpm = screen.getByLabelText("Requests per minute limit");
+    await actor.clear(rpm);
+    await actor.type(rpm, "60");
+    const tpm = screen.getByLabelText("Tokens per minute limit");
+    await actor.clear(tpm);
+    await actor.type(tpm, "100000");
+
+    const save = screen.getByRole("button", { name: "Save limits" });
+    expect(save).toBeEnabled();
+    await actor.click(save);
+
+    expect(onSave).toHaveBeenCalledWith({
+      limits: {
+        daily: {
+          usd: 10,
+          input_tokens: 100,
+          output_tokens: 20,
+          thresholds: [
+            { at: 0.5, action: "warn" },
+            { at: 0.9, action: "warn" },
+            { at: 1.5, action: "block" },
+          ],
+        },
+        // Untouched periods omit thresholds so the server keeps its list.
+        weekly: alice.limits.weekly,
+        monthly: null,
+      },
+      rate: { rpm: 60, tpm: 100000 },
+    });
+  });
+
+  it("flags an alert-only thresholds list, requires a reason, and rejects an out-of-order block", async () => {
+    const actor = userEvent.setup();
+    const onSave = vi.fn();
+    render(<LimitsDialog apiError="" busy={false} onClose={vi.fn()} onSave={onSave} user={alice} />);
+
+    // Default list is 80 % warn, 100 % block. Turn the block into a warn.
+    await actor.selectOptions(screen.getByLabelText("Daily threshold 2 action"), "warn");
+    expect(within(screen.getByTestId("daily-thresholds")).getByRole("status")).toHaveTextContent("Alert-only");
+    const save = screen.getByRole("button", { name: "Save limits" });
+    expect(save).toBeDisabled();
+    await actor.type(screen.getByLabelText(/Reason/), "Soft budget for the pilot team");
+    expect(save).toBeEnabled();
+
+    // Now make the first entry a block (non-terminal): the editor refuses.
+    await actor.selectOptions(screen.getByLabelText("Daily threshold 1 action"), "block");
+    expect(within(screen.getByTestId("daily-thresholds")).getByRole("alert")).toHaveTextContent("must be the last entry");
+    await actor.click(save);
+    expect(onSave).not.toHaveBeenCalled();
+
+    // Restore a valid alert-only list and save.
+    await actor.selectOptions(screen.getByLabelText("Daily threshold 1 action"), "warn");
+    await actor.click(save);
+    expect(onSave).toHaveBeenCalledWith({
+      limits: {
+        daily: {
+          usd: 10,
+          input_tokens: 100,
+          output_tokens: 20,
+          thresholds: [
+            { at: 0.8, action: "warn" },
+            { at: 1, action: "warn" },
+          ],
+        },
+        weekly: alice.limits.weekly,
+        monthly: null,
+      },
+      reason: "Soft budget for the pilot team",
+    });
+  });
+
+  it("sends rate: null when both rate limits are cleared", async () => {
+    const actor = userEvent.setup();
+    const onSave = vi.fn();
+    render(<LimitsDialog apiError="" busy={false} onClose={vi.fn()} onSave={onSave} user={{ ...alice, rate: { rpm: 10, tpm: 5 } }} />);
+    const rpm = screen.getByLabelText("Requests per minute limit");
+    await actor.clear(rpm);
+    await actor.type(rpm, "0");
+    const tpm = screen.getByLabelText("Tokens per minute limit");
+    await actor.clear(tpm);
+    await actor.type(tpm, "0");
+    await actor.click(screen.getByRole("button", { name: "Save limits" }));
+    expect(onSave).toHaveBeenCalledWith({
+      limits: { daily: alice.limits.daily, weekly: alice.limits.weekly, monthly: null },
+      rate: null,
+    });
+  });
+
   it("requires confirmation and a reason for Unlimited or below-usage limits", async () => {
     const actor = userEvent.setup();
     const onSave = vi.fn();
@@ -610,8 +745,9 @@ describe("server-side user pagination", () => {
 
     expect(await screen.findByRole("button", { name: "Alice Example" })).toBeInTheDocument();
     expect(listUsers).toHaveBeenCalledTimes(1);
-    expect(listUsers.mock.calls[0][2]).toEqual({ limit: 25, cursor: null, status: undefined, query: "" });
-    expect(screen.getByText("1 identities on this page", { selector: ".users-panel .panel-heading p" })).toBeInTheDocument();
+    // The Users tab is JWT identities only; workloads live on their own tab.
+    expect(listUsers.mock.calls[0][2]).toEqual({ limit: 25, cursor: null, status: undefined, granularity: "user", query: "" });
+    expect(screen.getByText("1 JWT identities on this page", { selector: ".users-panel .panel-heading p" })).toBeInTheDocument();
 
     await actor.click(screen.getByRole("button", { name: "Next" }));
     expect(await screen.findByRole("button", { name: "Bob Example" })).toBeInTheDocument();
@@ -710,7 +846,7 @@ describe("create and canonical detail synchronization", () => {
     await actor.click(within(wizard).getByRole("button", { name: "Create user" }));
 
     expect(await screen.findByRole("button", { name: "New User" })).toBeInTheDocument();
-    expect(await screen.findByRole("dialog", { name: "New User" })).toHaveTextContent("$0.000000");
+    expect(await screen.findByRole("dialog", { name: "New User" })).toHaveTextContent("$0,00");
     expect(screen.getByText("New User was created.")).toBeInTheDocument();
   });
 
@@ -860,45 +996,188 @@ describe("filtered detail and precision edge cases", () => {
 });
 
 describe("workload mode", () => {
-  const paymentsWorkload: UserRow = {
+  const paymentsSubject: UserRow = {
     ...alice,
     user_id: "workload:payments",
     name: "payments",
     granularity: "workload",
     enforcement_ready: true,
+    workload: {
+      workload_id: "workload:payments",
+      name: "payments",
+      model: "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+      profile_arn: "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123",
+      role_arn: "arn:aws:iam::123456789012:role/payments-batch",
+      enforcement_ready: true,
+      registered: true,
+      tag: { key: "bedrock-spend-controls-workload", value: "payments" },
+    },
   };
-  const reportsWorkload: UserRow = {
+  const reportsSubject: UserRow = {
     ...alice,
     user_id: "workload:reports",
     name: "reports",
+    status: "blocked",
+    status_origin: "automatic",
+    status_reason: "auto: daily USD quota exhausted in 2026-09-02",
     granularity: "workload",
     enforcement_ready: false,
+    workload: {
+      workload_id: "workload:reports",
+      name: "reports",
+      model: "us.amazon.nova-pro-v1:0",
+      profile_arn: "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/def456",
+      role_arn: null,
+      enforcement_ready: false,
+      registered: true,
+      tag: { key: "bedrock-spend-controls-workload", value: "reports" },
+    },
+  };
+  const roster: WorkloadListResponse = {
+    roster_source: "parameter_store",
+    tag_key: "bedrock-spend-controls-workload",
+    workloads: [
+      { ...paymentsSubject.workload!, subject: paymentsSubject },
+      { ...reportsSubject.workload!, subject: reportsSubject },
+      {
+        workload_id: "workload:silent",
+        name: "silent",
+        model: "us.amazon.nova-micro-v1:0",
+        profile_arn: "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/ghi789",
+        role_arn: "arn:aws:iam::123456789012:role/silent",
+        enforcement_ready: true,
+        registered: true,
+        tag: { key: "bedrock-spend-controls-workload", value: "silent" },
+        subject: null,
+      },
+    ],
+  };
+  const splitSummary: Summary = {
+    ...summary,
+    enforcement: {
+      ...summary.enforcement,
+      total_users: 3,
+      blocked_users: 1,
+      subjects: {
+        users: { total: 1, blocked: 0, today: { cost_usd: 0.25, input_tokens: 10, output_tokens: 2, requests: 2 } },
+        workloads: {
+          total: 2, blocked: 1, configured: 3, metering_only: 1, unregistered: 0, awaiting_traffic: 1,
+          today: { cost_usd: 4.75, input_tokens: 40, output_tokens: 8, requests: 2 },
+        },
+      },
+    },
   };
 
-  it("filters by granularity and renders workload badges with enforcement state", async () => {
+  it("keeps workload rows off the Users tab and lists them on the Workloads tab with identity and enforcement", async () => {
     const actor = userEvent.setup();
-    const listUsers = vi.spyOn(api, "listUsersPage")
-      .mockResolvedValueOnce({ users: [alice, paymentsWorkload, reportsWorkload], next_cursor: null })
-      .mockResolvedValueOnce({ users: [paymentsWorkload, reportsWorkload], next_cursor: null });
+    const listUsers = vi.spyOn(api, "listUsersPage").mockResolvedValue({ users: [alice], next_cursor: null });
+    vi.spyOn(api, "listWorkloads").mockResolvedValue(roster);
+    vi.spyOn(api, "summary").mockResolvedValue(splitSummary);
+    vi.spyOn(api, "operations").mockResolvedValue(operations);
+    render(<Dashboard cfg={cfg} onSignOut={vi.fn()} session={session} />);
+
+    await openTab(actor, "Users");
+    expect(await screen.findByRole("button", { name: "Alice Example" })).toBeInTheDocument();
+    expect(listUsers.mock.calls[0][2]).toMatchObject({ granularity: "user" });
+    // The kind filter is gone: status only.
+    expect(within(screen.getByLabelText("Filter users")).queryByRole("option", { name: "Workloads" })).not.toBeInTheDocument();
+    expect(screen.queryByText("workload:payments")).not.toBeInTheDocument();
+
+    await openTab(actor, "Workloads");
+    const panel = screen.getByRole("region", { name: "Configured workloads" });
+    expect(screen.getByText("3 configured · 2 metered", { selector: ".panel-heading p" })).toBeInTheDocument();
+    expect(within(panel).getByRole("button", { name: "payments" })).toBeInTheDocument();
+    expect(within(panel).getByText("anthropic.claude-haiku-4-5-20251001-v1:0")).toBeInTheDocument();
+    expect(within(panel).getAllByText("Enforced")).toHaveLength(2); // payments, silent
+    expect(within(panel).getByText("Metering only")).toBeInTheDocument();
+    // Configured but silent since deploy: no row, so no limits/status actions yet.
+    expect(within(panel).getByText("Awaiting traffic")).toBeInTheDocument();
+    expect(within(panel).queryByRole("button", { name: "silent" })).not.toBeInTheDocument();
+    expect(within(panel).getByRole("button", { name: /silent has no quota row yet; limits/ })).toBeDisabled();
+    // Role-less workload: the action is honest about what it does.
+    expect(within(panel).getByRole("button", { name: "Unblock reports" })).toBeEnabled();
+    expect(within(panel).getByRole("button", { name: "Block payments" })).toBeEnabled();
+  });
+
+  it("shows workload identity in the drawer and enforcement-aware copy in the status dialog", async () => {
+    const actor = userEvent.setup();
+    vi.spyOn(api, "listUsersPage").mockResolvedValue({ users: [alice], next_cursor: null });
+    vi.spyOn(api, "listWorkloads").mockResolvedValue(roster);
+    vi.spyOn(api, "summary").mockResolvedValue(splitSummary);
+    vi.spyOn(api, "operations").mockResolvedValue(operations);
+    vi.spyOn(api, "getUser").mockResolvedValue({ data: { user: paymentsSubject, current_usage: paymentsSubject.current_usage }, requestId: "r1", etag: '"1"' } as never);
+    render(<Dashboard cfg={cfg} onSignOut={vi.fn()} session={session} />);
+    await openTab(actor, "Workloads");
+
+    await actor.click(await screen.findByRole("button", { name: "payments" }));
+    const drawer = await screen.findByRole("dialog", { name: "payments" });
+    expect(within(drawer).getByText("Workload details")).toBeInTheDocument();
+    const identity = within(drawer).getByRole("region", { name: "Workload identity" });
+    expect(within(identity).getByText("arn:aws:iam::123456789012:role/payments-batch")).toBeInTheDocument();
+    expect(within(identity).getByText("arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123")).toBeInTheDocument();
+    expect(within(identity).getByText("bedrock-spend-controls-workload=payments")).toBeInTheDocument();
+
+    await actor.click(within(drawer).getByRole("button", { name: "Block workload" }));
+    const dialog = await screen.findByRole("dialog", { name: "Confirm block" });
+    expect(within(dialog).getByText("IAM Deny on workload role")).toBeInTheDocument();
+    expect(within(dialog).getByText(/attaches an inline IAM Deny/)).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "Block workload" })).toBeDisabled();
+  });
+
+  it("never promises enforcement for a role-less workload", () => {
+    expect(statusEnforcementMessage(summary.enforcement, "blocked", reportsSubject)).toMatch(/NOT stopped/);
+    expect(statusEnforcementMessage(summary.enforcement, "active", reportsSubject)).toMatch(/no Deny was in place/);
+    expect(statusEnforcementMessage(summary.enforcement, "blocked", paymentsSubject)).toMatch(/inline IAM Deny/);
+    expect(statusEnforcementMessage(summary.enforcement, "blocked", { ...paymentsSubject, workload: { ...paymentsSubject.workload!, registered: false } })).toMatch(/not in the deployed roster/);
+    // JWT users keep the credential-vend wording.
+    expect(statusEnforcementMessage(summary.enforcement, "blocked", alice)).toMatch(/prevents new credentials/);
+    expect(statusEnforcementMessage(summary.enforcement, "blocked")).toMatch(/prevents new credentials/);
+  });
+
+  it("splits the overview by subject kind and links each group to its tab", async () => {
+    const actor = userEvent.setup();
+    vi.spyOn(api, "listUsersPage").mockResolvedValue({ users: [alice], next_cursor: null });
+    vi.spyOn(api, "listWorkloads").mockResolvedValue(roster);
+    vi.spyOn(api, "summary").mockResolvedValue(splitSummary);
+    vi.spyOn(api, "operations").mockResolvedValue(operations);
+    render(<Dashboard cfg={cfg} onSignOut={vi.fn()} session={session} />);
+
+    const users = await screen.findByRole("article", { name: "Users" });
+    const workloads = screen.getByRole("article", { name: "Workloads" });
+    expect(within(users).getByText("Managed").nextElementSibling).toHaveTextContent("1");
+    expect(within(users).getByText("Spend today").nextElementSibling).toHaveTextContent("$0,25");
+    expect(within(workloads).getByText("Configured").nextElementSibling).toHaveTextContent("3");
+    expect(within(workloads).getByText("Blocked").nextElementSibling).toHaveTextContent("1");
+    expect(within(workloads).getByText("Spend today").nextElementSibling).toHaveTextContent("$4,75");
+    expect(within(workloads).getByText("1 awaiting traffic")).toBeInTheDocument();
+    expect(within(workloads).getByText("1 metering only")).toBeInTheDocument();
+    expect(within(workloads).queryByText(/unregistered/)).not.toBeInTheDocument();
+    // The all-subject figure is still visible, once, in the enforcement strip.
+    expect(screen.getByText(/All subjects today \$5,00 · 4 req/)).toBeInTheDocument();
+
+    await actor.click(within(workloads).getByRole("button", { name: "Manage workloads" }));
+    expect(screen.getByRole("heading", { level: 1, name: "Workload management" })).toBeInTheDocument();
+  });
+
+  it("falls back to the all-subject cards for brokers without the breakdown", async () => {
+    vi.spyOn(api, "listUsersPage").mockResolvedValue({ users: [alice], next_cursor: null });
     vi.spyOn(api, "summary").mockResolvedValue(summary);
     vi.spyOn(api, "operations").mockResolvedValue(operations);
     render(<Dashboard cfg={cfg} onSignOut={vi.fn()} session={session} />);
-    await openTab(actor, "Users");
 
-    expect(await screen.findByRole("button", { name: "Alice Example" })).toBeInTheDocument();
-    expect(screen.getAllByText("workload")).toHaveLength(2);
-    // Only the role-less workload warns that it cannot be hard-blocked.
-    expect(screen.getAllByText("metering only")).toHaveLength(1);
+    expect(await screen.findByText("Managed subjects")).toBeInTheDocument();
+    expect(screen.queryByRole("article", { name: "Workloads" })).not.toBeInTheDocument();
+  });
 
-    await actor.selectOptions(screen.getByLabelText("Filter users"), "workloads");
-    await waitFor(() => expect(listUsers).toHaveBeenCalledTimes(2));
-    expect(listUsers.mock.calls[1][2]).toMatchObject({
-      cursor: null,
-      granularity: "workload",
-      status: undefined,
-    });
-    await waitFor(() =>
-      expect(screen.queryByRole("button", { name: "Alice Example" })).not.toBeInTheDocument(),
-    );
+  it("keeps a newer cached subject when a workload refresh is stale", () => {
+    const entry: WorkloadEntry = { ...paymentsSubject.workload!, subject: { ...paymentsSubject, version: 3, status: "blocked" } };
+    const stale: WorkloadEntry = { ...entry, subject: { ...paymentsSubject, version: 2, today: { cost_usd: 9, input_tokens: 1, output_tokens: 1, requests: 1 } } };
+    const merged = mergeRefreshedWorkloads([entry], [stale])[0];
+    expect(merged.subject?.version).toBe(3);
+    expect(merged.subject?.status).toBe("blocked");
+    // Usage always comes from the refresh.
+    expect(merged.subject?.today.cost_usd).toBe(9);
+    // A silent roster entry passes through untouched.
+    expect(mergeRefreshedWorkloads([entry], [{ ...entry, subject: null }])[0].subject).toBeNull();
   });
 });

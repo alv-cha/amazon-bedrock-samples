@@ -1,0 +1,704 @@
+{
+  "title": "Bedrock Spend Controls threat model",
+  "reviewed": "2026-09-14",
+  "branch": "per-user-quotas",
+  "method": "STRIDE per trust boundary",
+  "asset": "The Bedrock bill, bounded per identity, tenant, or workload; correct usage attribution; enforcement within the documented bound (metering lag + min(lease remainder, deny propagation)); authorized and audited administration. Prompt confidentiality is out of scope: the broker never sees inference traffic and payload delivery is disabled.",
+  "status_legend": {
+    "Mitigated": "A control exists in code and is covered by tests.",
+    "Accepted": "Known residual risk, documented, not planned.",
+    "Open": "No control; listed so it is not forgotten."
+  },
+  "boundaries": [
+    {
+      "id": "B1",
+      "name": "Application / end user -> broker",
+      "crosses": "OIDC JWT in X-Quota-User-Token; SigV4 on the AWS_IAM Function URL",
+      "implemented_by": [
+        "gateway/app/auth.py",
+        "gateway/app/main.py:_authenticate",
+        "cdk/stacks/spend_controls_stack.py (Function URL, invoker_principal_arns)"
+      ]
+    },
+    {
+      "id": "B2",
+      "name": "Broker -> STS / IAM",
+      "crosses": "AssumeRole with RoleSessionName = SourceIdentity = sanitized claim; inline session policy",
+      "implemented_by": [
+        "gateway/app/broker.py",
+        "gateway/app/session_policy.py",
+        "cdk/stacks/spend_controls_stack.py (BedrockUserRole, permissions boundary)"
+      ]
+    },
+    {
+      "id": "B3",
+      "name": "Vended session -> Bedrock",
+      "crosses": "IAM authorization of bedrock:InvokeModel*/CountTokens on allowed_model_arns; invocation log is the metering truth",
+      "implemented_by": [
+        "cdk/stacks/spend_controls_stack.py (role policy, boundary, invocation logging)"
+      ]
+    },
+    {
+      "id": "B4",
+      "name": "Invocation logs -> usage processor -> DynamoDB",
+      "crosses": "CloudWatch Logs subscription; identity.arn and modelId; transactional ledger writes",
+      "implemented_by": [
+        "usage_processor/handler.py"
+      ]
+    },
+    {
+      "id": "B5",
+      "name": "DynamoDB streams -> enforcement processors -> IAM policy versions",
+      "crosses": "REVOCATION# sentinels, CONFIG#EMERGENCY_STOP; CreatePolicyVersion on pre-attached policies; PutRolePolicy on workload roles",
+      "implemented_by": [
+        "enforcement_dispatcher/handler.py",
+        "revocation_processor/handler.py",
+        "emergency_processor/handler.py",
+        "workload_enforcer/handler.py"
+      ]
+    },
+    {
+      "id": "B6",
+      "name": "Admin UI / API -> admin mutations",
+      "crosses": "Shared admin key or admin JWT claim; separate break-glass key; If-Match + Idempotency-Key",
+      "implemented_by": [
+        "gateway/app/main.py:_require_admin",
+        "gateway/app/main.py:_require_emergency_admin",
+        "gateway/app/quota.py (admin mutations)",
+        "admin-audit table"
+      ]
+    },
+    {
+      "id": "B7",
+      "name": "Operator / account administrator -> out-of-band IAM, SCP, logging",
+      "crosses": "Console/CLI with account privileges",
+      "implemented_by": [
+        "DenyDirectBedrockPolicy (helper)",
+        "DEPLOYMENT.md SCP guidance"
+      ]
+    }
+  ],
+  "threats": [
+    {
+      "id": "T-01",
+      "boundary": "B1",
+      "stride": [
+        "Spoofing"
+      ],
+      "title": "JWT forgery or replay",
+      "description": "Attacker presents a fabricated or captured token to obtain credentials under another identity.",
+      "mitigation": "Signature verified against issuer JWKS (RS/ES) or dev-only HS256; iss/aud/exp enforced; discovery and JWKS must be HTTPS; lease deadline capped at token exp so a replayed token cannot mint credentials that outlive it.",
+      "code_references": [
+        "gateway/app/auth.py:JwtVerifier.verify",
+        "gateway/app/main.py:_reserve_permission_lease"
+      ],
+      "tests": [
+        "tests/test_auth.py"
+      ],
+      "residual_risk": "A token stolen before exp is usable until then; no jti replay cache. Caller must also hold a SigV4 principal allowed on the Function URL.",
+      "status": "Accepted"
+    },
+    {
+      "id": "T-02",
+      "boundary": "B1",
+      "stride": [
+        "Spoofing",
+        "Elevation of privilege"
+      ],
+      "title": "jwt_user_claim user-controlled or IdP misconfigured",
+      "description": "If the quota claim is user-editable at the IdP, one user can spend another's budget.",
+      "mitigation": "Reserved prefixes and the workload: namespace are rejected; documentation directs operators to a stable IdP-controlled claim (default sub).",
+      "code_references": [
+        "gateway/app/quota.py:validate_user_id",
+        "gateway/app/main.py:_authenticate"
+      ],
+      "tests": [
+        "tests/test_gateway_app.py::test_reserved_internal_identity_prefixes_are_rejected"
+      ],
+      "residual_risk": "IdP configuration is outside the sample.",
+      "status": "Accepted"
+    },
+    {
+      "id": "T-03",
+      "boundary": "B1",
+      "stride": [
+        "Denial of service"
+      ],
+      "title": "Vend flooding",
+      "description": "A client refreshes credentials in a loop, exhausting STS or DynamoDB.",
+      "mitigation": "Per-identity vend rate limit (VEND#<user>#<minute>, vend_rate_limit_per_minute) -> 429; logical lease refresh window rejects premature new lease IDs; Function URL requires a SigV4 principal from invoker_principal_arns.",
+      "code_references": [
+        "gateway/app/quota.py:_consume_vend_rate",
+        "gateway/app/quota.py:reserve_lease"
+      ],
+      "tests": [
+        "tests/test_quota.py::test_vend_rate_limit_counts_retries_and_resets_next_minute"
+      ],
+      "residual_risk": "Many valid identities multiply the per-identity budget; SigV4 scopes who can try.",
+      "status": "Mitigated"
+    },
+    {
+      "id": "T-04",
+      "boundary": "B1",
+      "stride": [
+        "Information disclosure"
+      ],
+      "title": "Quota headers leak another user's state",
+      "description": "Response headers could expose limits of other subjects.",
+      "mitigation": "Headers describe only the authenticated identity's own limits.",
+      "code_references": [
+        "gateway/app/main.py:_quota_headers"
+      ],
+      "tests": [
+        "tests/test_gateway_app.py"
+      ],
+      "residual_risk": null,
+      "status": "Mitigated"
+    },
+    {
+      "id": "T-05",
+      "boundary": "B2",
+      "stride": [
+        "Spoofing"
+      ],
+      "title": "Session-name collision or injection",
+      "description": "Two identities sanitize to the same RoleSessionName, or a crafted claim escapes the session-name character set, so metering or revocation targets the wrong subject.",
+      "mitigation": "session_name_for derives a collision-resistant name (sanitized prefix + hash of the full claim) and the same value is SourceIdentity; the exact stamped value is persisted on the user row (source_identity) so revocation never re-derives it; SESSION# reverse map; SetSourceIdentity/TagSession granted only to the broker role on the trust policy.",
+      "code_references": [
+        "gateway/app/broker.py:session_name_for",
+        "gateway/app/quota.py:record_session"
+      ],
+      "tests": [
+        "tests/test_broker.py"
+      ],
+      "residual_risk": null,
+      "status": "Mitigated"
+    },
+    {
+      "id": "T-06",
+      "boundary": "B2",
+      "stride": [
+        "Elevation of privilege"
+      ],
+      "title": "Session policy widens access",
+      "description": "The Resource:\"*\" in the lease session policy could grant models outside the allowlist.",
+      "mitigation": "STS intersects the session policy with the role policy and the permissions boundary; \"*\" only applies the DateLessThan deadline to the existing allowlist. Role grants exactly CountTokens, InvokeModel, InvokeModelWithResponseStream.",
+      "code_references": [
+        "gateway/app/session_policy.py",
+        "cdk/stacks/spend_controls_stack.py (BedrockUserPermissionsBoundary)"
+      ],
+      "tests": [
+        "tests/test_broker.py",
+        "tests/test_cdk_stack.py"
+      ],
+      "residual_risk": null,
+      "status": "Mitigated"
+    },
+    {
+      "id": "T-07",
+      "boundary": "B2",
+      "stride": [
+        "Elevation of privilege"
+      ],
+      "title": "Bearer-token bypass of the model allowlist",
+      "description": "bedrock:CallWithBearerToken requires Resource:\"*\" and would defeat the per-model ARN allowlist.",
+      "mitigation": "Not granted on the vended role, boundary, or session policy; DenyDirectBedrockPolicy and the SCP example explicitly deny it for other principals.",
+      "code_references": [
+        "cdk/stacks/spend_controls_stack.py",
+        "DEPLOYMENT.md#5-prevent-bypass"
+      ],
+      "tests": [
+        "tests/test_cdk_stack.py"
+      ],
+      "residual_risk": null,
+      "status": "Mitigated"
+    },
+    {
+      "id": "T-08",
+      "boundary": "B2",
+      "stride": [
+        "Elevation of privilege"
+      ],
+      "title": "bedrock-mantle endpoint bypass",
+      "description": "bedrock-mantle:CreateInference / CallWithBearerToken is a separate IAM service prefix and Bedrock Mantle calls are not captured by model-invocation logging; if reachable, spend is invisible to metering.",
+      "mitigation": "Verified: the vended role's identity policy, the permissions boundary, and the session policy grant only bedrock:* actions, so a vended session has no bedrock-mantle:* permission (denied by omission) and the boundary prevents adding it by editing the role alone.",
+      "code_references": [
+        "cdk/stacks/spend_controls_stack.py (role policy, boundary)",
+        "gateway/app/session_policy.py"
+      ],
+      "tests": [
+        "tests/test_cdk_stack.py"
+      ],
+      "residual_risk": "Other principals in the account with bedrock-mantle:* spend unmetered; DenyDirectBedrockPolicy and the SCP example should be extended with bedrock-mantle:CreateInference and bedrock-mantle:CallWithBearerToken where Mantle is not wanted. Documented in README 'Metering coverage caveat'.",
+      "status": "Mitigated",
+      "status_detail": "Mitigated for vended sessions; Accepted (documented) for other principals"
+    },
+    {
+      "id": "T-09",
+      "boundary": "B3",
+      "stride": [
+        "Repudiation",
+        "Tampering"
+      ],
+      "title": "requestMetadata spoofing",
+      "description": "The caller controls requestMetadata in the invocation log.",
+      "mitigation": "Never read for attribution; only identity.arn (Bedrock-populated) and modelId are used.",
+      "code_references": [
+        "usage_processor/handler.py:_parse_invocation"
+      ],
+      "tests": [
+        "tests/test_usage_processor.py"
+      ],
+      "residual_risk": null,
+      "status": "Mitigated"
+    },
+    {
+      "id": "T-10",
+      "boundary": "B3",
+      "stride": [
+        "Tampering"
+      ],
+      "title": "Unmetered Runtime APIs",
+      "description": "StartAsyncInvoke and InvokeModelWithBidirectionalStream authorize under bedrock:InvokeModel* but produce no invocation-log record.",
+      "mitigation": "None possible in the data plane; documented with the recommendation to exclude such models from allowed_model_arns; listed as a reconciliation-delta cause.",
+      "code_references": [
+        "README.md (Metering coverage caveat)",
+        "docs/runbooks/alarms/reconciliation-delta.md"
+      ],
+      "tests": [],
+      "residual_risk": "Spend through those APIs never reaches the ledger.",
+      "status": "Accepted"
+    },
+    {
+      "id": "T-11",
+      "boundary": "B3",
+      "stride": [
+        "Tampering"
+      ],
+      "title": "Image generation priced at zero when image delivery is off",
+      "description": "A Nova Canvas record with imageDataDeliveryEnabled=false carries no token counts and no body, so images=0 and cost $0 with no missing_dimensions flag.",
+      "mitigation": "The record is still counted as a request (image-model heuristic prevents it being skipped as metadata-less) so volume is visible; README tells operators to enable image delivery or exclude image models.",
+      "code_references": [
+        "usage_processor/handler.py:_is_image_model",
+        "usage_processor/handler.py:_image_count"
+      ],
+      "tests": [
+        "tests/test_usage_processor.py::test_image_model_record_without_image_count_is_metered_and_flagged"
+      ],
+      "residual_risk": "The one pricing gap the fallback alarm cannot detect.",
+      "status": "Accepted"
+    },
+    {
+      "id": "T-12",
+      "boundary": "B4",
+      "stride": [
+        "Tampering"
+      ],
+      "title": "Invocation-log tampering or deletion by an account administrator",
+      "description": "logs:DeleteLogGroup or PutModelInvocationLoggingConfiguration removes or redirects the metering source.",
+      "mitigation": "Managed log group and logging configuration are RemovalPolicy.RETAIN; writer role trust is condition-scoped to aws:SourceAccount/aws:SourceArn. Opt-in reconciliation (reconciliation_enabled) is the detection control.",
+      "code_references": [
+        "cdk/stacks/spend_controls_stack.py",
+        "reconciliation_processor/handler.py"
+      ],
+      "tests": [
+        "tests/test_cdk_stack.py",
+        "tests/test_reconciliation_processor.py"
+      ],
+      "residual_risk": "An administrator can turn logging off; only detectable after the fact.",
+      "status": "Accepted"
+    },
+    {
+      "id": "T-13",
+      "boundary": "B4",
+      "stride": [
+        "Denial of service"
+      ],
+      "title": "Metering lag or stream lag leading to overspend",
+      "description": "Slow log delivery or a backed-up subscription delays detection.",
+      "mitigation": "Overspend bounded by construction: metering lag + min(lease remainder, deny propagation); lease deadline embedded in the credential and non-extending on retry; DetectionLagMilliseconds measured per record.",
+      "code_references": [
+        "gateway/app/session_policy.py",
+        "gateway/app/quota.py:reserve_lease",
+        "usage_processor/handler.py:_emit_emf"
+      ],
+      "tests": [
+        "tests/test_quota.py::test_logical_lease_retry_never_extends_fixed_deadline",
+        "tests/test_usage_processor.py::test_emf_reports_invocation_to_detection_lag"
+      ],
+      "residual_risk": "Bound not measured under load (qualification pending); workload mode has no lease (T-19).",
+      "status": "Mitigated",
+      "status_detail": "Bounded, not eliminated"
+    },
+    {
+      "id": "T-14",
+      "boundary": "B4",
+      "stride": [
+        "Tampering"
+      ],
+      "title": "Double-charging or lost increments on retry",
+      "description": "CloudWatch Logs delivery is at-least-once.",
+      "mitigation": "One TransactWriteItems with a conditional REQUEST#<id> marker Put plus subject and per-model ledger Updates; a cancelled transaction re-reads the marker before classifying as duplicate.",
+      "code_references": [
+        "usage_processor/handler.py:_apply_usage"
+      ],
+      "tests": [
+        "tests/test_usage_processor.py::test_duplicate_delivery_is_idempotent",
+        "tests/test_usage_processor.py::test_duplicate_request_skips_both_subject_and_model_rows",
+        "tests/test_usage_processor.py::test_transient_transaction_cancellation_is_retried_not_dropped"
+      ],
+      "residual_risk": null,
+      "status": "Mitigated"
+    },
+    {
+      "id": "T-15",
+      "boundary": "B4",
+      "stride": [
+        "Elevation of privilege"
+      ],
+      "title": "Unresolved session -> usage silently lost",
+      "description": "A SESSION# map row expired so a late record cannot be attributed.",
+      "mitigation": "Logged as unresolved_sessions warning; retention floor 31 days; a session cannot outlive the vended STS credential (<= 3600 s).",
+      "code_references": [
+        "usage_processor/handler.py:handler"
+      ],
+      "tests": [
+        "tests/test_usage_processor.py::test_unknown_session_and_other_role_are_not_metered"
+      ],
+      "residual_risk": "Only for records delivered days late.",
+      "status": "Accepted"
+    },
+    {
+      "id": "T-16",
+      "boundary": "B5",
+      "stride": [
+        "Tampering"
+      ],
+      "title": "IAM eventual consistency",
+      "description": "CreatePolicyVersion succeeds but takes seconds to propagate; sessions keep working meanwhile.",
+      "mitigation": "Propagation is inside the documented bound; the lease is the fallback.",
+      "code_references": [
+        "README.md (Enforcement guarantee)"
+      ],
+      "tests": [],
+      "residual_risk": "Seconds of continued access after a block.",
+      "status": "Accepted",
+      "status_detail": "Bounded"
+    },
+    {
+      "id": "T-17",
+      "boundary": "B5",
+      "stride": [
+        "Denial of service"
+      ],
+      "title": "Revocation shard overflow",
+      "description": "Blocking many identities fills a 6144-character shard; new identities in that shard are not IAM-cut.",
+      "mitigation": "Processor keeps the last-good deny set rather than clearing it; RevocationPolicyOverflowAlarm; lease still bounds new identities; shard count immutable to prevent rehash gaps.",
+      "code_references": [
+        "revocation_processor/handler.py",
+        "cdk/stacks/configuration.py"
+      ],
+      "tests": [
+        "tests/test_revocation_processor.py::test_policy_overflow_fails_open_for_that_shard_and_alerts"
+      ],
+      "residual_risk": "Capacity ~800-1100 simultaneously blocked identities; beyond that, new blocks rely on the lease.",
+      "status": "Mitigated",
+      "status_detail": "Fail-safe mitigated; capacity accepted"
+    },
+    {
+      "id": "T-18",
+      "boundary": "B5",
+      "stride": [
+        "Elevation of privilege"
+      ],
+      "title": "Enforcement processors escalate via IAM",
+      "description": "A compromised processor uses its IAM permissions to grant itself or the vended role wider access.",
+      "mitigation": "Revocation and emergency processors may only version their designated pre-attached policy ARNs (no AttachRolePolicy/CreatePolicy/role edits); the vended role's permissions boundary caps any policy version; workload enforcer PutRolePolicy scoped to exact configured role ARNs; emergency processor DynamoDB access restricted with dynamodb:LeadingKeys.",
+      "code_references": [
+        "cdk/stacks/spend_controls_stack.py"
+      ],
+      "tests": [
+        "tests/test_cdk_stack.py"
+      ],
+      "residual_risk": null,
+      "status": "Mitigated"
+    },
+    {
+      "id": "T-19",
+      "boundary": "B5",
+      "stride": [
+        "Denial of service"
+      ],
+      "title": "Workload enforcement failure has no lease fallback",
+      "description": "A blocked workload keeps spending until PutRolePolicy succeeds; workload mode has no vend path and therefore no permission lease.",
+      "mitigation": "WorkloadEnforcementFailureAlarm; 5-minute repair schedule; manual attach procedure in the runbook.",
+      "code_references": [
+        "workload_enforcer/handler.py",
+        "docs/runbooks/alarms/workload-enforcement-failure.md"
+      ],
+      "tests": [
+        "tests/test_workload_enforcer.py"
+      ],
+      "residual_risk": "The only unbounded-overspend path in the system; alarmed.",
+      "status": "Accepted"
+    },
+    {
+      "id": "T-20",
+      "boundary": "B5",
+      "stride": [
+        "Tampering"
+      ],
+      "title": "Stream consumer starvation",
+      "description": "A third users-table stream consumer would throttle the two enforcement readers.",
+      "mitigation": "Dispatcher fan-out design; synth test asserts exactly two EventSourceMappings.",
+      "code_references": [
+        "enforcement_dispatcher/handler.py",
+        "cdk/stacks/spend_controls_stack.py"
+      ],
+      "tests": [
+        "tests/test_cdk_stack.py::test_revocation_layer_is_always_deployed"
+      ],
+      "residual_risk": null,
+      "status": "Mitigated"
+    },
+    {
+      "id": "T-21",
+      "boundary": "B6",
+      "stride": [
+        "Spoofing"
+      ],
+      "title": "Admin key or emergency key exposure",
+      "description": "Leak of the routine or break-glass shared key.",
+      "mitigation": "Both keys in Secrets Manager, read at cold start, never sent to the browser (UI authorizes by admin JWT claim); break-glass key entered per action and not persisted; empty ADMIN_JWT_CLAIM disables JWT admin; both compares constant-time via secrets.compare_digest (the emergency compare was == until this review).",
+      "code_references": [
+        "gateway/app/main.py:_require_admin",
+        "gateway/app/main.py:_require_emergency_admin",
+        "admin-ui/src/api.ts"
+      ],
+      "tests": [
+        "tests/test_gateway_app.py::test_admin_requires_authorization_and_valid_payloads",
+        "tests/test_gateway_app.py::test_emergency_stop_requires_break_glass_confirmation_and_gates_recovery"
+      ],
+      "residual_risk": "Rotation is manual and needs container recycling.",
+      "status": "Mitigated"
+    },
+    {
+      "id": "T-22",
+      "boundary": "B6",
+      "stride": [
+        "Elevation of privilege"
+      ],
+      "title": "Admin JWT claim escalation at the IdP",
+      "description": "A user adds themselves to the admin group at the IdP.",
+      "mitigation": "Claim/value are operator-configured; IdP group membership is outside the sample.",
+      "code_references": [
+        "gateway/app/main.py:_jwt_admin_principal"
+      ],
+      "tests": [
+        "tests/test_gateway_app.py::test_admin_jwt_group_is_supported"
+      ],
+      "residual_risk": "IdP governance.",
+      "status": "Accepted"
+    },
+    {
+      "id": "T-23",
+      "boundary": "B6",
+      "stride": [
+        "Repudiation"
+      ],
+      "title": "Unaudited or replayed administrative change",
+      "description": "An admin mutation without a durable record, or a replayed request applying twice.",
+      "mitigation": "Every create/limit/status/model-budget mutation writes an immutable audit event (actor, auth method, reason, before/after) and a request-hash-bound idempotency marker in the same transaction; If-Match versioning rejects lost updates; enforcement-dial and emergency actions write their own immutable audit rows.",
+      "code_references": [
+        "gateway/app/quota.py:_admin_metadata_items",
+        "gateway/app/quota.py:update_admin_limits",
+        "gateway/app/quota.py:update_admin_model_budget",
+        "gateway/app/quota.py:set_permission_lease_seconds",
+        "gateway/app/quota.py:set_emergency_desired"
+      ],
+      "tests": [
+        "tests/test_gateway_app.py::test_admin_mutations_enforce_version_and_durable_idempotency",
+        "tests/test_gateway_app.py::test_model_budget_crud_with_reason_idempotency_and_etag"
+      ],
+      "residual_risk": null,
+      "status": "Mitigated"
+    },
+    {
+      "id": "T-24",
+      "boundary": "B6",
+      "stride": [
+        "Denial of service"
+      ],
+      "title": "Authorized admin disables enforcement",
+      "description": "An admin makes every budget alert-only or Unlimited.",
+      "mitigation": "UI requires explicit confirmation and a reason for Unlimited, period changes, and alert-only thresholds; all changes audited.",
+      "code_references": [
+        "admin-ui/src/App.tsx:LimitsDialog",
+        "gateway/app/quota.py"
+      ],
+      "tests": [
+        "admin-ui/src/App.test.tsx"
+      ],
+      "residual_risk": "Cannot be prevented for a legitimate admin.",
+      "status": "Accepted",
+      "status_detail": "Accepted (audited)"
+    },
+    {
+      "id": "T-25",
+      "boundary": "B6",
+      "stride": [
+        "Information disclosure"
+      ],
+      "title": "Admin API returns CloudWatch/IAM internals",
+      "description": "Operations responses could leak secret ARNs or policy ARNs to the browser.",
+      "mitigation": "Operations exposes alarm keys/states, metric values, and configuration numbers only; never secret ARNs, policy ARNs, or the emergency key.",
+      "code_references": [
+        "gateway/app/main.py:admin_operations"
+      ],
+      "tests": [
+        "tests/test_gateway_app.py::test_operations_is_read_only_safe_and_reports_revocation_health"
+      ],
+      "residual_risk": null,
+      "status": "Mitigated"
+    },
+    {
+      "id": "T-26",
+      "boundary": "B7",
+      "stride": [
+        "Elevation of privilege"
+      ],
+      "title": "Direct Bedrock access outside the vended role",
+      "description": "Any principal with bedrock:InvokeModel* (or bedrock-mantle:*) spends unmetered.",
+      "mitigation": "DenyDirectBedrockPolicyArn helper and SCP example; reconciliation detects the bill/ledger gap.",
+      "code_references": [
+        "cdk/stacks/spend_controls_stack.py (DenyDirectBedrockInvocation)",
+        "DEPLOYMENT.md#5-prevent-bypass",
+        "reconciliation_processor/handler.py"
+      ],
+      "tests": [
+        "tests/test_reconciliation_processor.py"
+      ],
+      "residual_risk": "The sample cannot constrain the management plane; production must apply the SCP/boundary.",
+      "status": "Accepted"
+    },
+    {
+      "id": "T-27",
+      "boundary": "B7",
+      "stride": [
+        "Tampering"
+      ],
+      "title": "Administrator edits IAM, the boundary, the logging configuration, or DynamoDB directly",
+      "description": "Out-of-band changes to enforcement or ledger state.",
+      "mitigation": "None; RETAIN policies preserve evidence; CloudTrail (not deployed by this sample) is the audit source.",
+      "code_references": [],
+      "tests": [],
+      "residual_risk": "Full.",
+      "status": "Accepted"
+    },
+    {
+      "id": "T-28",
+      "boundary": "B7",
+      "stride": [
+        "Tampering"
+      ],
+      "title": "Price catalog manipulation",
+      "description": "An operator pins a $0 price to make a model free.",
+      "mitigation": "Synth requires a positive token pair except for image models with positive per_image, requires a reason on every override, and the catalog is reviewed in Git.",
+      "code_references": [
+        "cdk/stacks/configuration.py:_price"
+      ],
+      "tests": [
+        "tests/test_cdk_stack.py::test_model_config_rejects_invalid_price_dimensions"
+      ],
+      "residual_risk": "Reviewed configuration, not a runtime control.",
+      "status": "Mitigated"
+    },
+    {
+      "id": "T-29",
+      "boundary": "B7",
+      "stride": [
+        "Information disclosure",
+        "Tampering"
+      ],
+      "title": "Reconciliation reads the account bill",
+      "description": "With reconciliation_enabled a Lambda holds ce:GetCostAndUsage on * (no resource scoping exists) and stores account-level Bedrock USD as RECONCILE# rows in the usage table, readable through the admin API.",
+      "mitigation": "Opt-in, off by default; the grant is the single ce: verb and the function has no users/audit-table access; the CE query is filtered to Bedrock services and the stack Region and only totals are stored; the broker never calls CE and serves stored rows behind the same admin authorization as the ledger.",
+      "code_references": [
+        "reconciliation_processor/handler.py",
+        "cdk/stacks/spend_controls_stack.py (SpendReconciliationFn)",
+        "gateway/app/main.py (admin_reconciliation)"
+      ],
+      "tests": [
+        "tests/test_cdk_stack.py::test_reconciliation_enabled_wires_lambda_schedule_alarm_and_least_privilege",
+        "tests/test_reconciliation_processor.py",
+        "tests/test_gateway_app.py::test_reconciliation_requires_admin"
+      ],
+      "residual_risk": "An admin sees aggregate account Bedrock spend for the Region.",
+      "status": "Mitigated"
+    },
+    {
+      "id": "T-30",
+      "boundary": "B7",
+      "stride": [
+        "Tampering",
+        "Information disclosure"
+      ],
+      "title": "Workload roster parameter",
+      "description": "The broker labels workload: rows and answers GET /admin/workloads from the WorkloadRosterParameter SSM parameter (name, model, inference-profile ARN, role ARN, enforcement_ready). ssm:PutParameter on it could relabel a role-less workload as Enforced or hide one from the console; reading it discloses role and profile ARNs.",
+      "mitigation": "Written only by CloudFormation; the broker grant is ssm:GetParameter on the single ARN; the roster is presentation only (the enforcer has its own copy and evaluates budgets from the ledger, so tampering cannot change what is enforced); POST /admin/users rejects the workload: namespace so no unregistered row can be minted through the API.",
+      "code_references": [
+        "gateway/app/main.py (_workload_registry, _workload_json, create_user)",
+        "cdk/stacks/spend_controls_stack.py (WorkloadRosterParameter)"
+      ],
+      "tests": [
+        "tests/test_cdk_stack.py::test_workload_roster_parameter_carries_identity_and_broker_reads_it",
+        "tests/test_gateway_app.py::test_workload_roster_is_read_from_parameter_store_and_cached",
+        "tests/test_gateway_app.py::test_workload_roster_falls_back_when_parameter_store_is_unreadable",
+        "tests/test_gateway_app.py::test_admin_cannot_hand_create_a_workload_row"
+      ],
+      "residual_risk": "A console label can mislead an admin in an account that is already compromised at the ssm:PutParameter level.",
+      "status": "Mitigated"
+    }
+  ],
+  "summary": {
+    "Mitigated": [
+      "T-03",
+      "T-04",
+      "T-05",
+      "T-06",
+      "T-07",
+      "T-08",
+      "T-09",
+      "T-13",
+      "T-14",
+      "T-17",
+      "T-18",
+      "T-20",
+      "T-21",
+      "T-23",
+      "T-25",
+      "T-28",
+      "T-29",
+      "T-30"
+    ],
+    "Accepted": [
+      "T-01",
+      "T-02",
+      "T-10",
+      "T-11",
+      "T-12",
+      "T-15",
+      "T-16",
+      "T-19",
+      "T-22",
+      "T-24",
+      "T-26",
+      "T-27"
+    ],
+    "Open": []
+  },
+  "headline_accepts": [
+    "The sample cannot constrain the account's management plane (T-12, T-26, T-27): apply the SCP.",
+    "Workload mode has no permission lease (T-19): an IAM failure there is the only unbounded-overspend path; it is alarmed."
+  ]
+}

@@ -688,18 +688,21 @@ class SpendControlsStack(Stack):
                 "EMERGENCY_KEY_SECRET_ARN": emergency_secret.secret_arn,
                 "AUTO_PROVISION_USERS": str(config.auto_provision_users).lower(),
                 "DEFAULT_LIMITS_JSON": config.default_limits_json,
-                # Workload roster for the admin API: granularity labeling
-                # and enforcement_ready surfacing (static config, no tokens).
-                "WORKLOAD_ENFORCEMENT_JSON": json.dumps(
-                    {
-                        workload.workload_id: {
-                            "name": workload.name,
-                            "enforcement_ready": bool(workload.role_arn),
-                        }
-                        for workload in config.workloads
-                    },
-                    sort_keys=True,
+                # Rows written before per-period thresholds existed resolve
+                # to [{warn_threshold: warn}, {1.0: block}]; the broker needs
+                # the same value the metering processor uses.
+                "WARN_THRESHOLD": str(config.warn_threshold),
+                # Model-scoped budgets are validated against the vended
+                # role's allowlist so a budget can never target a model the
+                # subject cannot call.
+                "ALLOWED_MODEL_ARNS_JSON": json.dumps(
+                    list(config.allowed_model_arns), sort_keys=True
                 ),
+                # The workload roster (WORKLOAD_ROSTER_PARAMETER_NAME) is
+                # wired after the inference profiles exist, below: it
+                # carries their ARNs, so it lives in Parameter Store rather
+                # than this 4 KB-capped environment.
+                "WORKLOAD_TAG_KEY": WORKLOAD_TAG_KEY,
                 "USAGE_RETENTION_DAYS": str(config.usage_retention_days),
                 # Credential lifetime and refresh controls. The lease window
                 # here is the deployment DEFAULT; the effective value is the
@@ -1058,7 +1061,7 @@ class SpendControlsStack(Stack):
                     "x-quota-emergency-key",
                     "x-quota-user-token",
                 ],
-                allow_methods=["GET", "POST", "PUT"],
+                allow_methods=["DELETE", "GET", "POST", "PUT"],
                 allow_origins=[
                     f"https://{ui_distribution.distribution_domain_name}"
                 ],
@@ -1233,6 +1236,14 @@ class SpendControlsStack(Stack):
                         "bedrock:CallWithBearerToken",
                         "bedrock:InvokeModel",
                         "bedrock:InvokeModelWithResponseStream",
+                        # Bedrock Mantle is a separate IAM service prefix
+                        # and is NOT captured by model-invocation logging;
+                        # a principal with these actions spends unmetered.
+                        # The vended role never receives them (denied by
+                        # omission); this helper closes the gap for every
+                        # other role it is attached to. Threat model T-08.
+                        "bedrock-mantle:CreateInference",
+                        "bedrock-mantle:CallWithBearerToken",
                     ],
                     resources=["*"],
                 ),
@@ -1370,6 +1381,48 @@ class SpendControlsStack(Stack):
                 "role_arn": workload.role_arn,
             }
 
+        # Admin-facing roster: everything the console needs to present a
+        # workload as its own kind of subject (model, profile, role,
+        # enforceability). Profile ARNs are deploy-time tokens and ~100
+        # characters each, so this rides in Parameter Store instead of the
+        # broker's 4 KB Lambda environment; intelligent tiering promotes the
+        # parameter past the 4 KB standard cap automatically for large
+        # rosters. Written by this template only; the broker caches reads.
+        workload_roster_parameter = ssm.StringParameter(
+            self,
+            "WorkloadRosterParameter",
+            tier=ssm.ParameterTier.INTELLIGENT_TIERING,
+            string_value=(
+                cdk.Fn.to_json_string(
+                    {
+                        workload.workload_id: {
+                            "name": workload.name,
+                            "model": workload.model,
+                            "profile_arn": (
+                                workload_enforcement[workload.workload_id][
+                                    "profile_arn"
+                                ]
+                            ),
+                            "role_arn": workload.role_arn,
+                            "enforcement_ready": bool(workload.role_arn),
+                        }
+                        for workload in config.workloads
+                    }
+                )
+                if config.workloads
+                else "{}"
+            ),
+            description=(
+                "Bedrock spend-controls workload roster (name, model, "
+                "inference profile, role) read by the admin API"
+            ),
+        )
+        broker_api_fn.add_environment(
+            "WORKLOAD_ROSTER_PARAMETER_NAME",
+            workload_roster_parameter.parameter_name,
+        )
+        workload_roster_parameter.grant_read(broker_api_fn)
+
         usage_processor_fn = lambda_.Function(
             self, "UsageProcessorFn",
             runtime=lambda_.Runtime.PYTHON_3_12,
@@ -1385,7 +1438,13 @@ class SpendControlsStack(Stack):
                 "WARN_THRESHOLD": str(config.warn_threshold),
                 "USAGE_RETENTION_DAYS": str(config.usage_retention_days),
                 "METRICS_NAMESPACE": METRICS_NAMESPACE,
-                "MODEL_PRICES_JSON": model_prices_json,
+                # The resolved price snapshot is NOT injected here: Lambda
+                # caps environment variables at 4 KB and the snapshot alone
+                # is ~3 KB once cache/image dimensions are included. The
+                # ModelPricesParameter (written by this template before the
+                # function can be invoked) is the runtime source; the
+                # processor falls back to its built-in conservative defaults
+                # only if Parameter Store is unreadable at a cold start.
                 "MODEL_FALLBACK_PRICE_JSON": fallback_price_json,
                 "PRICES_PARAMETER_NAME": (
                     model_prices_parameter.parameter_name
@@ -1723,6 +1782,7 @@ class SpendControlsStack(Stack):
                     "USAGE_TABLE": usage_table.table_name,
                     "SNS_TOPIC_ARN": alert_topic.topic_arn,
                     "METRICS_NAMESPACE": METRICS_NAMESPACE,
+                    "WARN_THRESHOLD": str(config.warn_threshold),
                     "WORKLOADS_JSON": cdk.Fn.to_json_string(
                         workload_enforcement
                     ),
@@ -1899,6 +1959,94 @@ class SpendControlsStack(Stack):
         )
         operations_alarms["pricing_fallback"] = pricing_fallback_alarm
 
+        # ------------------------------------------------------------------
+        # Reconciliation (opt-in): once a day, compare the ledger's estimated
+        # USD for D-<lag> with Cost Explorer's Bedrock spend for the same day
+        # (aggregate, and per workload via the cost-allocation tag). Minimal
+        # by design: ce:GetCostAndUsage needs no export, Athena, or Glue;
+        # it accepts CE's ~24 h lag and an account-only view. JWT users share
+        # one role in the bill, so aggregate is the finest grain for them.
+        # ------------------------------------------------------------------
+        reconciliation_fn: lambda_.Function | None = None
+        if config.reconciliation_enabled:
+            reconciliation_fn = lambda_.Function(
+                self,
+                "SpendReconciliationFn",
+                runtime=lambda_.Runtime.PYTHON_3_12,
+                memory_size=256,
+                timeout=Duration.minutes(2),
+                handler="handler.handler",
+                code=lambda_.Code.from_asset("../reconciliation_processor"),
+                environment={
+                    "USAGE_TABLE": usage_table.table_name,
+                    "SNS_TOPIC_ARN": alert_topic.topic_arn,
+                    "METRICS_NAMESPACE": METRICS_NAMESPACE,
+                    "RECONCILE_REGION": self.region,
+                    "RECONCILE_LAG_DAYS": str(config.reconcile_lag_days),
+                    "USAGE_RETENTION_DAYS": str(config.usage_retention_days),
+                    "WORKLOAD_TAG_KEY": WORKLOAD_TAG_KEY,
+                    "WORKLOADS_JSON": cdk.Fn.to_json_string(
+                        workload_enforcement
+                    ),
+                },
+            )
+            # Reads every subject row for one day and writes the RECONCILE#
+            # result row; nothing else on this table.
+            usage_table.grant_read_write_data(reconciliation_fn)
+            alert_topic.grant_publish(reconciliation_fn)
+            reconciliation_fn.add_to_role_policy(
+                iam.PolicyStatement(
+                    actions=["ce:GetCostAndUsage"],
+                    # Cost Explorer has no resource-level permissions; "*" is
+                    # the only valid resource for this action.
+                    resources=["*"],  # nosemgrep: iam-wildcard-resource
+                )
+            )
+            events.Rule(
+                self,
+                "SpendReconciliationSchedule",
+                # 06:00 UTC: after Cost Explorer's daily refresh for D-1 has
+                # landed, reconciling D-<lag> (default D-2) is safely settled.
+                schedule=events.Schedule.cron(minute="0", hour="6"),
+                targets=[
+                    events_targets.LambdaFunction(
+                        reconciliation_fn,
+                        event=events.RuleTargetInput.from_object(
+                            {"source": "aws.events"}
+                        ),
+                    )
+                ],
+            )
+            reconciliation_alarm = cw.Alarm(
+                self,
+                "SpendReconciliationDeltaAlarm",
+                metric=cw.Metric(
+                    namespace=METRICS_NAMESPACE,
+                    metric_name="ReconciliationDeltaPercent",
+                    # Only the aggregate emission has no Workload dimension.
+                    statistic="Maximum",
+                    period=Duration.days(1),
+                ),
+                threshold=config.reconciliation_alarm_percent,
+                comparison_operator=(
+                    cw.ComparisonOperator.GREATER_THAN_THRESHOLD
+                ),
+                # Two consecutive daily runs over the threshold: a single day
+                # can be CE lag or a one-off unmetered call.
+                evaluation_periods=2,
+                treat_missing_data=cw.TreatMissingData.NOT_BREACHING,
+            )
+            reconciliation_alarm.add_alarm_action(
+                cw_actions.SnsAction(alert_topic)
+            )
+            operations_alarms["reconciliation_delta"] = reconciliation_alarm
+            broker_api_fn.add_environment("RECONCILIATION_ENABLED", "true")
+            broker_api_fn.add_environment(
+                "RECONCILE_LAG_DAYS", str(config.reconcile_lag_days)
+            )
+        else:
+            broker_api_fn.add_environment("RECONCILIATION_ENABLED", "false")
+
         broker_api_fn.add_environment(
             "OPERATIONS_ALARM_NAMES_JSON",
             cdk.Fn.to_json_string(
@@ -2012,7 +2160,37 @@ class SpendControlsStack(Stack):
                         "RevocationPolicyOverflow",
                     )
                 ],
-            )
+            ),
+            *(
+                [
+                    cw.GraphWidget(
+                        title="Spend reconciliation: ledger vs Cost Explorer (daily)",
+                        width=12,
+                        left=[
+                            cw.Metric(
+                                namespace=METRICS_NAMESPACE,
+                                metric_name=metric_name,
+                                statistic="Maximum",
+                                period=Duration.days(1),
+                            )
+                            for metric_name in (
+                                "ReconciliationEstimatedUSD",
+                                "ReconciliationBilledUSD",
+                            )
+                        ],
+                        right=[
+                            cw.Metric(
+                                namespace=METRICS_NAMESPACE,
+                                metric_name="ReconciliationDeltaPercent",
+                                statistic="Maximum",
+                                period=Duration.days(1),
+                            )
+                        ],
+                    )
+                ]
+                if reconciliation_fn is not None
+                else []
+            ),
         )
 
         # ------------------------------------------------------------------

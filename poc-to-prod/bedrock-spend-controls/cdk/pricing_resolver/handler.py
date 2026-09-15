@@ -1,4 +1,21 @@
-"""Resolve standard on-demand Bedrock token prices during stack deployment."""
+"""Resolve standard on-demand Bedrock prices during stack deployment.
+
+Price entries carry one rate per *dimension*. ``input_per_mtok`` and
+``output_per_mtok`` are required (the pre-existing contract); the resolver
+also emits ``cache_read_per_mtok``, ``cache_write_per_mtok``, and
+``per_image`` when the Price List publishes them for the catalog model.
+The usage processor prices whichever dimensions a record carries and flags
+requests whose dimensions have no rate, so adding a dimension here is
+additive and never changes how an input/output-only model is priced.
+
+Dimension names below are the exact ``inferenceType`` attribute values
+observed in the AmazonBedrock offer (us-east-1, catalog 2026-09) for
+Nova Lite/Pro/Micro (``Prompt cache read input tokens`` /
+``Prompt cache write input tokens``, unit ``1K tokens``) and Nova Canvas
+(``T2I 1024 Standard`` ..., unit ``image``). They are matched literally,
+never guessed from substrings, so a renamed dimension surfaces as a
+missing rate (alarmed) rather than a silently wrong price.
+"""
 
 import json
 import os
@@ -10,21 +27,49 @@ import boto3
 SERVICE_CODE = "AmazonBedrock"
 PRICING_API_REGION = "us-east-1"
 
+# ``inferenceType`` -> price-entry key, for the token dimensions priced per
+# 1K tokens in the Price List and stored here per million tokens.
+_TOKEN_DIMENSIONS = {
+    "input tokens": "input_per_mtok",
+    "output tokens": "output_per_mtok",
+    "prompt cache read input tokens": "cache_read_per_mtok",
+    "prompt cache write input tokens": "cache_write_per_mtok",
+}
+_REQUIRED = ("input_per_mtok", "output_per_mtok")
+_OPTIONAL_TOKEN = ("cache_read_per_mtok", "cache_write_per_mtok")
 
-def _dimension_rate(product: dict) -> Decimal:
+# Image generation prices are per image and vary by task type, size, and
+# quality; the invocation log reports only a count, so the resolver keeps
+# the STANDARD text-to-image rate at the smallest published size as the
+# per-image estimate and lets operators pin a different one via
+# ``price_overrides`` when their workload is premium/large. Matched
+# literally on the observed ``inferenceType`` values.
+_IMAGE_DIMENSION_PREFERENCE = (
+    "t2i 512 standard",
+    "t2i 1024 standard",
+    "t2i 2048 standard",
+)
+
+
+def _unit_rate(product: dict, *, unit: str, multiplier: Decimal) -> Decimal:
     rates = set()
     for term in product.get("terms", {}).get("OnDemand", {}).values():
         for dimension in term.get("priceDimensions", {}).values():
-            if dimension.get("unit") != "1K tokens":
+            if dimension.get("unit") != unit:
                 continue
-            rates.add(Decimal(dimension["pricePerUnit"]["USD"]) * 1000)
+            rates.add(Decimal(dimension["pricePerUnit"]["USD"]) * multiplier)
     if len(rates) != 1:
         sku = product.get("product", {}).get("sku")
         raise ValueError(
-            f"Expected one USD-per-MTok rate for SKU {sku}; "
+            f"Expected one USD rate per {unit} for SKU {sku}; "
             f"found {sorted(rates)}"
         )
     return rates.pop()
+
+
+def _dimension_rate(product: dict) -> Decimal:
+    """USD per million tokens for a ``1K tokens`` SKU."""
+    return _unit_rate(product, unit="1K tokens", multiplier=Decimal(1000))
 
 
 def _catalog_price(pricing_client, region_code: str, catalog_model: str) -> dict:
@@ -32,7 +77,8 @@ def _catalog_price(pricing_client, region_code: str, catalog_model: str) -> dict
         {"Type": "TERM_MATCH", "Field": "regionCode", "Value": region_code},
         {"Type": "TERM_MATCH", "Field": "model", "Value": catalog_model},
     ]
-    rates: dict[str, set[Decimal]] = {"input": set(), "output": set()}
+    rates: dict[str, set[Decimal]] = {key: set() for key in _TOKEN_DIMENSIONS.values()}
+    image_rates: dict[str, set[Decimal]] = {}
     paginator = pricing_client.get_paginator("get_products")
     for page in paginator.paginate(ServiceCode=SERVICE_CODE, Filters=filters):
         for raw_product in page.get("PriceList", []):
@@ -46,22 +92,63 @@ def _catalog_price(pricing_client, region_code: str, catalog_model: str) -> dict
                 continue
 
             inference_type = attributes.get("inferenceType", "").lower()
-            if inference_type == "input tokens":
-                rates["input"].add(_dimension_rate(product))
-            elif inference_type == "output tokens":
-                rates["output"].add(_dimension_rate(product))
+            token_key = _TOKEN_DIMENSIONS.get(inference_type)
+            if token_key is not None:
+                rates[token_key].add(_dimension_rate(product))
+            elif inference_type in _IMAGE_DIMENSION_PREFERENCE:
+                image_rates.setdefault(inference_type, set()).add(
+                    _unit_rate(product, unit="image", multiplier=Decimal(1))
+                )
 
-    for token_type, candidates in rates.items():
+    per_image: float | None = None
+    for inference_type in _IMAGE_DIMENSION_PREFERENCE:
+        candidates = image_rates.get(inference_type)
+        if not candidates:
+            continue
         if len(candidates) != 1:
             raise ValueError(
-                f"Expected one standard on-demand {token_type} price for "
+                f"Expected one {inference_type} image price for "
                 f"{catalog_model} in {region_code}; found {sorted(candidates)}"
             )
+        per_image = float(candidates.pop())
+        break
 
-    return {
-        "input_per_mtok": float(rates["input"].pop()),
-        "output_per_mtok": float(rates["output"].pop()),
-    }
+    price: dict[str, float] = {}
+    for key in _REQUIRED:
+        if len(rates[key]) == 1:
+            price[key] = float(rates[key].pop())
+        elif not rates[key] and per_image is not None:
+            # Image-only model (observed: Nova Canvas publishes no token
+            # rows). The token pair is zero by construction, not by guess.
+            price[key] = 0.0
+        else:
+            token_type = key.split("_per_")[0]
+            raise ValueError(
+                f"Expected one standard on-demand {token_type} price for "
+                f"{catalog_model} in {region_code}; found {sorted(rates[key])}"
+            )
+    for key in _OPTIONAL_TOKEN:
+        candidates = rates[key]
+        if len(candidates) == 1:
+            price[key] = float(candidates.pop())
+        elif len(candidates) > 1:
+            # Ambiguity is a catalog defect, not something to average away.
+            raise ValueError(
+                f"Expected at most one standard on-demand {key} price for "
+                f"{catalog_model} in {region_code}; found {sorted(candidates)}"
+            )
+    if per_image is not None:
+        price["per_image"] = per_image
+    return price
+
+
+def _pinned_price(price: dict) -> dict:
+    """Copy a hand-pinned entry, keeping only known rate keys."""
+    resolved = {key: float(price[key]) for key in _REQUIRED}
+    for key in (*_OPTIONAL_TOKEN, "per_image"):
+        if price.get(key) is not None:
+            resolved[key] = float(price[key])
+    return resolved
 
 
 def resolve_snapshot(
@@ -71,10 +158,7 @@ def resolve_snapshot(
     pinned_prices: dict[str, dict],
 ) -> dict:
     snapshot = {
-        model_id: {
-            "input_per_mtok": float(price["input_per_mtok"]),
-            "output_per_mtok": float(price["output_per_mtok"]),
-        }
+        model_id: _pinned_price(price)
         for model_id, price in pinned_prices.items()
     }
     for catalog_model, model_ids in catalog_models.items():
@@ -82,17 +166,36 @@ def resolve_snapshot(
         for model_id in model_ids:
             if model_id in snapshot:
                 raise ValueError(f"Duplicate model price mapping for {model_id}")
-            snapshot[model_id] = price
+            snapshot[model_id] = dict(price)
     return snapshot
 
 
 def conservative_fallback(snapshot: dict, configured: dict) -> dict:
-    """Keep unknown models at least as expensive as every known model."""
+    """Keep unknown models at least as expensive as every known model.
+
+    Applies per dimension: the fallback carries every dimension any known
+    model prices, at the maximum known rate, so a record whose dimension is
+    missing from its own model's entry is priced conservatively rather than
+    at zero. Dimensions no model prices are omitted (the processor then
+    flags them as unpriceable).
+    """
     fallback = {}
-    for field in ("input_per_mtok", "output_per_mtok"):
-        candidates = [float(configured[field])]
-        candidates.extend(float(price[field]) for price in snapshot.values())
-        fallback[field] = max(candidates)
+    keys = set(_REQUIRED) | set(configured) | {
+        key for price in snapshot.values() for key in price
+    }
+    for field in sorted(keys):
+        if field not in (*_REQUIRED, *_OPTIONAL_TOKEN, "per_image"):
+            continue
+        candidates = []
+        if configured.get(field) is not None:
+            candidates.append(float(configured[field]))
+        candidates.extend(
+            float(price[field])
+            for price in snapshot.values()
+            if price.get(field) is not None
+        )
+        if candidates:
+            fallback[field] = max(candidates)
     return fallback
 
 

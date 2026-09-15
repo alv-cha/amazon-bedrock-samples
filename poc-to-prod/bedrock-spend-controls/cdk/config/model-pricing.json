@@ -34,23 +34,32 @@
     ],
     "DeepSeek v3.2": [
       "deepseek.v3.2"
+    ],
+    "Nova Canvas": [
+      "amazon.nova-canvas-v1:0"
     ]
   },
   "price_overrides": {
     "anthropic.claude-opus-4-7": {
       "input_per_mtok": 5.0,
       "output_per_mtok": 25.0,
-      "reason": "AWS pricing page data feed (meteredUnitMaps 2026-09-01); no Pricing API entry"
+      "cache_read_per_mtok": 0.5,
+      "cache_write_per_mtok": 6.25,
+      "reason": "AWS pricing page data feed (meteredUnitMaps 2026-09-01); no Pricing API entry. Cache read 10% / write 125% of input per the Bedrock prompt-caching pricing page."
     },
     "global.anthropic.claude-opus-4-7": {
       "input_per_mtok": 5.0,
       "output_per_mtok": 25.0,
-      "reason": "AWS pricing page data feed (meteredUnitMaps 2026-09-01); no Pricing API entry"
+      "cache_read_per_mtok": 0.5,
+      "cache_write_per_mtok": 6.25,
+      "reason": "AWS pricing page data feed (meteredUnitMaps 2026-09-01); no Pricing API entry. Cache read 10% / write 125% of input per the Bedrock prompt-caching pricing page."
     },
     "us.anthropic.claude-opus-4-7": {
       "input_per_mtok": 5.5,
       "output_per_mtok": 27.5,
-      "reason": "AWS pricing page data feed (meteredUnitMaps 2026-09-01); no Pricing API entry"
+      "cache_read_per_mtok": 0.55,
+      "cache_write_per_mtok": 6.875,
+      "reason": "AWS pricing page data feed (meteredUnitMaps 2026-09-01); no Pricing API entry. Cache read 10% / write 125% of input per the Bedrock prompt-caching pricing page."
     },
     "anthropic.claude-fable-5": {
       "input_per_mtok": 10.0,

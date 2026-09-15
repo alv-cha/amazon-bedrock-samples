@@ -115,24 +115,34 @@ def _admin_request_args(
     """Build one routine or emergency request without performing I/O."""
     base = args.gateway_url.rstrip("/")
     if args.command == "create-user":
+        daily = {
+            "usd": args.daily_usd,
+            "input_tokens": args.daily_input_tokens,
+            "output_tokens": args.daily_output_tokens,
+        }
+        daily_thresholds = _parse_thresholds(
+            getattr(args, "daily_thresholds", None)
+        )
+        if daily_thresholds is not None:
+            daily["thresholds"] = daily_thresholds
         limits = {
-            "daily": {
-                "usd": args.daily_usd,
-                "input_tokens": args.daily_input_tokens,
-                "output_tokens": args.daily_output_tokens,
-            },
+            "daily": daily,
             "weekly": _optional_period(args, "weekly"),
             "monthly": _optional_period(args, "monthly"),
         }
+        body = {
+            "user_id": args.user_id,
+            "name": args.name or args.user_id,
+            "limits": limits,
+        }
+        rate, rate_present = _rate_payload(args)
+        if rate_present:
+            body["rate"] = rate
         return "POST", f"{base}/admin/users", {
             "headers": {
                 "Idempotency-Key": idempotency_key or str(uuid.uuid4())
             },
-            "json": {
-                "user_id": args.user_id,
-                "name": args.name or args.user_id,
-                "limits": limits,
-            },
+            "json": body,
         }
     if args.command == "list-users":
         return "GET", f"{base}/admin/users", {}
@@ -167,6 +177,11 @@ def _admin_request_args(
                 for name in names
                 if getattr(args, f"{period}_{name}") is not None
             }
+            thresholds = _parse_thresholds(
+                getattr(args, f"{period}_thresholds", None)
+            )
+            if thresholds is not None:
+                provided["thresholds"] = thresholds
             if provided:
                 existing = limits.get(period) or {
                     "usd": 0,
@@ -175,13 +190,16 @@ def _admin_request_args(
                 }
                 limits[period] = {**existing, **provided}
                 changed = True
-        if not changed:
+        rate, rate_present = _rate_payload(args)
+        if not changed and not rate_present:
             raise ValueError(
                 "update-user requires at least one quota option"
             )
         if if_match is None:
             raise ValueError("update-user requires the current user version")
         body = {"limits": limits}
+        if rate_present:
+            body["rate"] = rate
         if args.reason is not None:
             body["reason"] = args.reason
         return "PUT", f"{base}/admin/user/limits", {
@@ -227,7 +245,52 @@ def _optional_period(args, period: str) -> dict | None:
         raise ValueError(
             f"{period} requires USD, input-token, and output-token limits"
         )
+    thresholds = _parse_thresholds(getattr(args, f"{period}_thresholds", None))
+    if thresholds is not None:
+        values["thresholds"] = thresholds
     return values
+
+
+def _parse_thresholds(raw: str | None) -> list[dict] | None:
+    """``"50:warn,80:warn,100:block"`` -> API thresholds list.
+
+    Percentages, comma-separated, each ``<percent>:<warn|block>``. Ordering
+    and the at-most-one-trailing-block rule are validated by the server;
+    the client only parses the shape.
+    """
+    if raw is None:
+        return None
+    entries: list[dict] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        percent, _, action = token.partition(":")
+        try:
+            at = float(percent) / 100
+        except ValueError as exc:
+            raise ValueError(
+                f"threshold {token!r} must look like <percent>:<warn|block>"
+            ) from exc
+        if action not in ("warn", "block"):
+            raise ValueError(
+                f"threshold {token!r} must end in :warn or :block"
+            )
+        entries.append({"at": at, "action": action})
+    if not entries:
+        raise ValueError("thresholds must contain at least one entry")
+    return entries
+
+
+def _rate_payload(args) -> tuple[dict | None, bool]:
+    """Return (rate, present). ``--rpm 0 --tpm 0`` disables both."""
+    rpm = getattr(args, "rpm", None)
+    tpm = getattr(args, "tpm", None)
+    if getattr(args, "disable_rate", False):
+        return None, True
+    if rpm is None and tpm is None:
+        return None, False
+    return {"rpm": int(rpm or 0), "tpm": int(tpm or 0)}, True
 
 
 def _response_body(response: httpx.Response) -> dict:
@@ -344,18 +407,31 @@ def _parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
+    threshold_help = (
+        "Comma-separated <percent>:<warn|block> entries, e.g. "
+        "'50:warn,80:warn,100:block'. Omit the block entry for an "
+        "alert-only period."
+    )
+
     create = commands.add_parser("create-user")
     create.add_argument("user_id")
     create.add_argument("--name")
     create.add_argument("--daily-usd", type=float, required=True)
     create.add_argument("--daily-input-tokens", type=int, required=True)
     create.add_argument("--daily-output-tokens", type=int, required=True)
+    create.add_argument("--daily-thresholds", help=threshold_help)
     create.add_argument("--weekly-usd", type=float)
     create.add_argument("--weekly-input-tokens", type=int)
     create.add_argument("--weekly-output-tokens", type=int)
+    create.add_argument("--weekly-thresholds", help=threshold_help)
     create.add_argument("--monthly-usd", type=float)
     create.add_argument("--monthly-input-tokens", type=int)
     create.add_argument("--monthly-output-tokens", type=int)
+    create.add_argument("--monthly-thresholds", help=threshold_help)
+    create.add_argument("--rpm", type=int, help="Requests per minute (0 = off)")
+    create.add_argument(
+        "--tpm", type=int, help="Uncached input + output tokens per minute (0 = off)"
+    )
 
     commands.add_parser("list-users")
 
@@ -370,15 +446,25 @@ def _parser() -> argparse.ArgumentParser:
     update.add_argument("--daily-usd", type=float)
     update.add_argument("--daily-input-tokens", type=int)
     update.add_argument("--daily-output-tokens", type=int)
+    update.add_argument("--daily-thresholds", help=threshold_help)
     update.add_argument("--disable-daily", action="store_true")
     update.add_argument("--weekly-usd", type=float)
     update.add_argument("--weekly-input-tokens", type=int)
     update.add_argument("--weekly-output-tokens", type=int)
+    update.add_argument("--weekly-thresholds", help=threshold_help)
     update.add_argument("--disable-weekly", action="store_true")
     update.add_argument("--monthly-usd", type=float)
     update.add_argument("--monthly-input-tokens", type=int)
     update.add_argument("--monthly-output-tokens", type=int)
+    update.add_argument("--monthly-thresholds", help=threshold_help)
     update.add_argument("--disable-monthly", action="store_true")
+    update.add_argument("--rpm", type=int, help="Requests per minute (0 = off)")
+    update.add_argument(
+        "--tpm", type=int, help="Uncached input + output tokens per minute (0 = off)"
+    )
+    update.add_argument(
+        "--disable-rate", action="store_true", help="Remove both rate limits"
+    )
     update.add_argument("--reason")
 
     block = commands.add_parser("block-user")

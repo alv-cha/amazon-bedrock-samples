@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import secrets
+import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
 
@@ -21,9 +23,13 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from bedrock_spend_controls.quota_periods import (
     PERIODS,
+    RATE_DIMENSIONS,
     calendar_window,
+    normalize_thresholds,
     period_for_start,
     quota_reason,
+    thresholds_public,
+    validate_model_id,
 )
 
 from . import emf
@@ -67,6 +73,11 @@ _broker: CredentialBroker | None = None
 _admin_key: str | None = None
 _emergency_key: str | None = None
 _cloudwatch = None
+_ssm = None
+# (roster dict, monotonic fetch time, source label). See _workload_registry.
+_workload_roster_cache: tuple[dict, float, str] | None = None
+
+logger = logging.getLogger("bedrock_spend_controls.gateway")
 
 
 def store() -> QuotaStore:
@@ -74,6 +85,13 @@ def store() -> QuotaStore:
     if _store is None:
         _store = QuotaStore()
     return _store
+
+
+def ssm_client():
+    global _ssm
+    if _ssm is None:
+        _ssm = boto3.client("ssm", region_name=settings.aws_region)
+    return _ssm
 
 
 def verifier() -> JwtVerifier:
@@ -505,7 +523,13 @@ def _require_emergency_admin(
 ) -> tuple[JSONResponse | None, str]:
     provided = extract_bearer(request.headers.get("x-quota-emergency-key"))
     expected = emergency_key()
-    if expected and provided and provided == expected:
+    # Constant-time compare, same as the routine admin key: the break-glass
+    # key must not leak a prefix match through response timing.
+    if (
+        expected
+        and provided
+        and secrets.compare_digest(provided, expected)
+    ):
         return None, "emergency-shared-key"
     return (
         _error(
@@ -545,11 +569,80 @@ def _limits_json(user: UserRecord) -> dict:
                 "usd": int(value.get("usd_micro", 0)) / MICRO,
                 "input_tokens": int(value.get("input_tokens", 0)),
                 "output_tokens": int(value.get("output_tokens", 0)),
+                # Ordered warn/block list in API form ({at: ratio, action}).
+                # Rows without their own list report the deployment default.
+                "thresholds": thresholds_public(value.get("thresholds") or []),
             }
             if value is not None
             else None
         )
     return limits
+
+
+def _rate_json(user: UserRecord) -> dict | None:
+    """Subject-level per-minute limits; null when neither is configured."""
+    return dict(user.rate_limits) if user.rate_limited else None
+
+
+def _period_limits_public(value: dict | None) -> dict | None:
+    if value is None:
+        return None
+    return {
+        "usd": int(value.get("usd_micro", 0)) / MICRO,
+        "input_tokens": int(value.get("input_tokens", 0)),
+        "output_tokens": int(value.get("output_tokens", 0)),
+        "thresholds": thresholds_public(value.get("thresholds") or []),
+    }
+
+
+def _model_budgets_json(user: UserRecord) -> dict[str, dict]:
+    """``{model_id: {daily|weekly|monthly: limits | null}}`` (API form)."""
+    return {
+        model_id: {
+            period: _period_limits_public(periods.get(period))
+            for period in PERIODS
+        }
+        for model_id, periods in sorted(user.model_budget_limits.items())
+    }
+
+
+def _allowed_model_ids() -> set[str] | None:
+    """Model/profile IDs the vended role may call; None means ``*``.
+
+    Derived from ``allowed_model_arns`` by taking the trailing resource ID
+    (``foundation-model/<id>`` or ``inference-profile/<id>``). A budget for
+    a model outside this set could never accrue usage, so it is rejected.
+    """
+    try:
+        arns = json.loads(settings.allowed_model_arns_json)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(arns, list) or "*" in arns:
+        return None
+    ids: set[str] = set()
+    for arn in arns:
+        if not isinstance(arn, str):
+            continue
+        tail = arn.rsplit("/", 1)[-1]
+        if tail and tail != "*":
+            ids.add(tail)
+        if tail.endswith("*") and len(tail) > 1:
+            # Prefix wildcard (e.g. anthropic.*): keep the prefix for a
+            # startswith check below.
+            ids.add(tail)
+    return ids
+
+
+def _model_allowed(model_id: str) -> bool:
+    allowed = _allowed_model_ids()
+    if allowed is None:
+        return True
+    if model_id in allowed:
+        return True
+    return any(
+        entry.endswith("*") and model_id.startswith(entry[:-1])
+        for entry in allowed
+    )
 
 
 def _period_usage_json(value: dict[str, object]) -> dict:
@@ -563,6 +656,13 @@ def _period_usage_json(value: dict[str, object]) -> dict:
         "input_tokens": int(value.get("input_tokens", 0)),
         "output_tokens": int(value.get("output_tokens", 0)),
         "requests": int(value.get("requests", 0)),
+        # Non-limited priced dimensions (additive; older clients ignore).
+        "cache_read_tokens": int(value.get("cache_read_tokens", 0)),
+        "cache_write_tokens": int(value.get("cache_write_tokens", 0)),
+        "images": int(value.get("images", 0)),
+        # Requests whose USD is known to be incomplete (a dimension had no
+        # catalog rate). Non-zero means "repair candidate", never silent.
+        "unpriced_requests": int(value.get("unpriced_requests", 0)),
     }
 
 
@@ -605,7 +705,77 @@ def _lease_json(user: UserRecord) -> dict | None:
 
 
 def _workload_registry() -> dict:
-    return _json_object(settings.workload_enforcement_json)
+    """Workload roster ``{workload_id: {name, model, profile_arn, role_arn,
+    enforcement_ready}}``.
+
+    Read from the Parameter Store parameter the stack writes (cached for
+    ``workload_roster_cache_seconds``); the inline ``WORKLOAD_ROSTER_JSON``
+    is the local/dev fallback and the last-known-good value if Parameter
+    Store is unreadable. The roster is static deploy configuration, so a
+    stale cache can only lag a redeploy by the cache window.
+    """
+    global _workload_roster_cache
+    fallback = _json_object(settings.workload_roster_json)
+    parameter_name = settings.workload_roster_parameter_name
+    if not parameter_name:
+        return fallback
+    now = time.monotonic()
+    cached = _workload_roster_cache
+    if cached is not None and (
+        now - cached[1] < settings.workload_roster_cache_seconds
+    ):
+        return cached[0]
+    try:
+        response = ssm_client().get_parameter(Name=parameter_name)
+        roster = _json_object(response["Parameter"]["Value"])
+        _workload_roster_cache = (roster, now, "parameter_store")
+        return roster
+    except (BotoCoreError, ClientError, KeyError) as exc:
+        logger.warning(
+            "workload roster parameter %s unreadable (%s); using %s",
+            parameter_name,
+            type(exc).__name__,
+            "cached roster" if cached is not None else "inline fallback",
+        )
+        if cached is not None:
+            # Keep serving the stale copy rather than flapping to the
+            # fallback; refresh attempts continue every call until it works.
+            return cached[0]
+        return fallback
+
+
+def _workload_roster_source() -> str:
+    if not settings.workload_roster_parameter_name:
+        return "environment"
+    cached = _workload_roster_cache
+    return cached[2] if cached is not None else "fallback"
+
+
+def _is_workload_id(user_id: str) -> bool:
+    return user_id.startswith(WORKLOAD_USER_ID_PREFIX)
+
+
+def _workload_json(workload_id: str, entry: dict | None) -> dict:
+    """Identity block for a ``workload:`` subject.
+
+    ``registered`` is False for rows whose id is not in the deployed roster
+    (a workload removed from the config, or a row created out of band):
+    they keep metering history but nothing enforces them.
+    """
+    registered = isinstance(entry, dict)
+    entry = entry if registered else {}
+    name = str(entry.get("name") or workload_id[len(WORKLOAD_USER_ID_PREFIX):])
+    role_arn = entry.get("role_arn") or None
+    return {
+        "workload_id": workload_id,
+        "name": name,
+        "model": entry.get("model") or None,
+        "profile_arn": entry.get("profile_arn") or None,
+        "role_arn": role_arn,
+        "enforcement_ready": bool(entry.get("enforcement_ready")),
+        "registered": registered,
+        "tag": {"key": settings.workload_tag_key, "value": name},
+    }
 
 
 def _user_json(user: UserRecord) -> dict:
@@ -619,14 +789,19 @@ def _user_json(user: UserRecord) -> dict:
         "created_at": user.created_at,
         "updated_at": user.updated_at,
         "limits": _limits_json(user),
+        "rate": _rate_json(user),
+        # Optional second axis; empty object when none are configured. A
+        # breach on any model budget blocks the whole subject.
+        "model_budgets": _model_budgets_json(user),
         "lease": _lease_json(user),
     }
-    if user.user_id.startswith(WORKLOAD_USER_ID_PREFIX):
-        entry = _workload_registry().get(user.user_id)
-        payload["granularity"] = "workload"
-        payload["enforcement_ready"] = bool(
-            isinstance(entry, dict) and entry.get("enforcement_ready")
+    if _is_workload_id(user.user_id):
+        workload = _workload_json(
+            user.user_id, _workload_registry().get(user.user_id)
         )
+        payload["granularity"] = "workload"
+        payload["enforcement_ready"] = workload["enforcement_ready"]
+        payload["workload"] = workload
     else:
         payload["granularity"] = "user"
     return payload
@@ -726,15 +901,36 @@ def _transaction_unavailable() -> JSONResponse:
     )
 
 
+def _parse_rate(body: dict) -> tuple[dict | None, bool, str]:
+    """Return (rate, present, error). ``rate`` is ``{rpm, tpm}`` or None
+    (disable both); ``present`` is False when the body did not mention it."""
+    if "rate" not in body:
+        return None, False, ""
+    raw = body["rate"]
+    if raw is None:
+        return None, True, ""
+    if not isinstance(raw, dict):
+        return None, True, "rate must be an object or null."
+    unknown = sorted(set(raw) - set(RATE_DIMENSIONS))
+    if unknown:
+        return None, True, "Unknown rate fields: " + ", ".join(unknown)
+    rate: dict[str, int] = {}
+    for dimension in RATE_DIMENSIONS:
+        value = raw.get(dimension, 0)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None, True, f"rate.{dimension} must be a non-negative integer."
+        rate[dimension] = value
+    return rate, True, ""
+
+
 def _parse_limits(
     body: dict, *, with_defaults: bool
 ) -> tuple[dict, str]:
     if "limits" not in body:
-        return (
-            (configured_default_limits(), "")
-            if with_defaults
-            else ({}, "limits is required.")
-        )
+        if with_defaults:
+            return configured_default_limits(), ""
+        # A rate-only update is a valid limits mutation.
+        return ({}, "") if "rate" in body else ({}, "limits is required.")
     raw_limits = body["limits"]
     if not isinstance(raw_limits, dict):
         return {}, "limits must be an object."
@@ -744,7 +940,9 @@ def _parse_limits(
     values: dict[str, dict | None] = (
         configured_default_limits() if with_defaults else {}
     )
+    values.pop("rate", None)
     expected_fields = {"usd", "input_tokens", "output_tokens"}
+    optional_fields = {"thresholds"}
     for period in PERIODS:
         if period not in raw_limits:
             continue
@@ -754,7 +952,7 @@ def _parse_limits(
             continue
         if not isinstance(raw_period, dict):
             return {}, f"limits.{period} must be an object or null."
-        unknown_fields = sorted(set(raw_period) - expected_fields)
+        unknown_fields = sorted(set(raw_period) - expected_fields - optional_fields)
         missing_fields = sorted(expected_fields - set(raw_period))
         if unknown_fields or missing_fields:
             details = []
@@ -763,7 +961,7 @@ def _parse_limits(
             if unknown_fields:
                 details.append("unknown " + ", ".join(unknown_fields))
             return {}, f"Invalid limits.{period}: " + "; ".join(details)
-        period_values: dict[str, float | int] = {}
+        period_values: dict[str, object] = {}
         for field_name in ("usd", "input_tokens", "output_tokens"):
             raw = raw_period[field_name]
             qualified = f"limits.{period}.{field_name}"
@@ -781,6 +979,13 @@ def _parse_limits(
                     return {}, f"{qualified} must be a non-negative integer."
                 parsed = raw
             period_values[field_name] = parsed
+        if raw_period.get("thresholds") is not None:
+            try:
+                period_values["thresholds"] = normalize_thresholds(
+                    raw_period["thresholds"], name=f"limits.{period}.thresholds"
+                )
+            except ValueError as exc:
+                return {}, str(exc)
         values[period] = period_values
     if with_defaults and not any(value is not None for value in values.values()):
         return {}, "At least one quota period must be enabled."
@@ -808,6 +1013,17 @@ async def create_user(request: Request) -> Response:
         validate_user_id(user_id)
     except ValueError as exc:
         return _error(400, str(exc), "invalid_request_error")
+    if _is_workload_id(user_id):
+        # Workload rows are created by metering from the deployed roster; a
+        # hand-made one would be an unregistered orphan nothing enforces.
+        return _error(
+            400,
+            "The 'workload:' namespace is reserved for workload-mode "
+            "subjects. Declare workloads in the deployment config "
+            "(workloads.json) and redeploy; their rows appear on first "
+            "metered invocation.",
+            "invalid_request_error",
+        )
     name = body.get("name", user_id)
     if not isinstance(name, str) or not name.strip():
         return _error(
@@ -816,6 +1032,13 @@ async def create_user(request: Request) -> Response:
     limits, limit_error = _parse_limits(body, with_defaults=True)
     if limit_error:
         return _error(400, limit_error, "invalid_request_error")
+    rate, rate_present, rate_error = _parse_rate(body)
+    if rate_error:
+        return _error(400, rate_error, "invalid_request_error")
+    if rate_present:
+        limits["rate"] = rate
+    elif configured_default_limits().get("rate") is not None:
+        limits["rate"] = configured_default_limits()["rate"]
     request_id, key_error = _idempotency_key(request)
     if key_error is not None:
         return key_error
@@ -903,25 +1126,56 @@ async def list_users(
                 "next_cursor": next_cursor,
             }
         )
-    rows = []
-    for user in users:
-        current_usage = _current_usage_json(user.user_id)
-        rows.append(
+    rows = [_usage_row(user) for user in users]
+    return JSONResponse({"users": rows, "next_cursor": next_cursor})
+
+
+def _usage_row(user: UserRecord) -> dict:
+    current_usage = _current_usage_json(user.user_id)
+    return {
+        **_user_json(user),
+        "today": {
+            key: current_usage["daily"][key]
+            for key in ("cost_usd", "input_tokens", "output_tokens", "requests")
+        },
+        "current_usage": current_usage,
+    }
+
+
+@app.get("/admin/workloads")
+async def list_workloads(request: Request) -> Response:
+    """Deployed roster joined with the metered ``workload:`` rows.
+
+    A roster entry without a row is a workload configured at deploy time
+    that has not invoked yet (its row is created by the first metered
+    invocation); a row without a roster entry is unregistered. Workload
+    counts are bounded by the deployment config, so no pagination.
+    """
+    if (denied := _require_admin(request)) is not None:
+        return denied
+    roster = _workload_registry()
+    rows = {
+        user.user_id: user
+        for user in store().list_users()
+        if _is_workload_id(user.user_id)
+    }
+    workloads = []
+    for workload_id in sorted(set(roster) | set(rows)):
+        identity = _workload_json(workload_id, roster.get(workload_id))
+        user = rows.get(workload_id)
+        workloads.append(
             {
-                **_user_json(user),
-                "today": {
-                    key: current_usage["daily"][key]
-                    for key in (
-                        "cost_usd",
-                        "input_tokens",
-                        "output_tokens",
-                        "requests",
-                    )
-                },
-                "current_usage": current_usage,
+                **identity,
+                "subject": _usage_row(user) if user is not None else None,
             }
         )
-    return JSONResponse({"users": rows, "next_cursor": next_cursor})
+    return JSONResponse(
+        {
+            "workloads": workloads,
+            "roster_source": _workload_roster_source(),
+            "tag_key": settings.workload_tag_key,
+        }
+    )
 
 
 def _json_object(raw: str) -> dict:
@@ -1374,6 +1628,9 @@ async def admin_usage_metrics(request: Request, days: int = 14) -> Response:
                 user.name if user is not None and user.name
                 else entry["user_id"]
             )
+            entry["granularity"] = (
+                "workload" if _is_workload_id(entry["user_id"]) else "user"
+            )
         payload["top_users"] = top_users
         payload["status"] = "partial" if incomplete else "available"
     except (BotoCoreError, ClientError) as exc:
@@ -1489,6 +1746,40 @@ async def get_emergency_stop(request: Request) -> Response:
     if (denied := _require_admin(request)) is not None:
         return denied
     return JSONResponse(store().get_emergency_state())
+
+
+@app.get("/admin/reconciliation")
+async def admin_reconciliation(request: Request, limit: int = 14) -> Response:
+    """Recent daily ledger-vs-Cost-Explorer reconciliation runs.
+
+    Served from stored ``RECONCILE#`` rows only; the broker never queries
+    Cost Explorer. When the feature is off at deploy time the payload says so
+    explicitly instead of returning an empty list that looks like "no drift".
+    """
+    if (denied := _require_admin(request)) is not None:
+        return denied
+    limit = max(1, min(limit, 90))
+    if not settings.reconciliation_enabled:
+        return JSONResponse(
+            {
+                "enabled": False,
+                "runs": [],
+                "message": (
+                    "Reconciliation is disabled for this deployment. Set "
+                    "reconciliation_enabled=true in the deployment config to "
+                    "compare the ledger against Cost Explorer daily."
+                ),
+            }
+        )
+    runs = store().list_reconciliation_runs(limit=limit)
+    return JSONResponse(
+        {
+            "enabled": True,
+            "lag_days": settings.reconcile_lag_days,
+            "runs": runs,
+            "latest": runs[0] if runs else None,
+        }
+    )
 
 
 @app.get("/admin/enforcement")
@@ -1658,16 +1949,51 @@ async def admin_summary(request: Request) -> Response:
     now = datetime.now(timezone.utc)
     users = store().list_users()
     blocked = [user.user_id for user in users if not user.active]
-    aggregate = {
-        "cost_usd": 0.0,
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "requests": 0,
+
+    def _empty_usage() -> dict:
+        return {
+            "cost_usd": 0.0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "requests": 0,
+        }
+
+    aggregate = _empty_usage()
+    # Per-kind breakdown: JWT identities vend credentials through the
+    # broker; workloads are apps on their own IAM principals metered by
+    # application inference profile. They share a ledger but not a control
+    # path, so the overview reports them side by side.
+    subjects = {
+        kind: {"total": 0, "blocked": 0, "today": _empty_usage()}
+        for kind in ("users", "workloads")
     }
+    roster = _workload_registry()
+    subjects["workloads"]["configured"] = len(roster)
+    subjects["workloads"]["metering_only"] = 0
+    subjects["workloads"]["unregistered"] = 0
+    seen_workloads: set[str] = set()
     for user in users:
         usage = store().get_window_usage(user.user_id)
+        kind = "workloads" if _is_workload_id(user.user_id) else "users"
+        bucket = subjects[kind]
+        bucket["total"] += 1
+        if not user.active:
+            bucket["blocked"] += 1
         for key in aggregate:
             aggregate[key] += usage.get(key, 0)
+            bucket["today"][key] += usage.get(key, 0)
+        if kind == "workloads":
+            seen_workloads.add(user.user_id)
+            entry = roster.get(user.user_id)
+            if not isinstance(entry, dict):
+                bucket["unregistered"] += 1
+            elif not entry.get("enforcement_ready"):
+                bucket["metering_only"] += 1
+    # Roster entries whose row has not been created yet (no invocation
+    # since deploy) still count as configured-but-silent for the operator.
+    subjects["workloads"]["awaiting_traffic"] = len(
+        [wid for wid in roster if wid not in seen_workloads]
+    )
     enforcement_config = store().get_enforcement_config()
     effective_lease = int(enforcement_config["permission_lease_seconds"])
     return JSONResponse(
@@ -1703,6 +2029,9 @@ async def admin_summary(request: Request) -> Response:
                 "blocked_users": len(blocked),
                 "blocked_user_ids": blocked,
                 "today": aggregate,
+                # total_users / blocked_users / today above stay as the
+                # all-subjects figures; this splits them by control path.
+                "subjects": subjects,
             },
             "observability": {
                 "source": "bedrock_model_invocation_logs",
@@ -2058,14 +2387,40 @@ async def _set_limits_response(user_id: str, request: Request) -> Response:
     limits, limit_error = _parse_limits(body, with_defaults=False)
     if limit_error:
         return _error(400, limit_error, "invalid_request_error")
-    if not limits:
+    rate, rate_present, rate_error = _parse_rate(body)
+    if rate_error:
+        return _error(400, rate_error, "invalid_request_error")
+    if not limits and not rate_present:
         return _error(
             400,
-            "At least one quota period update is required.",
+            "At least one quota period or rate update is required.",
             "invalid_request_error",
         )
-    limits = {**_limits_json(current), **limits}
-    if not any(value is not None for value in limits.values()):
+    # Merge: untouched periods keep their stored thresholds (the public
+    # form round-trips through normalize_thresholds unchanged).
+    merged: dict = {}
+    for period, existing in _limits_json(current).items():
+        merged[period] = (
+            {**existing, "thresholds": existing["thresholds"]}
+            if existing is not None
+            else None
+        )
+    for period, submitted in limits.items():
+        if submitted is None:
+            merged[period] = None
+            continue
+        previous = merged.get(period)
+        if "thresholds" not in submitted and previous is not None:
+            # Period re-submitted without thresholds: keep the current list
+            # rather than resetting it to the deployment default.
+            submitted = {**submitted, "thresholds": previous["thresholds"]}
+        merged[period] = submitted
+    limits = merged
+    if rate_present:
+        limits["rate"] = rate
+    if not any(
+        value is not None for key, value in limits.items() if key != "rate"
+    ):
         return _error(
             400,
             "At least one quota period must be enabled.",
@@ -2222,3 +2577,218 @@ async def set_status(user_id: str, request: Request) -> Response:
     if (invalid := _user_id_error(user_id)) is not None:
         return invalid
     return await _set_status_response(user_id, request)
+
+
+# ---------------------------------------------------------------------------
+# Model-scoped budgets (optional second axis on a subject)
+# ---------------------------------------------------------------------------
+#
+# A subject may carry zero or more budgets keyed by model ID, evaluated
+# against per-model daily ledger rows the usage processor writes in the same
+# transaction as the subject row. Enforcement stays subject-wide: the deny
+# primitives operate on aws:SourceIdentity / the workload role, not on a
+# model resource, so ANY model budget breach blocks the subject entirely.
+# Making the deny model-selective would need per-identity resource lists in
+# the 19 revocation shards and blow the 6,144-character shard cap; it is a
+# documented limitation, not a roadmap item. Model budgets are also not part
+# of the credential-vend pre-flight (main.py vend_credentials): at vend time
+# the model is unknown, so pre-flight stays subject-level.
+
+
+def _parse_model_budget(body: dict) -> tuple[dict | None, str]:
+    """``{"limits": {...}}`` -> per-period limits (same shape as the subject)."""
+    if "limits" not in body:
+        return None, "limits is required."
+    raw_limits = body["limits"]
+    if not isinstance(raw_limits, dict):
+        return None, "limits must be an object."
+    if "rate" in raw_limits:
+        return None, "Model budgets do not support rate limits."
+    limits, error = _parse_limits({"limits": raw_limits}, with_defaults=False)
+    if error:
+        return None, error
+    for period in PERIODS:
+        limits.setdefault(period, None)
+    if not any(value is not None for value in limits.values()):
+        return None, "A model budget must enable at least one quota period."
+    return limits, ""
+
+
+async def _model_budget_mutation(
+    user_id: str, request: Request, *, remove: bool
+) -> Response:
+    principal: AdminPrincipal = request.state.admin_principal
+    model_id = request.query_params.get("model_id")
+    if (
+        model_id is None
+        or len(request.query_params.getlist("model_id")) != 1
+    ):
+        return _error(
+            400,
+            "model_id must be provided exactly once.",
+            "invalid_request_error",
+        )
+    try:
+        model_id = validate_model_id(model_id)
+    except ValueError as exc:
+        return _error(400, str(exc), "invalid_request_error")
+    current = store().get_user(user_id)
+    if current is None:
+        return _error(404, f"User '{user_id}' was not found.", "not_found")
+    if remove:
+        body: dict = {}
+        if await request.body():
+            body, error = await _admin_json_object(request)
+            if error is not None:
+                return error
+            assert body is not None
+        limits = None
+        if model_id not in (current.model_budgets or {}):
+            return _error(
+                404,
+                f"User '{user_id}' has no budget for model '{model_id}'.",
+                "not_found",
+            )
+    else:
+        body, error = await _admin_json_object(request)
+        if error is not None:
+            return error
+        assert body is not None
+        if not _model_allowed(model_id):
+            return _error(
+                400,
+                f"Model '{model_id}' is not in this deployment's "
+                "allowed_model_arns; the subject could never accrue usage "
+                "against this budget.",
+                "invalid_request_error",
+            )
+        limits, limit_error = _parse_model_budget(body)
+        if limit_error:
+            return _error(400, limit_error, "invalid_request_error")
+    reason, reason_error = _admin_reason(body)
+    if reason_error is not None:
+        return reason_error
+    assert reason is not None
+    canonical_body = {**body, "reason": reason} if "reason" in body else body
+    expected, match_error = _expected_version(request, current)
+    if match_error is not None:
+        return match_error
+    request_id, key_error = _idempotency_key(request)
+    if key_error is not None:
+        return key_error
+    assert expected is not None and request_id is not None
+    request_hash = _request_hash(request, canonical_body, principal)
+    # Reconcile the automatic status against the NEW budget set so a budget
+    # below current model usage blocks immediately and removing the binding
+    # budget lifts an automatic block.
+    next_budgets = dict(current.model_budget_limits)
+    if limits is None:
+        next_budgets.pop(model_id, None)
+    else:
+        from .quota import limits_from_item, model_budget_attributes
+
+        next_budgets[model_id] = limits_from_item(model_budget_attributes(limits))
+    reconciled_status = store().status_after_limit_change(
+        current, _limits_json(current), model_budgets=next_budgets
+    )
+    try:
+        result = store().update_admin_model_budget(
+            user_id,
+            model_id,
+            limits,
+            reason=reason,
+            expected_version=expected,
+            actor=principal.actor,
+            auth_method=principal.auth_method,
+            idempotency_key=request_id,
+            request_hash=request_hash,
+            reconciled_status=reconciled_status,
+        )
+    except IdempotencyConflict:
+        return _error(
+            409,
+            "Idempotency-Key was already used for a different request.",
+            "idempotency_conflict",
+        )
+    except VersionConflict as exc:
+        return _version_conflict(exc)
+    except KeyError as exc:
+        if str(exc).strip("'") == model_id:
+            return _error(
+                404,
+                f"User '{user_id}' has no budget for model '{model_id}'.",
+                "not_found",
+            )
+        return _error(404, f"User '{user_id}' was not found.", "not_found")
+    except ValueError as exc:
+        return _error(400, str(exc), "invalid_request_error")
+    except ClientError:
+        return _transaction_unavailable()
+    user = result.user
+    return _mutation_response(
+        {
+            "user_id": user_id,
+            "model_id": model_id,
+            "removed" if remove else "updated": True,
+            "model_budgets": _model_budgets_json(user),
+        },
+        user,
+        request_id,
+    )
+
+
+@app.put("/admin/user/model-budget")
+async def canonical_set_model_budget(
+    request: Request, user_id: str | None = None
+) -> Response:
+    if (denied := _require_admin(request)) is not None:
+        return denied
+    if (invalid := _canonical_user_id_error(request, user_id)) is not None:
+        return invalid
+    assert user_id is not None
+    return await _model_budget_mutation(user_id, request, remove=False)
+
+
+@app.delete("/admin/user/model-budget")
+async def canonical_delete_model_budget(
+    request: Request, user_id: str | None = None
+) -> Response:
+    if (denied := _require_admin(request)) is not None:
+        return denied
+    if (invalid := _canonical_user_id_error(request, user_id)) is not None:
+        return invalid
+    assert user_id is not None
+    return await _model_budget_mutation(user_id, request, remove=True)
+
+
+@app.get("/admin/user/model-usage")
+async def canonical_user_model_usage(
+    request: Request,
+    user_id: str | None = None,
+    model_id: str | None = None,
+) -> Response:
+    """Current calendar usage for one subject × model ledger."""
+    if (denied := _require_admin(request)) is not None:
+        return denied
+    if (invalid := _canonical_user_id_error(request, user_id)) is not None:
+        return invalid
+    assert user_id is not None
+    if model_id is None:
+        return _error(400, "model_id is required.", "invalid_request_error")
+    try:
+        model_id = validate_model_id(model_id)
+    except ValueError as exc:
+        return _error(400, str(exc), "invalid_request_error")
+    if store().get_user(user_id) is None:
+        return _error(404, f"User '{user_id}' was not found.", "not_found")
+    usage = store().get_model_usage(user_id, model_id)
+    return JSONResponse(
+        {
+            "user_id": user_id,
+            "model_id": model_id,
+            "current_usage": {
+                period: _period_usage_json(value)
+                for period, value in usage.items()
+            },
+        }
+    )

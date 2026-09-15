@@ -61,14 +61,19 @@ const usage: UsageMetrics = {
     { user_id: "user-b", name: "Grace Hopper (server)", cost_usd: 0.2, requests: 1 },
     { user_id: "user-a", cost_usd: 0.15, requests: 6 },
     { user_id: "user-c", cost_usd: 0.01, requests: 1 },
+    { user_id: "workload:payments", name: "payments", cost_usd: 0.005, requests: 1, granularity: "workload" },
+    // Older broker: no granularity field, the id prefix still labels it.
+    { user_id: "workload:legacy", name: "legacy", cost_usd: 0.001, requests: 1 },
   ],
 };
 
 describe("metric formatting", () => {
-  it("formats spend with sub-dollar precision and counts as integers", () => {
-    expect(formatMetricValue("cost_usd", 0.1234)).toBe("$0.1234");
-    expect(formatMetricValue("cost_usd", 12.3)).toBe("$12.30");
-    expect(formatMetricValue("requests", 1234)).toBe("1,234");
+  it("formats spend as $1.234,56 with two decimals and counts as grouped integers", () => {
+    expect(formatMetricValue("cost_usd", 0.1234)).toBe("$0,12");
+    expect(formatMetricValue("cost_usd", 12.3)).toBe("$12,30");
+    expect(formatMetricValue("cost_usd", 1234.567)).toBe("$1.234,57");
+    expect(formatMetricValue("requests", 1234)).toBe("1.234");
+    expect(formatMetricValue("input_tokens", 1_234_567.4)).toBe("1.234.567");
   });
 });
 
@@ -80,15 +85,19 @@ describe("overview usage charts", () => {
     expect(await screen.findByRole("img", { name: "Daily Spend (USD) by model" })).toBeInTheDocument();
     const legend = screen.getByLabelText("Model legend");
     expect(within(legend).getByText("us.amazon.nova-micro-v1:0")).toBeInTheDocument();
-    expect(within(legend).getByText("$0.1500")).toBeInTheDocument();
-    expect(screen.getByText(/Range totals: \$0\.3500 · 7 requests/)).toBeInTheDocument();
+    expect(within(legend).getByText("$0,15")).toBeInTheDocument();
+    expect(screen.getByText(/Range totals: \$0,35 · 7 requests/)).toBeInTheDocument();
 
-    const topUsers = screen.getByLabelText("Top users by spend");
+    const topUsers = screen.getByLabelText("Top spenders");
     // Server-resolved names win; known users map from the local page; and
     // unknown ones fall back to the raw id.
     expect(within(topUsers).getByText("Grace Hopper (server)")).toBeInTheDocument();
     expect(within(topUsers).getByText("Ada Lovelace")).toBeInTheDocument();
     expect(within(topUsers).getByText("user-c")).toBeInTheDocument();
+    // Workloads are labelled so a top spender is never mistaken for a person.
+    expect(within(topUsers).getAllByText("workload")).toHaveLength(2);
+    expect(within(topUsers).getByText("payments")).toBeInTheDocument();
+    expect(within(topUsers).getByText("legacy")).toBeInTheDocument();
   });
 
   it("switches the charted metric and refetches when the range changes", async () => {

@@ -413,6 +413,29 @@ describe("paginated operational endpoints", () => {
     })).rejects.toMatchObject({ code: "invalid_response" });
   });
 
+  it("reads reconciliation runs with a bounded limit and rejects malformed comparisons", async () => {
+    const run = {
+      day: "2026-09-12",
+      run_at: "2026-09-14T06:00:00Z",
+      aggregate: { estimated_usd: 5, billed_usd: 5.5, delta_usd: 0.5, delta_percent: 9.1 },
+      workloads: [{ workload_id: "workload:p", name: "p", estimated_usd: 2, billed_usd: 0, delta_usd: -2, delta_percent: null, tag_inactive: true }],
+      tag_inactive_workloads: ["p"],
+    };
+    const okFetch = vi.fn().mockResolvedValue(jsonResponse({ enabled: true, lag_days: 2, runs: [run], latest: run }, 200));
+    const response = await api.reconciliation(cfg, sessionWith(okFetch), 7);
+    expect(new URL(okFetch.mock.calls[0][0] as string).search).toBe("?limit=7");
+    expect(response.latest?.workloads[0].tag_inactive).toBe(true);
+
+    const disabledFetch = vi.fn().mockResolvedValue(jsonResponse({ enabled: false, runs: [], message: "off" }, 200));
+    expect((await api.reconciliation(cfg, sessionWith(disabledFetch))).enabled).toBe(false);
+
+    const badFetch = vi.fn().mockResolvedValue(jsonResponse({
+      enabled: true,
+      runs: [{ ...run, aggregate: { estimated_usd: "5", billed_usd: 5.5, delta_usd: 0.5, delta_percent: 9.1 } }],
+    }, 200));
+    await expect(api.reconciliation(cfg, sessionWith(badFetch))).rejects.toMatchObject({ code: "invalid_response" });
+  });
+
   it("validates global and per-user audit snapshots without accepting cross-user events", async () => {
     const snapshot = {
       user_id: user.user_id,

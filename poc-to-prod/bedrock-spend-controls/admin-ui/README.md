@@ -111,6 +111,33 @@ npm test
 npm run build
 ```
 
+### Local preview without a backend
+
+`preview/` mounts the full authenticated dashboard against an in-memory fake
+broker (users, workloads, leases, audit, reconciliation, emergency stop), so a
+UI change can be reviewed in a browser without deploying or signing in:
+
+```bash
+npx vite --port 5179 --strictPort --host 127.0.0.1
+# then open http://127.0.0.1:5179/preview/index.html
+```
+
+Query switches: `?recon=on|tag|alarm|off|empty` selects the reconciliation
+scenario; the emergency-stop dialog accepts the key `break-glass`. Edits
+persist for the life of the page. The harness is outside `tsconfig`'s
+`include` and is never imported by `src/main.tsx`, so nothing from it reaches
+the production bundle; keep its fixtures in step with `src/api.ts` types when
+the API changes (it is type-checked only when you open it).
+
+### Number presentation
+
+All numbers use one fixed convention regardless of browser locale
+(`src/format.ts`): `.` groups thousands, `,` separates decimals, money always
+shows exactly two decimals (`$1.234,56`), integers none (`31.000.000`), token
+counts abbreviate from a thousand (`21,6M`). The ledger keeps micro-dollar
+precision; the console rounds sub-cent amounts to `$0,00`. Timestamps stay in
+the browser locale.
+
 `npx cdk deploy -c deployment_config=config/demo.json` uploads `dist/` and writes
 `config.js` with the generated public resource identifiers, including the
 Cognito managed-login origin. Callback (`/auth/callback`) and logout (`/`) URLs

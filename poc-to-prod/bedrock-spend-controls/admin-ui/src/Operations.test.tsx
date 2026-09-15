@@ -1,8 +1,8 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { EmergencyStopCard, EnforcementDialCard, OperationsView, leaseWindowLabel } from "./Operations";
-import { ApiError, api, type EnforcementConfig, type Operations } from "./api";
+import { EmergencyStopCard, EnforcementDialCard, OperationsView, SpendReconciliationCard, leaseWindowLabel, reconciliationTone } from "./Operations";
+import { ApiError, api, type EnforcementConfig, type Operations, type ReconciliationResponse } from "./api";
 import type { Session } from "./auth";
 import type { AdminConfig } from "./config";
 
@@ -291,6 +291,7 @@ describe("operations view", () => {
   // deterministic in every operations-view test.
   beforeEach(() => {
     vi.spyOn(api, "leaseSnapshot").mockResolvedValue({ users: [], next_cursor: null });
+    vi.spyOn(api, "reconciliation").mockResolvedValue({ enabled: false, runs: [], message: "off" });
   });
 
   it("renders controls, health cards, and alarms together", async () => {
@@ -379,5 +380,81 @@ describe("operations view", () => {
     expect(screen.getByText("Operations unavailable")).toBeInTheDocument();
     expect(await screen.findByRole("radiogroup", { name: "Permission lease window" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Activate emergency stop" })).toBeDisabled();
+  });
+});
+
+const reconciliationRun = {
+  day: "2026-09-12",
+  run_at: "2026-09-14T06:00:12Z",
+  region: "us-east-1",
+  aggregate: { estimated_usd: 5, billed_usd: 5.5, delta_usd: 0.5, delta_percent: 9.091 },
+  workloads: [
+    { workload_id: "workload:payments", name: "payments", estimated_usd: 2, billed_usd: 2.1, delta_usd: 0.1, delta_percent: 4.762, tag_inactive: false },
+  ],
+  tag_inactive_workloads: [],
+};
+
+describe("spend reconciliation card", () => {
+  it("says the feature is off instead of showing a zero delta", async () => {
+    vi.spyOn(api, "reconciliation").mockResolvedValue({ enabled: false, runs: [], message: "off" });
+    render(<SpendReconciliationCard alarmState={null} cfg={cfg} session={session} />);
+    expect(await screen.findByText("Disabled")).toBeInTheDocument();
+    expect(screen.getByText("Not compared")).toBeInTheDocument();
+    expect(screen.getByText(/reconciliation_enabled=true/)).toBeInTheDocument();
+    expect(screen.queryByText(/Ledger estimate/)).not.toBeInTheDocument();
+  });
+
+  it("renders the latest ledger-vs-bill comparison with a signed delta", async () => {
+    const response: ReconciliationResponse = {
+      enabled: true,
+      lag_days: 2,
+      runs: [reconciliationRun],
+      latest: reconciliationRun,
+    };
+    const get = vi.spyOn(api, "reconciliation").mockResolvedValue(response);
+    render(<SpendReconciliationCard alarmState="OK" cfg={cfg} session={session} />);
+    expect(await screen.findByText("Compared")).toBeInTheDocument();
+    expect(screen.getByText("2026-09-12 (D-2)")).toBeInTheDocument();
+    expect(screen.getByText("$5,00")).toBeInTheDocument();
+    expect(screen.getByText("$5,50")).toBeInTheDocument();
+    expect(screen.getByText("$0,50 · +9,09%")).toBeInTheDocument();
+    expect(screen.getByText("payments +4,76%")).toBeInTheDocument();
+    expect(get).toHaveBeenCalledWith(cfg, session, 14);
+  });
+
+  it("flags an inactive cost-allocation tag and an active drift alarm", async () => {
+    const inactive = {
+      ...reconciliationRun,
+      workloads: [{ ...reconciliationRun.workloads[0], billed_usd: 0, delta_usd: -2, delta_percent: null, tag_inactive: true }],
+      tag_inactive_workloads: ["payments"],
+    };
+    vi.spyOn(api, "reconciliation").mockResolvedValue({ enabled: true, lag_days: 2, runs: [inactive], latest: inactive });
+    render(<SpendReconciliationCard alarmState="ALARM" cfg={cfg} session={session} />);
+    expect(await screen.findByText("Tag inactive")).toBeInTheDocument();
+    expect(screen.getByText("Cost-allocation tag inactive: payments")).toBeInTheDocument();
+  });
+
+  it("shows an awaiting state before the first scheduled run and surfaces load errors", async () => {
+    vi.spyOn(api, "reconciliation").mockResolvedValueOnce({ enabled: true, lag_days: 2, runs: [], latest: null });
+    const { unmount } = render(<SpendReconciliationCard alarmState={null} cfg={cfg} session={session} />);
+    expect(await screen.findByText("No runs yet")).toBeInTheDocument();
+    expect(screen.getByText("Daily 06:00 UTC · compares day D-2")).toBeInTheDocument();
+    unmount();
+
+    vi.spyOn(api, "reconciliation").mockRejectedValueOnce(new ApiError("quota service down", 503, "service_unavailable"));
+    render(<SpendReconciliationCard alarmState={null} cfg={cfg} session={session} />);
+    expect(await screen.findByText("Unavailable")).toBeInTheDocument();
+    expect(screen.getByText(/temporarily unavailable/)).toBeInTheDocument();
+  });
+
+  it("derives the card tone from the latest run", () => {
+    expect(reconciliationTone(null, 10)).toBe("gray");
+    expect(reconciliationTone({ enabled: false, runs: [] }, 10)).toBe("gray");
+    expect(reconciliationTone({ enabled: true, runs: [reconciliationRun], latest: reconciliationRun }, 10)).toBe("green");
+    expect(reconciliationTone({ enabled: true, runs: [reconciliationRun], latest: reconciliationRun }, 5)).toBe("red");
+    const inactive = { ...reconciliationRun, tag_inactive_workloads: ["payments"] };
+    expect(reconciliationTone({ enabled: true, runs: [inactive], latest: inactive }, 10)).toBe("amber");
+    const noBill = { ...reconciliationRun, aggregate: { ...reconciliationRun.aggregate, delta_percent: null } };
+    expect(reconciliationTone({ enabled: true, runs: [noBill], latest: noBill }, 10)).toBe("gray");
   });
 });

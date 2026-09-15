@@ -17,6 +17,11 @@ from app.quota import MICRO, QuotaStore, current_window
 SECRET = "test-jwt-secret"  # nosec B105  # test-only HS256 key, matches conftest
 ADMIN = {"Authorization": "Bearer admin-secret"}
 EMERGENCY = {"X-Quota-Emergency-Key": "emergency-secret"}
+# What every period reports when no thresholds list has been configured.
+DEFAULT_THRESHOLDS = [
+    {"at": 0.8, "action": "warn"},
+    {"at": 1.0, "action": "block"},
+]
 
 
 def make_jwt(sub: str, **extra) -> str:
@@ -462,6 +467,9 @@ def test_admin_create_list_update_block_and_usage(client):
             "usd": 30.0,
             "input_tokens": 2_000_000,
             "output_tokens": 400_000,
+            # A period submitted without thresholds keeps the deployment
+            # default (warn at 80 %, block at 100 %).
+            "thresholds": DEFAULT_THRESHOLDS,
         },
         "weekly": None,
         "monthly": None,
@@ -845,12 +853,13 @@ def test_usage_metrics_aggregates_models_and_top_users(client, monkeypatch):
     assert nova["series"]["cost_usd"][-2] == 0.5
     assert sum(nova["series"]["requests"]) == 6.0
     # Top users are ordered by range cost; names resolve from the users
-    # table and deleted identities fall back to the raw key.
+    # table and deleted identities fall back to the raw key. Each entry
+    # says which control path it belongs to so the overview can label it.
     assert body["top_users"] == [
         {"user_id": "user-b", "name": "user-b", "cost_usd": 0.7,
-         "requests": 7},
+         "requests": 7, "granularity": "user"},
         {"user_id": "user-a", "name": "Ada Lovelace", "cost_usd": 0.05,
-         "requests": 1},
+         "requests": 1, "granularity": "user"},
     ]
     # One batched GetMetricData: totals + 2 models x 4 + 2 users x 2.
     queries = cloudwatch.metric_calls[0]["MetricDataQueries"]
@@ -1106,11 +1115,19 @@ def test_legacy_user_reads_as_version_zero_and_upgrades_on_first_mutation(client
     detail = api.get("/admin/users/legacy", headers=ADMIN)
     assert detail.status_code == 200
     assert detail.headers["etag"] == '"0"'
+    # A legacy row (no stored thresholds) reports the deployment default so
+    # its behaviour is unchanged.
     assert detail.json()["user"]["limits"] == {
-        "daily": {"usd": 1.0, "input_tokens": 100, "output_tokens": 50},
+        "daily": {
+            "usd": 1.0,
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "thresholds": DEFAULT_THRESHOLDS,
+        },
         "weekly": None,
         "monthly": None,
     }
+    assert detail.json()["user"]["rate"] is None
     assert detail.json()["user"]["version"] == 0
     assert detail.json()["user"]["created_at"] is None
     assert detail.json()["user"]["updated_at"] is None
@@ -2035,32 +2052,72 @@ def test_workload_namespace_cannot_vend_credentials(client):
     assert store.get_user("workload:payments") is None
 
 
-def test_workload_rows_carry_granularity_and_enforcement_ready(
-    client, monkeypatch
-):
+PAYMENTS_ROSTER_ENTRY = {
+    "name": "payments",
+    "model": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "profile_arn": (
+        "arn:aws:bedrock:us-east-1:123456789012:"
+        "application-inference-profile/abc123"
+    ),
+    "role_arn": "arn:aws:iam::123456789012:role/payments-batch",
+    "enforcement_ready": True,
+}
+REPORTS_ROSTER_ENTRY = {
+    "name": "reports",
+    "model": "us.amazon.nova-pro-v1:0",
+    "profile_arn": (
+        "arn:aws:bedrock:us-east-1:123456789012:"
+        "application-inference-profile/def456"
+    ),
+    "role_arn": "",
+    "enforcement_ready": False,
+}
+
+
+def _inline_roster(monkeypatch, roster: dict) -> None:
+    """Point the broker at an inline roster (no Parameter Store)."""
     from dataclasses import replace as dc_replace
 
-    api, store, _ = client
-    _seed_workload(store, "workload:payments")
-    _seed_workload(store, "workload:reports", name="reports")
+    monkeypatch.setattr(gateway, "_workload_roster_cache", None)
     monkeypatch.setattr(
         gateway,
         "settings",
         dc_replace(
             gateway.settings,
-            workload_enforcement_json=json.dumps(
-                {
-                    "workload:payments": {
-                        "name": "payments",
-                        "enforcement_ready": True,
-                    },
-                    "workload:reports": {
-                        "name": "reports",
-                        "enforcement_ready": False,
-                    },
-                }
-            ),
+            workload_roster_parameter_name="",
+            workload_roster_json=json.dumps(roster),
         ),
+    )
+
+
+class FakeSsm:
+    def __init__(self, value: str | None, error: str | None = None):
+        self.value = value
+        self.error = error
+        self.calls = 0
+
+    def get_parameter(self, Name: str):
+        self.calls += 1
+        if self.error:
+            raise ClientError(
+                {"Error": {"Code": self.error, "Message": Name}},
+                "GetParameter",
+            )
+        return {"Parameter": {"Name": Name, "Value": self.value}}
+
+
+def test_workload_rows_carry_granularity_and_enforcement_ready(
+    client, monkeypatch
+):
+    api, store, _ = client
+    _seed_workload(store, "workload:payments")
+    _seed_workload(store, "workload:reports", name="reports")
+    _inline_roster(
+        monkeypatch,
+        {
+            "workload:payments": PAYMENTS_ROSTER_ENTRY,
+            "workload:reports": REPORTS_ROSTER_ENTRY,
+        },
     )
 
     detail = api.get(
@@ -2072,6 +2129,18 @@ def test_workload_rows_carry_granularity_and_enforcement_ready(
     payload = detail.json()["user"]
     assert payload["granularity"] == "workload"
     assert payload["enforcement_ready"] is True
+    # The identity block is what lets the console present a workload as a
+    # workload: what it calls, through which profile, on which role.
+    assert payload["workload"] == {
+        "workload_id": "workload:payments",
+        "name": "payments",
+        "model": PAYMENTS_ROSTER_ENTRY["model"],
+        "profile_arn": PAYMENTS_ROSTER_ENTRY["profile_arn"],
+        "role_arn": PAYMENTS_ROSTER_ENTRY["role_arn"],
+        "enforcement_ready": True,
+        "registered": True,
+        "tag": {"key": "bedrock-spend-controls-workload", "value": "payments"},
+    }
 
     reports = api.get(
         "/admin/user",
@@ -2079,6 +2148,204 @@ def test_workload_rows_carry_granularity_and_enforcement_ready(
         headers={"X-Quota-Admin-Key": "admin-secret"},
     ).json()["user"]
     assert reports["enforcement_ready"] is False
+    assert reports["workload"]["role_arn"] is None
+    assert reports["workload"]["registered"] is True
+
+
+def test_workload_roster_is_read_from_parameter_store_and_cached(
+    client, monkeypatch
+):
+    from dataclasses import replace as dc_replace
+
+    api, store, _ = client
+    _seed_workload(store, "workload:payments")
+    ssm = FakeSsm(json.dumps({"workload:payments": PAYMENTS_ROSTER_ENTRY}))
+    monkeypatch.setattr(gateway, "_ssm", ssm)
+    monkeypatch.setattr(gateway, "_workload_roster_cache", None)
+    monkeypatch.setattr(
+        gateway,
+        "settings",
+        dc_replace(
+            gateway.settings,
+            workload_roster_parameter_name="/spend-controls/workloads",
+            # The inline fallback must NOT win when a parameter is named.
+            workload_roster_json=json.dumps(
+                {"workload:payments": {**PAYMENTS_ROSTER_ENTRY,
+                                       "enforcement_ready": False}}
+            ),
+        ),
+    )
+
+    first = api.get(
+        "/admin/user",
+        params={"user_id": "workload:payments"},
+        headers=ADMIN,
+    ).json()["user"]
+    second = api.get(
+        "/admin/user",
+        params={"user_id": "workload:payments"},
+        headers=ADMIN,
+    ).json()["user"]
+
+    assert first["enforcement_ready"] is True
+    assert first["workload"]["profile_arn"] == PAYMENTS_ROSTER_ENTRY["profile_arn"]
+    assert second == first
+    # One GetParameter for both requests: the roster is deploy-time static.
+    assert ssm.calls == 1
+
+
+def test_workload_roster_falls_back_when_parameter_store_is_unreadable(
+    client, monkeypatch
+):
+    from dataclasses import replace as dc_replace
+
+    api, store, _ = client
+    _seed_workload(store, "workload:payments")
+    monkeypatch.setattr(gateway, "_ssm", FakeSsm(None, error="AccessDenied"))
+    monkeypatch.setattr(gateway, "_workload_roster_cache", None)
+    monkeypatch.setattr(
+        gateway,
+        "settings",
+        dc_replace(
+            gateway.settings,
+            workload_roster_parameter_name="/spend-controls/workloads",
+            workload_roster_json=json.dumps(
+                {"workload:payments": PAYMENTS_ROSTER_ENTRY}
+            ),
+        ),
+    )
+
+    detail = api.get(
+        "/admin/user",
+        params={"user_id": "workload:payments"},
+        headers=ADMIN,
+    )
+
+    # Degraded, not broken: the inline copy answers and the row still reads
+    # as a workload.
+    assert detail.status_code == 200
+    assert detail.json()["user"]["workload"]["registered"] is True
+    workloads = api.get("/admin/workloads", headers=ADMIN).json()
+    assert workloads["roster_source"] == "fallback"
+
+
+def test_admin_workloads_joins_roster_with_metered_rows(client, monkeypatch):
+    api, store, _ = client
+    # payments has metered; reports is configured but silent since deploy;
+    # legacy metered once but was removed from the config.
+    _seed_workload(store, "workload:payments")
+    _seed_workload(store, "workload:legacy", name="legacy")
+    store.put_user("alice", "alice", 1.0, 0, 0)
+    _inline_roster(
+        monkeypatch,
+        {
+            "workload:payments": PAYMENTS_ROSTER_ENTRY,
+            "workload:reports": REPORTS_ROSTER_ENTRY,
+        },
+    )
+
+    assert api.get("/admin/workloads").status_code == 403
+    response = api.get("/admin/workloads", headers=ADMIN)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["tag_key"] == "bedrock-spend-controls-workload"
+    assert body["roster_source"] == "environment"
+    by_id = {entry["workload_id"]: entry for entry in body["workloads"]}
+    # JWT users never appear here.
+    assert set(by_id) == {
+        "workload:payments", "workload:reports", "workload:legacy"
+    }
+    payments = by_id["workload:payments"]
+    assert payments["registered"] is True
+    assert payments["enforcement_ready"] is True
+    assert payments["subject"]["user_id"] == "workload:payments"
+    assert payments["subject"]["granularity"] == "workload"
+    assert payments["subject"]["today"]["requests"] == 0
+    assert "current_usage" in payments["subject"]
+    reports = by_id["workload:reports"]
+    assert reports["registered"] is True
+    assert reports["enforcement_ready"] is False
+    assert reports["model"] == "us.amazon.nova-pro-v1:0"
+    assert reports["subject"] is None  # no row until first invocation
+    legacy = by_id["workload:legacy"]
+    assert legacy["registered"] is False
+    assert legacy["enforcement_ready"] is False
+    assert legacy["model"] is None
+    assert legacy["subject"]["name"] == "legacy"
+
+
+def test_summary_splits_subjects_by_control_path(client, monkeypatch):
+    api, store, _ = client
+    store.put_user("alice", "alice", 1.0, 0, 0)
+    store.put_user("bob", "bob", 1.0, 0, 0)
+    store.set_user_status("bob", "blocked", "manual")
+    _seed_workload(store, "workload:payments")
+    _seed_workload(store, "workload:reports", name="reports")
+    _seed_workload(store, "workload:legacy", name="legacy")
+    store.set_user_status("workload:reports", "blocked", "auto: daily")
+    _inline_roster(
+        monkeypatch,
+        {
+            "workload:payments": PAYMENTS_ROSTER_ENTRY,
+            "workload:reports": REPORTS_ROSTER_ENTRY,
+            "workload:silent": {**REPORTS_ROSTER_ENTRY, "name": "silent"},
+        },
+    )
+    today = current_window()
+    for subject, cost_usd, requests in (
+        ("alice", 0.25, 2),
+        ("workload:payments", 4.0, 40),
+    ):
+        store._usage.put_item(  # noqa: SLF001
+            Item={
+                "user_id": subject,
+                "window": today,
+                "cost_micro": int(cost_usd * MICRO),
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "requests": requests,
+            }
+        )
+
+    enforcement = api.get("/admin/summary", headers=ADMIN).json()[
+        "enforcement"
+    ]
+
+    # All-subject figures are unchanged for existing consumers.
+    assert enforcement["total_users"] == 5
+    assert enforcement["blocked_users"] == 2
+    assert enforcement["today"]["cost_usd"] == 4.25
+    subjects = enforcement["subjects"]
+    assert subjects["users"] == {
+        "total": 2,
+        "blocked": 1,
+        "today": {"cost_usd": 0.25, "input_tokens": 0,
+                  "output_tokens": 0, "requests": 2},
+    }
+    workloads = subjects["workloads"]
+    assert workloads["total"] == 3
+    assert workloads["blocked"] == 1
+    assert workloads["configured"] == 3
+    assert workloads["metering_only"] == 1  # reports: no role
+    assert workloads["unregistered"] == 1  # legacy: row, no roster entry
+    assert workloads["awaiting_traffic"] == 1  # silent: roster, no row
+    assert workloads["today"]["cost_usd"] == 4.0
+    assert workloads["today"]["requests"] == 40
+
+
+def test_admin_cannot_hand_create_a_workload_row(client):
+    api, store, _ = client
+
+    response = api.post(
+        "/admin/users",
+        json={"user_id": "workload:rogue", "name": "rogue"},
+        headers=ADMIN,
+    )
+
+    assert response.status_code == 400
+    assert "workloads.json" in response.json()["error"]["message"]
+    assert store.get_user("workload:rogue") is None
 
 
 def test_workload_missing_from_registry_reports_not_ready(client):
@@ -2522,3 +2789,531 @@ def test_unblock_at_vend_rewrites_the_revocation_sentinel(
         "Item"
     )
     assert sentinel["desired_status"] == "active"
+
+
+# ---------------------------------------------------------------------------
+# Thresholds list, alert-only budgets, and rpm/tpm through the admin API
+# ---------------------------------------------------------------------------
+
+
+def test_admin_api_round_trips_thresholds_and_rate(client):
+    api, store, _ = client
+    created = api.post(
+        "/admin/users",
+        json={
+            "user_id": "alice",
+            "limits": {
+                "daily": {
+                    "usd": 10,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "thresholds": [
+                        {"at": 0.5, "action": "warn"},
+                        {"at": 0.9, "action": "warn"},
+                        {"at": 1.25, "action": "block"},
+                    ],
+                },
+                "weekly": {
+                    "usd": 40,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "thresholds": [{"at": 1.0, "action": "warn"}],
+                },
+                "monthly": None,
+            },
+            "rate": {"rpm": 60, "tpm": 100_000},
+        },
+        headers={**ADMIN, "Idempotency-Key": "create-thresholds"},
+    )
+    assert created.status_code == 200, created.text
+    body = created.json()["user"]
+    assert body["limits"]["daily"]["thresholds"] == [
+        {"at": 0.5, "action": "warn"},
+        {"at": 0.9, "action": "warn"},
+        {"at": 1.25, "action": "block"},
+    ]
+    assert body["limits"]["weekly"]["thresholds"] == [
+        {"at": 1.0, "action": "warn"}
+    ]
+    assert body["rate"] == {"rpm": 60, "tpm": 100_000}
+    assert store.get_user("alice").rpm == 60
+
+    # Re-submitting a period WITHOUT thresholds keeps the stored list.
+    updated = api.put(
+        "/admin/user/limits",
+        params={"user_id": "alice"},
+        json={"limits": {"daily": {"usd": 20, "input_tokens": 0, "output_tokens": 0}}},
+        headers={**ADMIN, "If-Match": '"1"', "Idempotency-Key": "keep-thresholds"},
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["limits"]["daily"]["usd"] == 20.0
+    assert updated.json()["limits"]["daily"]["thresholds"][2]["at"] == 1.25
+    assert updated.json()["user"]["rate"] == {"rpm": 60, "tpm": 100_000}
+
+    # A rate-only update is a valid mutation; null disables both.
+    dropped = api.put(
+        "/admin/user/limits",
+        params={"user_id": "alice"},
+        json={"rate": None, "reason": "remove rate limits"},
+        headers={**ADMIN, "If-Match": '"2"', "Idempotency-Key": "drop-rate"},
+    )
+    assert dropped.status_code == 200, dropped.text
+    assert dropped.json()["user"]["rate"] is None
+    assert dropped.json()["user"]["version"] == 3
+    events, _ = store.list_admin_audit_page(user_id="alice", limit=10)
+    assert events[0]["after"]["rate"] == {"rpm": 0, "tpm": 0}
+    assert events[0]["before"]["rate"] == {"rpm": 60, "tpm": 100_000}
+
+
+@pytest.mark.parametrize(
+    ("thresholds", "message"),
+    [
+        (
+            [{"at": 0.8, "action": "block"}, {"at": 1.0, "action": "block"}],
+            "block' entry must be the last",
+        ),
+        (
+            [{"at": 1.0, "action": "block"}, {"at": 1.5, "action": "warn"}],
+            "block' entry must be the last",
+        ),
+        (
+            [{"at": 0.8, "action": "warn"}, {"at": 0.8, "action": "block"}],
+            "strictly increasing",
+        ),
+        (
+            [{"at": 0.9, "action": "warn"}, {"at": 0.5, "action": "warn"}],
+            "strictly increasing",
+        ),
+        ([{"at": 0, "action": "warn"}], "greater than 0"),
+        ([{"at": 11, "action": "block"}], "at most 10"),
+        ([{"at": 0.5, "action": "notify"}], "action must be one of"),
+        ([], "non-empty list"),
+        ([{"at": 0.5}], "action must be one of"),
+        ([{"at": 0.5, "action": "warn", "extra": 1}], "unknown keys"),
+    ],
+)
+def test_admin_api_rejects_invalid_thresholds(client, thresholds, message):
+    api, store, _ = client
+    store.put_user("alice", "Alice", 1, 100, 50)
+    response = api.put(
+        "/admin/user/limits",
+        params={"user_id": "alice"},
+        json={
+            "limits": {
+                "daily": {
+                    "usd": 1,
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "thresholds": thresholds,
+                }
+            }
+        },
+        headers=ADMIN,
+    )
+    assert response.status_code == 400
+    assert message in response.json()["error"]["message"]
+
+
+@pytest.mark.parametrize(
+    "rate",
+    [{"rpm": -1}, {"rpm": 1.5}, {"rpm": True}, {"rps": 1}, "fast", {"rpm": "6"}],
+)
+def test_admin_api_rejects_invalid_rate(client, rate):
+    api, store, _ = client
+    store.put_user("alice", "Alice", 1, 100, 50)
+    response = api.put(
+        "/admin/user/limits",
+        params={"user_id": "alice"},
+        json={"rate": rate},
+        headers=ADMIN,
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_alert_only_budget_vends_far_over_limit(client):
+    api, store, _ = client
+    store.put_user(
+        "alice",
+        "Alice",
+        limits={
+            "daily": {
+                "usd": 1,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "thresholds": [{"at": 1.0, "action": "warn"}],
+            },
+            "weekly": None,
+            "monthly": None,
+        },
+    )
+    store._usage.put_item(  # noqa: SLF001
+        Item={"user_id": "alice", "window": current_window(), "cost_micro": 40 * MICRO}
+    )
+    vend = _vend(api, make_jwt("alice"))
+    assert vend.status_code == 200, vend.text
+    assert store.get_user("alice").status == "active"
+
+
+def test_block_threshold_above_limit_is_honoured_at_vend(client):
+    api, store, _ = client
+    store.put_user(
+        "alice",
+        "Alice",
+        limits={
+            "daily": {
+                "usd": 1,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "thresholds": [{"at": 1.5, "action": "block"}],
+            },
+            "weekly": None,
+            "monthly": None,
+        },
+    )
+    store._usage.put_item(  # noqa: SLF001
+        Item={"user_id": "alice", "window": current_window(), "cost_micro": int(1.4 * MICRO)}
+    )
+    assert _vend(api, make_jwt("alice")).status_code == 200
+    store._usage.put_item(  # noqa: SLF001
+        Item={"user_id": "alice", "window": current_window(), "cost_micro": int(1.5 * MICRO)}
+    )
+    blocked = _vend(api, make_jwt("alice"))
+    assert blocked.status_code == 429
+    assert blocked.headers["x-quota-breached-period"] == "daily"
+    assert "at 150%" in store.get_user("alice").status_reason
+
+
+def test_rate_limited_subject_is_refused_at_vend_and_recovers_next_minute(client):
+    api, store, _ = client
+    store.put_user(
+        "alice",
+        "Alice",
+        limits={
+            "daily": {"usd": 100, "input_tokens": 0, "output_tokens": 0},
+            "weekly": None,
+            "monthly": None,
+            "rate": {"rpm": 5, "tpm": 0},
+        },
+    )
+    now = datetime.now(timezone.utc)
+    minute = now.strftime("%Y-%m-%dT%H:%M")
+    store._usage.put_item(  # noqa: SLF001 - what the metering processor writes
+        Item={"user_id": "RATE#alice", "window": minute, "requests": 5, "tokens": 10}
+    )
+    blocked = _vend(api, make_jwt("alice"))
+    assert blocked.status_code == 429
+    assert blocked.headers["x-quota-breached-period"] == "minute"
+    assert blocked.headers["x-quota-breached-dimension"] == "rpm"
+    user = store.get_user("alice")
+    assert user.status == "blocked"
+    assert user.status_origin == "automatic"
+    assert user.status_reason.startswith("auto: rpm rate limit reached")
+
+    # Pretend the minute has rolled: the counter row for "now" is gone.
+    store._usage.items.pop(("RATE#alice", minute))  # noqa: SLF001
+    recovered = _vend(api, make_jwt("alice"))
+    assert recovered.status_code == 200, recovered.text
+    assert store.get_user("alice").status == "active"
+
+
+# ---------------------------------------------------------------------------
+# Per-model budgets through the admin API
+# ---------------------------------------------------------------------------
+
+
+def _opus_budget(usd: float = 2.0) -> dict:
+    return {
+        "limits": {
+            "daily": {"usd": usd, "input_tokens": 0, "output_tokens": 0},
+            "weekly": None,
+            "monthly": None,
+        }
+    }
+
+
+def test_model_budget_crud_with_reason_idempotency_and_etag(client):
+    api, store, _ = client
+    store.put_user("alice", "Alice", 100, 0, 0)
+
+    created = api.put(
+        "/admin/user/model-budget",
+        params={"user_id": "alice", "model_id": "anthropic.claude-opus-4-7"},
+        json={**_opus_budget(2), "reason": "  Opus is expensive  "},
+        headers={**ADMIN, "If-Match": '"1"', "Idempotency-Key": "opus-1"},
+    )
+    assert created.status_code == 200, created.text
+    assert created.headers["etag"] == '"2"'
+    body = created.json()
+    assert body["updated"] is True
+    assert body["model_id"] == "anthropic.claude-opus-4-7"
+    assert body["model_budgets"]["anthropic.claude-opus-4-7"]["daily"] == {
+        "usd": 2.0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "thresholds": DEFAULT_THRESHOLDS,
+    }
+    assert body["user"]["model_budgets"] == body["model_budgets"]
+    assert body["user"]["limits"]["daily"]["usd"] == 100.0  # untouched
+
+    # Exact replay is stable; changed content under the same key conflicts.
+    replay = api.put(
+        "/admin/user/model-budget",
+        params={"user_id": "alice", "model_id": "anthropic.claude-opus-4-7"},
+        json={**_opus_budget(2), "reason": "Opus is expensive"},
+        headers={**ADMIN, "If-Match": '"1"', "Idempotency-Key": "opus-1"},
+    )
+    assert replay.status_code == 200 and replay.json() == body
+    mismatch = api.put(
+        "/admin/user/model-budget",
+        params={"user_id": "alice", "model_id": "anthropic.claude-opus-4-7"},
+        json={**_opus_budget(3), "reason": "Opus is expensive"},
+        headers={**ADMIN, "If-Match": '"1"', "Idempotency-Key": "opus-1"},
+    )
+    assert mismatch.status_code == 409
+    assert mismatch.json()["error"]["type"] == "idempotency_conflict"
+
+    # Stale If-Match.
+    stale = api.put(
+        "/admin/user/model-budget",
+        params={"user_id": "alice", "model_id": "anthropic.claude-opus-4-7"},
+        json=_opus_budget(5),
+        headers={**ADMIN, "If-Match": '"1"', "Idempotency-Key": "opus-stale"},
+    )
+    assert stale.status_code == 409
+    assert stale.json()["error"]["type"] == "version_conflict"
+    assert stale.headers["etag"] == '"2"'
+
+    # Detail shows the budget; the audit trail has before/after with budgets.
+    detail = api.get("/admin/user", params={"user_id": "alice"}, headers=ADMIN)
+    assert "anthropic.claude-opus-4-7" in detail.json()["user"]["model_budgets"]
+    events, _ = store.list_admin_audit_page(user_id="alice", limit=10)
+    assert events[0]["event_type"] == "user.model_budget.updated"
+    assert events[0]["reason"] == "Opus is expensive"
+
+    # Second model budget, then per-model usage endpoint.
+    second = api.put(
+        "/admin/user/model-budget",
+        params={"user_id": "alice", "model_id": "openai.gpt-oss-20b"},
+        json=_opus_budget(1),
+        headers={**ADMIN, "If-Match": '"2"', "Idempotency-Key": "gpt-1"},
+    )
+    assert second.status_code == 200
+    assert sorted(second.json()["model_budgets"]) == [
+        "anthropic.claude-opus-4-7",
+        "openai.gpt-oss-20b",
+    ]
+    store._usage.put_item(  # noqa: SLF001 - what the processor writes
+        Item={"user_id": "alice#model#openai.gpt-oss-20b",
+              "window": current_window(), "cost_micro": 250_000, "requests": 3}
+    )
+    usage = api.get(
+        "/admin/user/model-usage",
+        params={"user_id": "alice", "model_id": "openai.gpt-oss-20b"},
+        headers=ADMIN,
+    )
+    assert usage.status_code == 200
+    assert usage.json()["current_usage"]["daily"]["cost_usd"] == 0.25
+    assert usage.json()["current_usage"]["daily"]["requests"] == 3
+
+    # Remove one; the other remains.
+    removed = api.delete(
+        "/admin/user/model-budget",
+        params={"user_id": "alice", "model_id": "anthropic.claude-opus-4-7"},
+        headers={**ADMIN, "If-Match": '"3"', "Idempotency-Key": "opus-rm"},
+    )
+    assert removed.status_code == 200, removed.text
+    assert removed.json()["removed"] is True
+    assert list(removed.json()["model_budgets"]) == ["openai.gpt-oss-20b"]
+    missing = api.delete(
+        "/admin/user/model-budget",
+        params={"user_id": "alice", "model_id": "anthropic.claude-opus-4-7"},
+        headers={**ADMIN, "If-Match": '"4"', "Idempotency-Key": "opus-rm-2"},
+    )
+    assert missing.status_code == 404
+
+
+def test_model_budget_rejects_models_outside_the_allowlist(client, monkeypatch):
+    api, store, _ = client
+    from dataclasses import replace as dc_replace
+
+    monkeypatch.setattr(
+        gateway,
+        "settings",
+        dc_replace(
+            gateway.settings,
+            allowed_model_arns_json=json.dumps([
+                "arn:aws:bedrock:us-east-1::foundation-model/openai.gpt-oss-20b",
+                "arn:aws:bedrock:us-east-1:111122223333:inference-profile/us.anthropic.claude-opus-4-7",
+                "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-*",
+            ]),
+        ),
+    )
+    store.put_user("alice", "Alice", 100, 0, 0)
+
+    denied = api.put(
+        "/admin/user/model-budget",
+        params={"user_id": "alice", "model_id": "meta.llama3-3-70b-instruct-v1:0"},
+        json=_opus_budget(),
+        headers={**ADMIN, "Idempotency-Key": "llama"},
+    )
+    assert denied.status_code == 400
+    assert "allowed_model_arns" in denied.json()["error"]["message"]
+
+    for allowed in ("openai.gpt-oss-20b", "us.anthropic.claude-opus-4-7", "amazon.nova-lite-v1:0"):
+        response = api.put(
+            "/admin/user/model-budget",
+            params={"user_id": "alice", "model_id": allowed},
+            json=_opus_budget(),
+            headers={**ADMIN, "Idempotency-Key": f"ok-{allowed}"},
+        )
+        assert response.status_code == 200, (allowed, response.text)
+
+
+@pytest.mark.parametrize(
+    ("model_id", "body", "message"),
+    [
+        ("arn:aws:bedrock:us-east-1::foundation-model/x", _opus_budget(), "not an ARN"),
+        ("a#model#b", _opus_budget(), "reserved"),
+        ("", _opus_budget(), "non-empty"),
+        ("opus", {"limits": {"daily": None, "weekly": None, "monthly": None}}, "at least one quota period"),
+        ("opus", {"limits": {"daily": {"usd": 1, "input_tokens": 0, "output_tokens": 0}, "rate": {"rpm": 1}}}, "rate limits"),
+        ("opus", {}, "limits is required"),
+    ],
+)
+def test_model_budget_validation(client, model_id, body, message):
+    api, store, _ = client
+    store.put_user("alice", "Alice", 100, 0, 0)
+    response = api.put(
+        "/admin/user/model-budget",
+        params={"user_id": "alice", "model_id": model_id},
+        json=body,
+        headers=ADMIN,
+    )
+    assert response.status_code == 400, response.text
+    assert message in response.json()["error"]["message"]
+
+
+def test_model_budget_below_current_model_usage_blocks_immediately_and_lifts_on_removal(client):
+    api, store, _ = client
+    store.put_user("alice", "Alice", 100, 0, 0)
+    store._usage.put_item(  # noqa: SLF001
+        Item={"user_id": "alice#model#opus", "window": current_window(), "cost_micro": 5 * MICRO}
+    )
+    store._usage.put_item(  # noqa: SLF001
+        Item={"user_id": "alice", "window": current_window(), "cost_micro": 5 * MICRO}
+    )
+    blocked = api.put(
+        "/admin/user/model-budget",
+        params={"user_id": "alice", "model_id": "opus"},
+        json={**_opus_budget(2), "reason": "clamp opus"},
+        headers={**ADMIN, "If-Match": '"1"', "Idempotency-Key": "clamp"},
+    )
+    assert blocked.status_code == 200, blocked.text
+    user = blocked.json()["user"]
+    assert user["status"] == "blocked"
+    assert user["status_origin"] == "automatic"
+    assert "for model opus" in user["status_reason"]
+    assert _vend(api, make_jwt("alice")).status_code == 403
+
+    lifted = api.request(
+        "DELETE",
+        "/admin/user/model-budget",
+        params={"user_id": "alice", "model_id": "opus"},
+        json={"reason": "lift the clamp"},
+        headers={**ADMIN, "If-Match": '"2"', "Idempotency-Key": "unclamp"},
+    )
+    assert lifted.status_code == 200, lifted.text
+    assert lifted.json()["user"]["status"] == "active"
+    assert _vend(api, make_jwt("alice")).status_code == 200
+
+
+def test_vend_preflight_ignores_model_budgets_by_design(client):
+    """At vend time the model is unknown, so pre-flight is subject-level.
+    A subject whose model budget is NOT yet breached vends normally even
+    when a model ledger is close to its cap."""
+    api, store, _ = client
+    store.put_user("alice", "Alice", 100, 0, 0)
+    store.update_admin_model_budget(
+        "alice", "opus", _opus_budget(2)["limits"], reason="cap",
+        expected_version=1, actor="admin", auth_method="shared-key",
+        idempotency_key="cap", request_hash="h",
+    )
+    store._usage.put_item(  # noqa: SLF001 - 99 % of the opus budget
+        Item={"user_id": "alice#model#opus", "window": current_window(), "cost_micro": 1_980_000}
+    )
+    vend = _vend(api, make_jwt("alice"))
+    assert vend.status_code == 200
+    assert "X-Quota-Breached-Period" not in vend.headers
+
+
+def test_reconciliation_disabled_returns_explicit_payload(client, monkeypatch):
+    api, _, _ = client
+    monkeypatch.setattr(
+        gateway, "settings", replace(gateway.settings, reconciliation_enabled=False)
+    )
+    response = api.get("/admin/reconciliation", headers=ADMIN)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["enabled"] is False
+    assert body["runs"] == []
+    assert "reconciliation_enabled=true" in body["message"]
+
+
+def test_reconciliation_requires_admin(client):
+    api, _, _ = client
+    assert api.get("/admin/reconciliation").status_code == 403
+
+
+def test_reconciliation_lists_stored_runs_newest_first(client, monkeypatch):
+    """The broker serves stored RECONCILE# rows and never calls Cost Explorer;
+    ordinary ledger rows sharing the usage table are ignored."""
+    api, store, _ = client
+    monkeypatch.setattr(
+        gateway,
+        "settings",
+        replace(gateway.settings, reconciliation_enabled=True, reconcile_lag_days=2),
+    )
+    from decimal import Decimal
+
+    for day, billed in (("2026-09-10", "1.5"), ("2026-09-12", "3.25"), ("2026-09-11", "2")):
+        store._usage.put_item(  # noqa: SLF001
+            Item={
+                "user_id": f"RECONCILE#{day}",
+                "window": day,
+                "run_at": f"{day}T06:00:00+00:00",
+                "result": {
+                    "day": day,
+                    "aggregate": {
+                        "estimated_usd": Decimal("1"),
+                        "billed_usd": Decimal(billed),
+                        "delta_usd": Decimal(billed) - 1,
+                        "delta_percent": Decimal("10.5"),
+                    },
+                    "workloads": [
+                        {"name": "payments", "tag_inactive": True, "billed_usd": Decimal("0")}
+                    ],
+                    "tag_inactive_workloads": ["payments"],
+                },
+                "expires_at": 4_000_000_000,
+            }
+        )
+    store._usage.put_item(  # noqa: SLF001 - normal ledger row, must not leak in
+        Item={"user_id": "alice", "window": "2026-09-12", "cost_micro": 5}
+    )
+
+    response = api.get("/admin/reconciliation", headers=ADMIN, params={"limit": 2})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["enabled"] is True
+    assert body["lag_days"] == 2
+    assert [run["day"] for run in body["runs"]] == ["2026-09-12", "2026-09-11"]
+    latest = body["latest"]
+    assert latest["day"] == "2026-09-12"
+    assert latest["run_at"] == "2026-09-12T06:00:00+00:00"
+    # Decimals are rendered as JSON numbers, ints stay ints.
+    assert latest["aggregate"]["billed_usd"] == 3.25
+    assert latest["aggregate"]["estimated_usd"] == 1
+    assert latest["aggregate"]["delta_percent"] == 10.5
+    assert latest["tag_inactive_workloads"] == ["payments"]
+    assert latest["workloads"][0]["tag_inactive"] is True

@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "quota_periods_layer" / "python"))
 sys.path.insert(0, str(ROOT / "gateway"))
 sys.path.insert(0, str(ROOT / "usage_processor"))
+sys.path.insert(0, str(ROOT))
 
 os.environ.setdefault("AWS_REGION", "us-east-1")
 os.environ.setdefault("USERS_TABLE", "users-test")
@@ -28,6 +29,43 @@ os.environ.setdefault("ADMIN_AUDIT_TABLE", "admin-audit-test")
 os.environ.setdefault("JWT_SHARED_SECRET", "test-jwt-secret")
 
 from botocore.exceptions import ClientError  # noqa: E402
+
+
+def _boto_condition_ok(condition, item: dict) -> bool:
+    """Evaluate the small subset of boto3.dynamodb.conditions the app uses in
+    scan FilterExpressions: Attr(x).eq(v), .gt(v), .gte(v), .exists(),
+    Key(x).begins_with(v), and And/Or combinations."""
+    from boto3.dynamodb.conditions import (
+        And,
+        AttributeExists,
+        BeginsWith,
+        Equals,
+        GreaterThan,
+        GreaterThanEquals,
+        Or,
+    )
+
+    if isinstance(condition, And):
+        return all(_boto_condition_ok(part, item) for part in condition._values)
+    if isinstance(condition, Or):
+        return any(_boto_condition_ok(part, item) for part in condition._values)
+    attribute = condition._values[0].name
+    present = attribute in item
+    if isinstance(condition, AttributeExists):
+        return present
+    if not present:
+        return False
+    value = item[attribute]
+    operand = condition._values[1]
+    if isinstance(condition, Equals):
+        return value == operand
+    if isinstance(condition, GreaterThan):
+        return value > operand
+    if isinstance(condition, GreaterThanEquals):
+        return value >= operand
+    if isinstance(condition, BeginsWith):
+        return str(value).startswith(str(operand))
+    raise AssertionError(f"unsupported FilterExpression in fake: {condition}")
 
 
 class FakeTable:
@@ -76,6 +114,9 @@ class FakeTable:
         # deterministic (real DynamoDB order is unspecified, but tests need a
         # fixed one). Only the subset of the scan API the app uses.
         ordered = [dict(v) for _, v in sorted(self.items.items())]
+        condition = kwargs.get("FilterExpression")
+        if condition is not None:
+            ordered = [item for item in ordered if _boto_condition_ok(condition, item)]
         start = 0
         exclusive = kwargs.get("ExclusiveStartKey")
         if exclusive:
@@ -315,7 +356,14 @@ class FakeTable:
         if "ADD" in sections:
             for part in self._split_top_level(sections["ADD"]):
                 attr, placeholder = part.split()
-                item[attr] = int(item.get(attr, 0)) + int(values[placeholder])
+                addend = values[placeholder]
+                if isinstance(addend, (set, frozenset, list)):
+                    # DynamoDB set semantics: ADD unions the members.
+                    current = item.get(attr)
+                    current = set(current) if isinstance(current, (set, list)) else set()
+                    item[attr] = current | set(addend)
+                else:
+                    item[attr] = int(item.get(attr, 0)) + int(addend)
         if "REMOVE" in sections:
             for part in self._split_top_level(sections["REMOVE"]):
                 item.pop(names.get(part.strip(), part.strip()), None)

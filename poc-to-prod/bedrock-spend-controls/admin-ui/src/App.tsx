@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import {
   AlertCircle,
+  Boxes,
   Check,
   ChevronDown,
   CircleDollarSign,
   Gauge,
+  Info,
   Layers3,
   Lock,
   LogOut,
@@ -23,32 +25,41 @@ import { loadConfig, type AdminConfig } from "./config";
 import { beginSignIn, handleAuthCallback, type Session } from "./auth";
 import {
   ApiError,
+  DEFAULT_THRESHOLDS,
   api,
   apiErrorMessage,
   isAdminUser,
+  isAlertOnly,
+  isWorkload,
+  thresholdsError,
   type AdminUser,
   type CurrentUsage,
   type Operations,
   type QuotaLimits,
   type QuotaPeriod,
+  type QuotaThreshold,
+  type RateLimits,
   type SetLimitsRequest,
   type Summary,
+  type ThresholdAction,
   type TransportResponse,
   type UserRow,
   type UserStatus,
+  type WorkloadEntry,
 } from "./api";
-import { CreateUserWizard, GlobalAuditView, UserDetailDrawer } from "./OperationalUi";
+import { formatCompact, formatNumber, formatUsd } from "./format";
+import { CreateUserWizard, GlobalAuditView, UserDetailDrawer, workloadEnforcementLabel } from "./OperationalUi";
 import { OverviewCharts } from "./OverviewCharts";
 import { OperationsView } from "./Operations";
 import { useModalLifecycle } from "./modal";
 
-export type UserFilter = "all" | "active" | "blocked" | "users" | "workloads";
-export type DashboardView = "overview" | "users" | "operations" | "audit";
+export type UserFilter = "all" | "active" | "blocked";
+export type DashboardView = "overview" | "users" | "workloads" | "operations" | "audit";
 
+/** The Users tab lists JWT identities only; workload rows never match. */
 export function matchesUserFilter(user: AdminUser, filter: UserFilter): boolean {
+  if (isWorkload(user)) return false;
   if (filter === "active" || filter === "blocked") return user.status === filter;
-  if (filter === "workloads") return user.user_id.startsWith("workload:");
-  if (filter === "users") return !user.user_id.startsWith("workload:");
   return true;
 }
 const USER_PAGE_SIZE = 25;
@@ -95,6 +106,17 @@ export function mergeRefreshedUsers(current: UserRow[], refreshed: UserRow[]): U
     return cached && cached.version > user.version
       ? { ...cached, today: user.today, current_usage: user.current_usage }
       : user;
+  });
+}
+
+/** Same last-writer-wins rule as users, applied to the metered subject row
+ *  inside each roster entry. Roster identity always comes from the server. */
+export function mergeRefreshedWorkloads(current: WorkloadEntry[], refreshed: WorkloadEntry[]): WorkloadEntry[] {
+  const currentById = new Map(current.map((entry) => [entry.workload_id, entry]));
+  return refreshed.map((entry) => {
+    const cached = currentById.get(entry.workload_id)?.subject;
+    if (!entry.subject || !cached || cached.version <= entry.subject.version) return entry;
+    return { ...entry, subject: { ...cached, today: entry.subject.today, current_usage: entry.subject.current_usage } };
   });
 }
 
@@ -236,9 +258,16 @@ export function Dashboard({
   const [summaryLoading, setSummaryLoading] = useState(true);
   const [usersLoading, setUsersLoading] = useState(true);
   const [operationsLoading, setOperationsLoading] = useState(true);
+  const [workloads, setWorkloads] = useState<WorkloadEntry[]>([]);
+  const [workloadsMeta, setWorkloadsMeta] = useState<{ rosterSource: string; tagKey: string } | null>(null);
+  const [workloadsError, setWorkloadsError] = useState("");
+  const [workloadsStale, setWorkloadsStale] = useState(false);
+  const [workloadsLoading, setWorkloadsLoading] = useState(true);
+  const [selectedWorkloadId, setSelectedWorkloadId] = useState<string | null>(null);
   const summaryRequest = useRef(0);
   const usersRequest = useRef(0);
   const operationsRequest = useRef(0);
+  const workloadsRequest = useRef(0);
 
   async function refreshSummary() {
     const request = ++summaryRequest.current;
@@ -279,7 +308,8 @@ export function Dashboard({
         limit: USER_PAGE_SIZE,
         cursor,
         status: filter === "active" || filter === "blocked" ? filter : undefined,
-        granularity: filter === "workloads" ? "workload" : filter === "users" ? "user" : undefined,
+        // Workloads have their own tab; this list is JWT identities only.
+        granularity: "user",
         query,
       });
       if (request !== usersRequest.current) return false;
@@ -327,8 +357,38 @@ export function Dashboard({
     }
   }
 
+  async function refreshWorkloads() {
+    const request = ++workloadsRequest.current;
+    setWorkloadsLoading(true);
+    setWorkloadsError("");
+    try {
+      const next = await api.listWorkloads(cfg, session);
+      if (request !== workloadsRequest.current) return;
+      setWorkloads((current) => mergeRefreshedWorkloads(current, next.workloads));
+      setWorkloadsMeta({ rosterSource: next.roster_source, tagKey: next.tag_key });
+      setSelectedWorkloadId((current) => current && next.workloads.some((entry) => entry.workload_id === current) ? current : null);
+      setWorkloadsStale(false);
+    } catch (caught) {
+      if (request !== workloadsRequest.current) return;
+      setWorkloadsError(apiErrorMessage(caught));
+      setWorkloadsStale(true);
+    } finally {
+      if (request === workloadsRequest.current) setWorkloadsLoading(false);
+    }
+  }
+
   async function refresh() {
-    await Promise.allSettled([refreshSummary(), loadUsersPage(), refreshOperations()]);
+    await Promise.allSettled([refreshSummary(), loadUsersPage(), refreshWorkloads(), refreshOperations()]);
+  }
+
+  function replaceWorkloadSubject(updated: AdminUser) {
+    workloadsRequest.current += 1;
+    setWorkloadsLoading(false);
+    setWorkloads((current) => current.map((entry) => {
+      if (entry.workload_id !== updated.user_id || !entry.subject) return entry;
+      if (updated.version < entry.subject.version) return entry;
+      return { ...entry, subject: { ...updated, today: entry.subject.today, current_usage: entry.subject.current_usage } };
+    }));
   }
 
   function replaceUser(updated: AdminUser) {
@@ -361,6 +421,11 @@ export function Dashboard({
   }
 
   function openAuditTarget(userId: string) {
+    if (userId.startsWith("workload:")) {
+      setView("workloads");
+      setSelectedWorkloadId(workloads.some((entry) => entry.workload_id === userId && entry.subject) ? userId : null);
+      return;
+    }
     setView("users");
     if (users.some((user) => user.user_id === userId)) {
       setSelectedUserId(userId);
@@ -372,10 +437,11 @@ export function Dashboard({
 
   useEffect(() => { void refresh(); }, []);
 
-  const refreshing = summaryLoading || usersLoading || operationsLoading;
+  const refreshing = summaryLoading || usersLoading || workloadsLoading || operationsLoading;
   const tabs: Array<{ id: DashboardView; label: string; icon: React.ReactNode }> = [
     { id: "overview", label: "Overview", icon: <Gauge aria-hidden="true" size={15} /> },
     { id: "users", label: "Users", icon: <Users aria-hidden="true" size={15} /> },
+    { id: "workloads", label: "Workloads", icon: <Boxes aria-hidden="true" size={15} /> },
     { id: "operations", label: "Operations", icon: <SlidersHorizontal aria-hidden="true" size={15} /> },
     { id: "audit", label: "Audit log", icon: <ScrollText aria-hidden="true" size={15} /> },
   ];
@@ -418,7 +484,7 @@ export function Dashboard({
                 {summaryError && <ErrorMessage message={summaryError} />}
               </div>
             )}
-            {summary ? <SummaryPanel summary={summary} /> : summaryLoading ? <SummarySkeleton /> : <UnavailableState label="Summary unavailable" />}
+            {summary ? <SummaryPanel onNavigate={setView} summary={summary} /> : summaryLoading ? <SummarySkeleton /> : <UnavailableState label="Summary unavailable" />}
 
             <OverviewCharts cfg={cfg} refreshKey={summary?.enforcement.as_of} session={session} users={users} />
           </>
@@ -427,7 +493,7 @@ export function Dashboard({
         {view === "users" && (
           <>
             <div className="page-heading">
-              <div><p className="eyebrow">Amazon Bedrock</p><h1>User management</h1></div>
+              <div><p className="eyebrow">Amazon Bedrock</p><h1>User management</h1><p className="page-subtitle">JWT identities that obtain short-lived Bedrock credentials from the broker. Apps on their own IAM principals are managed under <button className="link-button" onClick={() => setView("workloads")} type="button">Workloads</button>.</p></div>
             </div>
             <UsersPanel
               cfg={cfg}
@@ -450,6 +516,28 @@ export function Dashboard({
               session={session}
               stale={usersStale}
               users={users}
+            />
+          </>
+        )}
+
+        {view === "workloads" && (
+          <>
+            <div className="page-heading">
+              <div><p className="eyebrow">Amazon Bedrock</p><h1>Workload management</h1><p className="page-subtitle">Applications that call Bedrock directly with their own IAM credentials, attributed by application inference profile. They never vend credentials; a block is an inline IAM Deny on the workload role.</p></div>
+            </div>
+            <WorkloadsPanel
+              cfg={cfg}
+              enforcement={!summaryStale ? summary?.enforcement ?? null : null}
+              error={workloadsError}
+              loading={workloadsLoading}
+              meta={workloadsMeta}
+              onSelectedWorkloadChange={setSelectedWorkloadId}
+              onSubjectChanged={replaceWorkloadSubject}
+              onSummaryRefresh={refreshSummary}
+              selectedWorkloadId={selectedWorkloadId}
+              session={session}
+              stale={workloadsStale}
+              workloads={workloads}
             />
           </>
         )}
@@ -482,78 +570,143 @@ export function Dashboard({
   );
 }
 
-function SummaryPanel({ summary }: { summary: Summary }) {
+function SummaryPanel({ onNavigate, summary }: { onNavigate: (view: DashboardView) => void; summary: Summary }) {
   const enforcement = summary.enforcement;
-  const metrics = [
-    {
-      label: "Managed users",
-      value: enforcement.total_users.toLocaleString(),
-      icon: <Users aria-hidden="true" size={20} />,
-      tone: "blue",
-    },
-    {
-      label: "Blocked",
-      value: enforcement.blocked_users.toLocaleString(),
-      icon: <Lock aria-hidden="true" size={20} />,
-      tone: enforcement.blocked_users > 0 ? "red" : "green",
-    },
-    {
-      label: "Spend today",
-      value: formatUsd(enforcement.today.cost_usd, 4),
-      icon: <CircleDollarSign aria-hidden="true" size={20} />,
-      tone: "orange",
-    },
-    {
-      label: "Requests today",
-      value: enforcement.today.requests.toLocaleString(),
-      icon: <Gauge aria-hidden="true" size={20} />,
-      tone: "green",
-    },
-  ];
+  const subjects = enforcement.subjects;
 
   return (
     <>
-      <section className="metric-grid" aria-label="Quota summary">
+      {subjects ? (
+        <section className="subject-grid" aria-label="Quota summary by subject kind">
+          <SubjectGroup
+            icon={<Users aria-hidden="true" size={18} />}
+            kind="users"
+            metrics={[
+              { label: "Managed", value: formatNumber(subjects.users.total), icon: <Users aria-hidden="true" size={18} />, tone: "blue" },
+              { label: "Blocked", value: formatNumber(subjects.users.blocked), icon: <Lock aria-hidden="true" size={18} />, tone: subjects.users.blocked > 0 ? "red" : "green" },
+              { label: "Spend today", value: formatUsd(subjects.users.today.cost_usd), icon: <CircleDollarSign aria-hidden="true" size={18} />, tone: "orange" },
+              { label: "Requests today", value: formatNumber(subjects.users.today.requests), icon: <Gauge aria-hidden="true" size={18} />, tone: "green" },
+            ]}
+            onNavigate={() => onNavigate("users")}
+            subtitle="JWT identities · credentials vended by the broker"
+            title="Users"
+          />
+          <SubjectGroup
+            chips={[
+              subjects.workloads.awaiting_traffic > 0 ? { label: `${subjects.workloads.awaiting_traffic} awaiting traffic`, tone: "gray" as const, title: "Configured in workloads.json but no invocation since deploy; the row appears on the first metered call." } : null,
+              subjects.workloads.metering_only > 0 ? { label: `${subjects.workloads.metering_only} metering only`, tone: "amber" as const, title: "No IAM role configured: metered and alerted, blocks are recorded but not enforced." } : null,
+              subjects.workloads.unregistered > 0 ? { label: `${subjects.workloads.unregistered} unregistered`, tone: "gray" as const, title: "Metered rows no longer in the deployed roster." } : null,
+            ].filter((chip): chip is { label: string; tone: "gray" | "amber"; title: string } => chip !== null)}
+            icon={<Boxes aria-hidden="true" size={18} />}
+            kind="workloads"
+            metrics={[
+              { label: "Configured", value: formatNumber(subjects.workloads.configured), icon: <Boxes aria-hidden="true" size={18} />, tone: "blue" },
+              { label: "Blocked", value: formatNumber(subjects.workloads.blocked), icon: <Lock aria-hidden="true" size={18} />, tone: subjects.workloads.blocked > 0 ? "red" : "green" },
+              { label: "Spend today", value: formatUsd(subjects.workloads.today.cost_usd), icon: <CircleDollarSign aria-hidden="true" size={18} />, tone: "orange" },
+              { label: "Requests today", value: formatNumber(subjects.workloads.today.requests), icon: <Gauge aria-hidden="true" size={18} />, tone: "green" },
+            ]}
+            onNavigate={() => onNavigate("workloads")}
+            subtitle="Apps on their own IAM role · attributed by inference profile"
+            title="Workloads"
+          />
+        </section>
+      ) : (
+        <LegacySummaryCards enforcement={enforcement} />
+      )}
+
+      <section className="system-strip" aria-label="Enforcement details">
+        <div className="system-status">
+          <span className="status-dot" aria-hidden="true" />
+          <strong>Enforcement active</strong>
+          <span className="system-chip">{enforcement.mode.replace(/_/g, " ")}</span>
+          <span className="system-chip system-chip-muted">{summary.observability.delivery.replace(/_/g, " ")}</span>
+          <span className="system-window">Window {enforcement.window}</span>
+          {subjects && <span className="system-window">All subjects today {formatUsd(enforcement.today.cost_usd)} · {formatNumber(enforcement.today.requests)} req</span>}
+        </div>
+        <dl className="system-details">
+          <SystemDetail label="Source" value={enforcement.source} />
+          <SystemDetail label="STS lifetime" value={`${Math.round(enforcement.credential_ttl_seconds / 60)} min`} />
+          <SystemDetail label="Permission cutoff" value={`${Math.round(enforcement.post_detection_fallback_seconds / 60)} min fallback`} />
+          <SystemDetail label="Refresh" value={`${enforcement.refresh_overlap_seconds}s overlap · ${enforcement.refresh_jitter_seconds}s jitter`} />
+          <SystemDetail label="Telemetry source" value={summary.observability.source} mono />
+          <SystemDetail label="Detection metric" value={summary.observability.detection_lag_metric} mono />
+          <SystemDetail label="Metrics namespace" value={summary.observability.metrics_namespace} mono />
+          <SystemDetail label="Vend rate limit" value={`${enforcement.vend_rate_limit_per_minute} / min per identity`} />
+        </dl>
+      </section>
+    </>
+  );
+}
+
+type MetricTone = "blue" | "red" | "orange" | "green";
+
+function SubjectGroup({
+  chips = [],
+  icon,
+  kind,
+  metrics,
+  onNavigate,
+  subtitle,
+  title,
+}: {
+  chips?: Array<{ label: string; tone: "gray" | "amber"; title: string }>;
+  icon: React.ReactNode;
+  kind: "users" | "workloads";
+  metrics: Array<{ label: string; value: string; icon: React.ReactNode; tone: MetricTone }>;
+  onNavigate: () => void;
+  subtitle: string;
+  title: string;
+}) {
+  return (
+    <article aria-labelledby={`subject-${kind}-title`} className={`subject-group subject-group-${kind}`}>
+      <header className="subject-group-heading">
+        <div className="subject-group-title">
+          <span className={`subject-group-icon subject-group-icon-${kind}`}>{icon}</span>
+          <div>
+            <h2 id={`subject-${kind}-title`}>{title}</h2>
+            <p>{subtitle}</p>
+          </div>
+        </div>
+        <div className="subject-group-tools">
+          {chips.map((chip) => <span className={`ops-status ops-status-${chip.tone}`} key={chip.label} title={chip.title}><span aria-hidden="true" />{chip.label}</span>)}
+          <button className="button button-secondary button-small" onClick={onNavigate} type="button">Manage {title.toLowerCase()}</button>
+        </div>
+      </header>
+      <div className="subject-metrics">
         {metrics.map((metric) => (
-          <article className="metric-card" key={metric.label}>
+          <div className="metric-card metric-card-compact" key={metric.label}>
             <div className={`metric-icon metric-icon-${metric.tone}`}>{metric.icon}</div>
             <div>
               <p>{metric.label}</p>
               <strong>{metric.value}</strong>
             </div>
-          </article>
-        ))}
-      </section>
-
-      <section className="system-strip" aria-label="Enforcement details">
-        <div className="system-status">
-          <span className="status-dot" aria-hidden="true" />
-          <div>
-            <strong>Enforcement active</strong>
-            <span>{enforcement.mode.replace(/_/g, " ")}</span>
           </div>
-        </div>
-        <SystemDetail label="Source" value={enforcement.source} />
-        <SystemDetail label="Window" value={enforcement.window} />
-        <SystemDetail
-          label="STS lifetime"
-          value={`${Math.round(enforcement.credential_ttl_seconds / 60)} min`}
-        />
-        <SystemDetail
-          label="Permission cutoff"
-          value={`${Math.round(enforcement.post_detection_fallback_seconds / 60)} min fallback`}
-        />
-        <SystemDetail
-          label="Refresh"
-          value={`${enforcement.refresh_overlap_seconds}s overlap · ${enforcement.refresh_jitter_seconds}s jitter`}
-        />
-        <SystemDetail
-          label="Telemetry"
-          value={`${summary.observability.source} · ${summary.observability.detection_lag_metric}`}
-        />
-        <SystemDetail label="Metrics" value={summary.observability.metrics_namespace} />
-      </section>
-    </>
+        ))}
+      </div>
+    </article>
+  );
+}
+
+/** Brokers older than the subject breakdown: the four all-subject cards. */
+function LegacySummaryCards({ enforcement }: { enforcement: Summary["enforcement"] }) {
+  const metrics: Array<{ label: string; value: string; icon: React.ReactNode; tone: MetricTone }> = [
+    { label: "Managed subjects", value: formatNumber(enforcement.total_users), icon: <Users aria-hidden="true" size={20} />, tone: "blue" },
+    { label: "Blocked", value: formatNumber(enforcement.blocked_users), icon: <Lock aria-hidden="true" size={20} />, tone: enforcement.blocked_users > 0 ? "red" : "green" },
+    { label: "Spend today", value: formatUsd(enforcement.today.cost_usd), icon: <CircleDollarSign aria-hidden="true" size={20} />, tone: "orange" },
+    { label: "Requests today", value: formatNumber(enforcement.today.requests), icon: <Gauge aria-hidden="true" size={20} />, tone: "green" },
+  ];
+  return (
+    <section className="metric-grid" aria-label="Quota summary">
+      {metrics.map((metric) => (
+        <article className="metric-card" key={metric.label}>
+          <div className={`metric-icon metric-icon-${metric.tone}`}>{metric.icon}</div>
+          <div>
+            <p>{metric.label}</p>
+            <strong>{metric.value}</strong>
+          </div>
+        </article>
+      ))}
+    </section>
   );
 }
 
@@ -708,7 +861,7 @@ export function UsersPanel({
   return (
     <section className="users-panel" aria-labelledby="users-title" aria-busy={loading}>
       <div className="panel-heading">
-        <div><h2 id="users-title">Users</h2><p>{error && users.length === 0 ? "User data unavailable" : `${users.length} identities on this page`}</p></div>
+        <div><h2 id="users-title">Users</h2><p>{error && users.length === 0 ? "User data unavailable" : `${users.length} JWT identities on this page`}</p></div>
         <div className="users-heading-actions">
           {stale && users.length > 0 && <span className="ops-status ops-status-amber"><span aria-hidden="true" />Cached users · refresh failed</span>}
           <button className="button button-primary" onClick={() => { setActionError(""); setNotice(""); setCreating(true); }} type="button">Create user</button>
@@ -718,7 +871,7 @@ export function UsersPanel({
               <div className="search-field"><Search aria-hidden="true" size={17} /><input aria-label="Search users" placeholder="Search users" type="search" value={searchDraft} onChange={(event) => setSearchDraft(event.target.value)} /></div>
               <button className="button button-secondary" disabled={loading} type="submit">Search</button>
             </form>
-            <div className="select-wrap"><select aria-label="Filter users" disabled={loading} value={filter} onChange={(event) => onFilterChange(event.target.value as UserFilter)}><option value="all">All subjects</option><option value="active">Active</option><option value="blocked">Blocked</option><option value="users">Users (JWT)</option><option value="workloads">Workloads</option></select><ChevronDown aria-hidden="true" size={16} /></div>
+            <div className="select-wrap"><select aria-label="Filter users" disabled={loading} value={filter} onChange={(event) => onFilterChange(event.target.value as UserFilter)}><option value="all">All statuses</option><option value="active">Active</option><option value="blocked">Blocked</option></select><ChevronDown aria-hidden="true" size={16} /></div>
           </div>
         </div>
       </div>
@@ -726,7 +879,6 @@ export function UsersPanel({
       {error && <ErrorMessage message={error} />}
       {actionError && !editing && !statusChanging && <ErrorMessage message={actionError} dismiss={() => setActionError("")} />}
       {notice && <SuccessMessage message={notice} dismiss={() => setNotice("")} />}
-      <p className="period-display-note">Showing {period} usage. All enabled calendar periods are enforced concurrently.</p>
 
       <div aria-label="Users on current page" className="table-scroll" role="region" tabIndex={0}>
         <table>
@@ -746,13 +898,252 @@ export function UsersPanel({
         </table>
         {!loading && users.length === 0 && (error ? <UnavailableState label="Users unavailable" /> : <EmptyState hasFilters={Boolean(query) || filter !== "all"} />)}
       </div>
-      <div className="pagination users-pagination"><span>{users.length} identities on this page</span><div><button className="button button-secondary" disabled={loading || !hasPrevious} onClick={onPrevious} type="button">Previous</button><button className="button button-secondary" disabled={loading || !hasNext} onClick={onNext} type="button">Next</button></div></div>
+      <div className="pagination users-pagination"><p className="period-display-note"><Info aria-hidden="true" size={13} />Showing {period} usage · all enabled calendar periods are enforced concurrently</p><div><button className="button button-secondary" disabled={loading || !hasPrevious} onClick={onPrevious} type="button">Previous</button><button className="button button-secondary" disabled={loading || !hasNext} onClick={onNext} type="button">Next</button></div></div>
 
       {creating && <CreateUserWizard cfg={cfg} onClose={() => setCreating(false)} onCreated={(created, openDetails) => { onCreateUser?.(created, openDetails); setNotice(`${created.name || created.user_id} was created.`); }} session={session} />}
       {selectedUser && <UserDetailDrawer cfg={cfg} onCanonical={onUserChanged} onClose={() => onSelectedUserChange(null)} onEdit={() => edit(selectedUser)} onStatus={() => changeStatus(selectedUser)} session={session} statusActionAvailable={enforcement !== null} suspended={Boolean(editing || statusChanging)} user={selectedUser} />}
       {editing && <LimitsDialog apiError={actionError} busy={busyUsers.has(editing.user_id)} key={`${editing.user_id}:${editing.version}`} onClose={() => setEditing(null)} onSave={(limits) => void saveLimits(editing, limits)} user={editing} />}
       {statusChanging && enforcement && <StatusDialog apiError={actionError} busy={busyUsers.has(statusChanging.user_id)} enforcement={enforcement} key={`${statusChanging.user_id}:${statusChanging.version}`} onClose={() => setStatusChanging(null)} onConfirm={(reason) => void saveStatus(statusChanging, reason)} user={statusChanging} />}
     </section>
+  );
+}
+
+export function WorkloadsPanel({
+  cfg,
+  enforcement,
+  error,
+  loading,
+  meta,
+  onSelectedWorkloadChange = () => undefined,
+  onSubjectChanged,
+  onSummaryRefresh,
+  selectedWorkloadId = null,
+  session,
+  stale,
+  workloads,
+}: {
+  cfg: AdminConfig;
+  enforcement: Summary["enforcement"] | null;
+  error: string;
+  loading: boolean;
+  meta: { rosterSource: string; tagKey: string } | null;
+  onSelectedWorkloadChange?: (workloadId: string | null) => void;
+  onSubjectChanged: (user: AdminUser) => void;
+  onSummaryRefresh: () => Promise<void>;
+  selectedWorkloadId?: string | null;
+  session: Session;
+  stale: boolean;
+  workloads: WorkloadEntry[];
+}) {
+  const [editing, setEditing] = useState<UserRow | null>(null);
+  const [statusChanging, setStatusChanging] = useState<UserRow | null>(null);
+  const [busy, setBusy] = useState<Set<string>>(() => new Set());
+  const [period, setPeriod] = useState<QuotaPeriod>("daily");
+  const [actionError, setActionError] = useState("");
+  const [notice, setNotice] = useState("");
+  const selected = selectedWorkloadId ? workloads.find((entry) => entry.workload_id === selectedWorkloadId)?.subject ?? null : null;
+  const configured = workloads.filter((entry) => entry.registered).length;
+  const metered = workloads.filter((entry) => entry.subject !== null).length;
+
+  useEffect(() => {
+    if (!enforcement) setStatusChanging(null);
+  }, [enforcement]);
+
+  function setSubjectBusy(id: string, value: boolean) {
+    setBusy((current) => {
+      const next = new Set(current);
+      if (value) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  }
+
+  function applyCanonical(existing: UserRow, canonical: AdminUser): UserRow {
+    onSubjectChanged(canonical);
+    return { ...canonical, today: existing.today, current_usage: existing.current_usage };
+  }
+
+  async function mutate(subject: UserRow, successMessage: string, fn: () => Promise<TransportResponse<{ user: AdminUser }>>): Promise<boolean> {
+    setSubjectBusy(subject.user_id, true);
+    setActionError("");
+    setNotice("");
+    try {
+      const result = await fn();
+      applyCanonical(subject, result.data.user);
+      setNotice(successMessage);
+      void onSummaryRefresh().catch(() => undefined);
+      return true;
+    } catch (caught) {
+      let message = apiErrorMessage(caught);
+      if (caught instanceof ApiError && caught.status === 409 && caught.code === "version_conflict") {
+        const current = (caught.details as { current_user?: unknown } | undefined)?.current_user;
+        if (isAdminUser(current) && current.user_id === subject.user_id && current.version > subject.version) {
+          const reconciled = applyCanonical(subject, current);
+          if (editing?.user_id === subject.user_id) setEditing(reconciled);
+          if (statusChanging?.user_id === subject.user_id) setStatusChanging(reconciled);
+        } else {
+          message = apiErrorMessage(new ApiError("The version conflict response did not identify the requested workload.", 409, "invalid_response", undefined, caught.requestId));
+        }
+      }
+      setActionError(message);
+      return false;
+    } finally {
+      setSubjectBusy(subject.user_id, false);
+    }
+  }
+
+  async function saveLimits(subject: UserRow, limits: SetLimitsRequest) {
+    if (await mutate(subject, `Limits saved for ${displayName(subject)}.`, () => api.setLimits(cfg, session, subject, limits))) setEditing(null);
+  }
+
+  async function saveStatus(subject: UserRow, reason: string) {
+    const nextStatus: UserStatus = subject.status === "active" ? "blocked" : "active";
+    const enforced = subject.workload?.enforcement_ready === true;
+    const message = nextStatus === "blocked" && !enforced
+      ? `Block recorded for ${displayName(subject)} (not enforced: no IAM role).`
+      : `${displayName(subject)} is now ${nextStatus}.`;
+    if (await mutate(subject, message, () => api.setStatus(cfg, session, subject, nextStatus, reason))) setStatusChanging(null);
+  }
+
+  return (
+    <section className="users-panel" aria-labelledby="workloads-title" aria-busy={loading}>
+      <div className="panel-heading">
+        <div><h2 id="workloads-title">Workloads</h2><p>{error && workloads.length === 0 ? "Workload data unavailable" : `${configured} configured · ${metered} metered`}</p></div>
+        <div className="users-heading-actions">
+          {stale && workloads.length > 0 && <span className="ops-status ops-status-amber"><span aria-hidden="true" />Cached workloads · refresh failed</span>}
+          <div className="user-tools">
+            <div className="select-wrap"><select aria-label="Workload usage period" value={period} onChange={(event) => setPeriod(event.target.value as QuotaPeriod)}><option value="daily">Daily window</option><option value="weekly">Weekly window</option><option value="monthly">Monthly window</option></select><ChevronDown aria-hidden="true" size={16} /></div>
+          </div>
+        </div>
+      </div>
+
+      {error && <ErrorMessage message={error} />}
+      {actionError && !editing && !statusChanging && <ErrorMessage message={actionError} dismiss={() => setActionError("")} />}
+      {notice && <SuccessMessage message={notice} dismiss={() => setNotice("")} />}
+
+      <div aria-label="Configured workloads" className="table-scroll" role="region" tabIndex={0}>
+        <table className="workloads-table">
+          <thead><tr><th>Workload</th><th>Model</th><th>Enforcement</th><th>Status</th><th>{periodLabel(period)} USD</th><th>Requests</th><th><span className="sr-only">Actions</span></th></tr></thead>
+          <tbody>{loading && workloads.length === 0 ? <TableSkeleton /> : workloads.map((entry) => (
+            <WorkloadTableRow
+              busy={busy.has(entry.workload_id)}
+              entry={entry}
+              key={entry.workload_id}
+              onEdit={() => { if (entry.subject) { setActionError(""); setNotice(""); setEditing(entry.subject); } }}
+              onOpen={() => entry.subject && onSelectedWorkloadChange(entry.workload_id)}
+              onRequestStatus={() => { if (entry.subject) { setActionError(""); setNotice(""); setStatusChanging(entry.subject); } }}
+              period={period}
+              statusActionAvailable={enforcement !== null}
+            />
+          ))}</tbody>
+        </table>
+        {!loading && workloads.length === 0 && (error ? <UnavailableState label="Workloads unavailable" /> : <WorkloadsEmptyState />)}
+      </div>
+      <div className="pagination users-pagination"><p className="period-display-note"><Info aria-hidden="true" size={13} />Showing {period} usage · roster from {meta ? formatOperationalLabel(meta.rosterSource) : "deployment"}{meta && <> · cost tag <code>{meta.tagKey}</code></>}</p><div /></div>
+
+      {selected && <UserDetailDrawer cfg={cfg} onCanonical={onSubjectChanged} onClose={() => onSelectedWorkloadChange(null)} onEdit={() => { setActionError(""); setNotice(""); setEditing(selected); }} onStatus={() => { setActionError(""); setNotice(""); setStatusChanging(selected); }} session={session} statusActionAvailable={enforcement !== null} suspended={Boolean(editing || statusChanging)} user={selected} />}
+      {editing && <LimitsDialog apiError={actionError} busy={busy.has(editing.user_id)} key={`${editing.user_id}:${editing.version}`} onClose={() => setEditing(null)} onSave={(limits) => void saveLimits(editing, limits)} user={editing} />}
+      {statusChanging && enforcement && <StatusDialog apiError={actionError} busy={busy.has(statusChanging.user_id)} enforcement={enforcement} key={`${statusChanging.user_id}:${statusChanging.version}`} onClose={() => setStatusChanging(null)} onConfirm={(reason) => void saveStatus(statusChanging, reason)} user={statusChanging} />}
+    </section>
+  );
+}
+
+function WorkloadTableRow({
+  busy,
+  entry,
+  onEdit,
+  onOpen,
+  onRequestStatus,
+  period,
+  statusActionAvailable,
+}: {
+  busy: boolean;
+  entry: WorkloadEntry;
+  onEdit: () => void;
+  onOpen: () => void;
+  onRequestStatus: () => void;
+  period: QuotaPeriod;
+  statusActionAvailable: boolean;
+}) {
+  const subject = entry.subject;
+  const enforcementState = workloadEnforcementLabel(entry);
+  const isActive = subject?.status === "active";
+  const usage = subject?.current_usage[period];
+  const limits = subject?.limits[period] ?? null;
+  const highest = subject ? highestUtilization(subject) : null;
+  const shortModel = entry.model ? entry.model.replace(/^[a-z]{2}\./, "") : null;
+
+  return (
+    <tr className={subject ? undefined : "workload-row-silent"}>
+      <td>
+        <div className="user-cell">
+          <div className="user-avatar user-avatar-workload" aria-hidden="true"><Boxes aria-hidden="true" size={15} /></div>
+          <div>
+            {subject
+              ? <button className="user-name-button" disabled={busy} onClick={onOpen} title={entry.name} type="button">{entry.name}</button>
+              : <strong className="user-name-static" title={entry.name}>{entry.name}</strong>}
+            <span title={entry.workload_id}>{entry.workload_id}</span>
+            {highest && <span className={`highest-utilization highest-${highest.level}`}>Highest: {periodLabel(highest.period)} {highest.percent}%</span>}
+          </div>
+        </div>
+      </td>
+      <td>{entry.model ? <code className="model-id" title={entry.model}>{shortModel}</code> : <span className="operations-muted">Unknown</span>}</td>
+      <td>
+        <div className="status-stack">
+          <span className={`ops-status ops-status-plain ops-status-${enforcementState.tone}`} title={enforcementState.detail}><span aria-hidden="true" />{enforcementState.label}</span>
+          {entry.role_arn && <details className="status-details"><summary>Role</summary><code className="break-all">{entry.role_arn}</code></details>}
+        </div>
+      </td>
+      <td>
+        {subject ? (
+          <div className="status-stack">
+            <span className={`status-badge status-${isActive ? "active" : "blocked"}`}><span aria-hidden="true" />{subject.status}</span>
+            <details className="status-details">
+              <summary>Status details</summary>
+              <dl>
+                <div><dt>Origin</dt><dd>{subject.status_origin || "Not provided"}</dd></div>
+                <div><dt>Reason</dt><dd>{subject.status_reason || "Not provided"}</dd></div>
+              </dl>
+            </details>
+          </div>
+        ) : (
+          <span className="ops-status ops-status-plain ops-status-gray" title="Configured at deploy time; the quota row is created on the first metered invocation."><span aria-hidden="true" />Awaiting traffic</span>
+        )}
+      </td>
+      <td>{usage ? <QuotaUsage current={usage.cost_usd} enabled={limits !== null} format={(value) => formatUsd(value)} limit={limits?.usd ?? 0} /> : <span className="operations-muted">—</span>}</td>
+      <td className="request-count">{usage ? formatNumber(usage.requests) : "—"}</td>
+      <td>
+        <div className="row-actions">
+          <IconButton disabled={busy || !subject} label={subject ? `Edit limits for ${entry.name}` : `${entry.name} has no quota row yet; limits apply after its first invocation`} onClick={onEdit}>
+            <Pencil aria-hidden="true" size={17} />
+          </IconButton>
+          <IconButton
+            danger={Boolean(subject) && isActive}
+            disabled={busy || !subject || !statusActionAvailable}
+            label={!subject
+              ? `${entry.name} has no quota row yet`
+              : !statusActionAvailable
+                ? `Status change unavailable for ${entry.name} until a fresh enforcement summary loads`
+                : isActive
+                  ? (entry.enforcement_ready ? `Block ${entry.name}` : `Record block for ${entry.name} (not enforced)`)
+                  : `Unblock ${entry.name}`}
+            onClick={onRequestStatus}
+          >
+            {busy ? <RefreshCw className="spin" aria-hidden="true" size={17} /> : isActive || !subject ? <Lock aria-hidden="true" size={17} /> : <Unlock aria-hidden="true" size={17} />}
+          </IconButton>
+        </div>
+      </td>
+    </tr>
+  );
+}
+
+function WorkloadsEmptyState() {
+  return (
+    <div className="empty-state">
+      <Boxes aria-hidden="true" size={24} />
+      <strong>No workloads configured</strong>
+      <span>Declare apps in <code>cdk/config/workloads.json</code> (name, model, optional role_arn) and redeploy. Each gets an application inference profile; rows appear here on the first metered invocation.</span>
+    </div>
   );
 }
 
@@ -787,16 +1178,6 @@ function UserTableRow({
             <button className="user-name-button" disabled={busy} onClick={onOpen} title={user.name} type="button">{displayName(user)}</button>
             <span title={user.user_id}>{user.user_id}</span>
             {highest && <span className={`highest-utilization highest-${highest.level}`}>Highest: {periodLabel(highest.period)} {highest.percent}%</span>}
-            {user.granularity === "workload" && (
-              <span className="granularity-stack">
-                <span className="status-badge status-workload">workload</span>
-                {user.enforcement_ready === false && (
-                  <span className="status-badge status-not-enforced" title="No IAM role configured: this workload is metered and alerted but cannot be hard-blocked. Add role_arn to the workloads config and redeploy.">
-                    metering only
-                  </span>
-                )}
-              </span>
-            )}
           </div>
         </div>
       </td>
@@ -819,7 +1200,7 @@ function UserTableRow({
         <QuotaUsage
           current={usage.cost_usd}
           enabled={limits !== null}
-          format={(value) => formatUsd(value, 6)}
+          format={(value) => formatUsd(value)}
           limit={limits?.usd ?? 0}
         />
       </td>
@@ -839,7 +1220,7 @@ function UserTableRow({
           limit={limits?.output_tokens ?? 0}
         />
       </td>
-      <td className="request-count">{usage.requests.toLocaleString()}</td>
+      <td className="request-count">{formatNumber(usage.requests)}</td>
       <td>
         <div className="row-actions">
           <IconButton disabled={busy} label={`Edit limits for ${displayName(user)}`} onClick={onEdit}>
@@ -926,14 +1307,38 @@ export function QuotaUsage({
   );
 }
 
+type ThresholdDraft = { at: string; action: ThresholdAction };
+
 type PeriodLimitDraft = {
   enabled: boolean;
   usd: string;
   input_tokens: string;
   output_tokens: string;
+  thresholds: ThresholdDraft[];
 };
 
 type LimitDraft = Record<QuotaPeriod, PeriodLimitDraft>;
+
+type RateDraft = { rpm: string; tpm: string };
+
+function thresholdDrafts(thresholds: QuotaThreshold[] | undefined): ThresholdDraft[] {
+  return (thresholds ?? DEFAULT_THRESHOLDS).map((entry) => ({
+    // Percent in the editor; ratio on the wire.
+    at: String(Math.round(entry.at * 10_000) / 100),
+    action: entry.action,
+  }));
+}
+
+/** Percent strings -> ratios; null when any entry is not a finite number. */
+export function parseThresholdDrafts(drafts: ThresholdDraft[]): QuotaThreshold[] | null {
+  const parsed: QuotaThreshold[] = [];
+  for (const draft of drafts) {
+    const percent = draft.at.trim() === "" ? Number.NaN : Number(draft.at);
+    if (!Number.isFinite(percent)) return null;
+    parsed.push({ at: Math.round(percent * 100) / 10_000, action: draft.action });
+  }
+  return parsed;
+}
 
 function limitDraft(limits: QuotaLimits): LimitDraft {
   return Object.fromEntries(QUOTA_PERIODS.map((period) => {
@@ -943,11 +1348,35 @@ function limitDraft(limits: QuotaLimits): LimitDraft {
       usd: String(value?.usd ?? 0),
       input_tokens: String(value?.input_tokens ?? 0),
       output_tokens: String(value?.output_tokens ?? 0),
+      thresholds: thresholdDrafts(value?.thresholds),
     }];
   })) as unknown as LimitDraft;
 }
 
-function parseLimitDraft(draft: LimitDraft): QuotaLimits | null {
+function rateDraft(rate: RateLimits | null | undefined): RateDraft {
+  return { rpm: String(rate?.rpm ?? 0), tpm: String(rate?.tpm ?? 0) };
+}
+
+/** Returns null when the draft is not a valid rate; `{rpm:0,tpm:0}` = off. */
+export function parseRateDraft(draft: RateDraft): RateLimits | null {
+  const rpm = draft.rpm.trim() === "" ? Number.NaN : Number(draft.rpm);
+  const tpm = draft.tpm.trim() === "" ? Number.NaN : Number(draft.tpm);
+  if (!Number.isInteger(rpm) || rpm < 0 || !Number.isInteger(tpm) || tpm < 0) return null;
+  return { rpm, tpm };
+}
+
+function sameThresholdList(a: QuotaThreshold[] | undefined, b: QuotaThreshold[] | undefined): boolean {
+  const left = a ?? DEFAULT_THRESHOLDS;
+  const right = b ?? DEFAULT_THRESHOLDS;
+  return left.length === right.length &&
+    left.every((entry, index) => Math.abs(entry.at - right[index].at) < 1e-9 && entry.action === right[index].action);
+}
+
+/** Parse the editor draft. `original` lets the payload omit an unchanged
+ *  thresholds list (the API keeps the stored list when omitted), so an
+ *  ordinary USD/token edit sends exactly what it did before thresholds
+ *  existed. */
+function parseLimitDraft(draft: LimitDraft, original?: QuotaLimits): QuotaLimits | null {
   const parsed: Partial<QuotaLimits> = {};
   for (const period of QUOTA_PERIODS) {
     const value = draft[period];
@@ -959,11 +1388,107 @@ function parseLimitDraft(draft: LimitDraft): QuotaLimits | null {
     const input = value.input_tokens.trim() === "" ? Number.NaN : Number(value.input_tokens);
     const output = value.output_tokens.trim() === "" ? Number.NaN : Number(value.output_tokens);
     if (!Number.isFinite(usd) || usd < 0 || !Number.isInteger(input) || input < 0 || !Number.isInteger(output) || output < 0) return null;
-    parsed[period] = { usd, input_tokens: input, output_tokens: output };
+    const thresholds = parseThresholdDrafts(value.thresholds);
+    if (thresholds === null || thresholdsError(thresholds) !== null) return null;
+    const previous = original?.[period];
+    // Omit when unchanged from the stored list, or when a newly enabled
+    // period keeps the default (the server materializes the deployment
+    // default, which may differ from DEFAULT_THRESHOLDS' 80 %).
+    const unchanged = previous
+      ? sameThresholdList(previous.thresholds, thresholds)
+      : sameThresholdList(undefined, thresholds);
+    parsed[period] = unchanged
+      ? { usd, input_tokens: input, output_tokens: output }
+      : { usd, input_tokens: input, output_tokens: output, thresholds };
   }
   return Object.values(parsed).some((value) => value !== null)
     ? parsed as QuotaLimits
     : null;
+}
+
+function ThresholdsEditor({
+  busy,
+  idPrefix,
+  onChange,
+  periodLabelText,
+  thresholds,
+}: {
+  busy: boolean;
+  idPrefix: string;
+  onChange: (next: ThresholdDraft[]) => void;
+  periodLabelText: string;
+  thresholds: ThresholdDraft[];
+}) {
+  const parsed = parseThresholdDrafts(thresholds);
+  const problem = parsed === null ? "Every threshold needs a numeric percentage." : thresholdsError(parsed);
+  const alertOnly = parsed !== null && problem === null && isAlertOnly(parsed);
+  return (
+    <fieldset className="thresholds-editor" data-testid={`${idPrefix}-thresholds`}>
+      <legend>{periodLabelText} thresholds</legend>
+      <ol className="thresholds-list">
+        {thresholds.map((entry, index) => (
+          <li key={index}>
+            <label>
+              <span className="sr-only">{periodLabelText} threshold {index + 1} percent</span>
+              <div className="number-input">
+                <input
+                  aria-label={`${periodLabelText} threshold ${index + 1} percent`}
+                  disabled={busy}
+                  inputMode="decimal"
+                  min="0.01"
+                  max="1000"
+                  step="0.01"
+                  type="number"
+                  value={entry.at}
+                  onChange={(event) => onChange(thresholds.map((item, i) => i === index ? { ...item, at: event.target.value } : item))}
+                />
+                <span aria-hidden="true">%</span>
+              </div>
+            </label>
+            <select
+              aria-label={`${periodLabelText} threshold ${index + 1} action`}
+              disabled={busy}
+              value={entry.action}
+              onChange={(event) => onChange(thresholds.map((item, i) => i === index ? { ...item, action: event.target.value as ThresholdAction } : item))}
+            >
+              <option value="warn">Warn</option>
+              <option value="block">Block</option>
+            </select>
+            <button
+              aria-label={`Remove ${periodLabelText} threshold ${index + 1}`}
+              className="icon-button"
+              disabled={busy || thresholds.length === 1}
+              onClick={() => onChange(thresholds.filter((_, i) => i !== index))}
+              type="button"
+            >
+              <X aria-hidden="true" size={14} />
+            </button>
+          </li>
+        ))}
+      </ol>
+      <div className="thresholds-actions">
+        <button
+          className="button button-secondary button-small"
+          disabled={busy}
+          onClick={() => {
+            const last = thresholds[thresholds.length - 1];
+            const lastAt = Number(last?.at ?? 0);
+            const nextAt = Number.isFinite(lastAt) && lastAt > 0 ? lastAt + 10 : 50;
+            // Insert before a trailing block so the block stays last.
+            const next = last?.action === "block"
+              ? [...thresholds.slice(0, -1), { at: String(nextAt - 20 > 0 ? nextAt - 20 : nextAt), action: "warn" as ThresholdAction }, last]
+              : [...thresholds, { at: String(nextAt), action: "warn" as ThresholdAction }];
+            onChange(next);
+          }}
+          type="button"
+        >
+          Add threshold
+        </button>
+        {alertOnly && <span className="ops-status ops-status-amber" role="status"><span aria-hidden="true" />Alert-only: this period warns but never blocks</span>}
+      </div>
+      {problem && <p className="field-error" role="alert">{problem}</p>}
+    </fieldset>
+  );
 }
 
 export function LimitsDialog({
@@ -982,6 +1507,7 @@ export function LimitsDialog({
   // Editable snapshot of the user's limits. The parent keys this dialog by
   // user id and version, so a changed prop remounts it with a fresh draft.
   const [draft, setDraft] = useState<LimitDraft>(() => limitDraft(user.limits)); // nosemgrep
+  const [rate, setRate] = useState<RateDraft>(() => rateDraft(user.rate)); // nosemgrep
   const [reason, setReason] = useState("");
   const [unlimitedConfirmed, setUnlimitedConfirmed] = useState(false);
   const [error, setError] = useState("");
@@ -989,10 +1515,12 @@ export function LimitsDialog({
   const firstFieldRef = useRef<HTMLInputElement>(null);
   useModalLifecycle(busy, onClose, dialogRef, firstFieldRef);
 
-  const parsedLimits = parseLimitDraft(draft);
+  const parsedLimits = parseLimitDraft(draft, user.limits);
+  const parsedRate = parseRateDraft(rate);
   const periodChanges = parsedLimits ? QUOTA_PERIODS.filter((period) => (user.limits[period] === null) !== (parsedLimits[period] === null)).map((period) => `${period} period`) : [];
   const unlimitedFields: string[] = [];
   const belowUsageFields: string[] = [];
+  const alertOnlyPeriods: string[] = [];
   if (parsedLimits) {
     for (const period of QUOTA_PERIODS) {
       const previous = user.limits[period];
@@ -1004,9 +1532,12 @@ export function LimitsDialog({
         const current = dimension === "usd" ? usage.cost_usd : usage[dimension];
         if (next[dimension] > 0 && next[dimension] < current) belowUsageFields.push(`${period} ${dimension.replace(/_/g, " ")}`);
       }
+      if (isAlertOnly(next.thresholds) && !isAlertOnly(previous?.thresholds)) alertOnlyPeriods.push(`${period} period`);
     }
   }
-  const reasonRequired = periodChanges.length > 0 || unlimitedFields.length > 0 || belowUsageFields.length > 0;
+  const currentRate = user.rate ?? { rpm: 0, tpm: 0 };
+  const rateChanged = parsedRate !== null && (parsedRate.rpm !== currentRate.rpm || parsedRate.tpm !== currentRate.tpm);
+  const reasonRequired = periodChanges.length > 0 || unlimitedFields.length > 0 || belowUsageFields.length > 0 || alertOnlyPeriods.length > 0;
 
   function changed(period: QuotaPeriod, patch: Partial<PeriodLimitDraft>) {
     setDraft((current) => ({ ...current, [period]: { ...current[period], ...patch } }));
@@ -1018,8 +1549,12 @@ export function LimitsDialog({
     event.preventDefault();
     if (!parsedLimits) {
       setError(Object.values(draft).some((value) => value.enabled)
-        ? "Enter a non-negative USD amount and whole token values. Fields cannot be blank."
+        ? "Enter a non-negative USD amount, whole token values, and a valid thresholds list. Fields cannot be blank."
         : "Enable at least one calendar quota period.");
+      return;
+    }
+    if (parsedRate === null) {
+      setError("Rate limits must be whole non-negative numbers (0 disables).");
       return;
     }
     if (unlimitedFields.length > 0 && !unlimitedConfirmed) {
@@ -1033,6 +1568,7 @@ export function LimitsDialog({
     }
     onSave({
       limits: parsedLimits,
+      ...(rateChanged ? { rate: parsedRate.rpm === 0 && parsedRate.tpm === 0 ? null : parsedRate } : {}),
       ...(trimmedReason ? { reason: trimmedReason } : {}),
     });
   }
@@ -1046,7 +1582,7 @@ export function LimitsDialog({
         aria-describedby="limits-zero-help"
         aria-labelledby="limits-title"
         aria-modal="true"
-        className="dialog"
+        className="dialog dialog-wide"
         ref={dialogRef}
         role="dialog"
         tabIndex={-1}
@@ -1084,11 +1620,31 @@ export function LimitsDialog({
                   <label><span>{periodLabel(period)} input token limit</span><input aria-describedby="limits-zero-help" aria-label={`${periodLabel(period)} input token limit`} disabled={busy || !draft[period].enabled} min="0" step="1" type="number" value={draft[period].input_tokens} onChange={(event) => changed(period, { input_tokens: event.target.value })} /></label>
                   <label><span>{periodLabel(period)} output token limit</span><input aria-describedby="limits-zero-help" aria-label={`${periodLabel(period)} output token limit`} disabled={busy || !draft[period].enabled} min="0" step="1" type="number" value={draft[period].output_tokens} onChange={(event) => changed(period, { output_tokens: event.target.value })} /></label>
                 </div>
+                {draft[period].enabled && (
+                  <ThresholdsEditor
+                    busy={busy}
+                    idPrefix={period}
+                    onChange={(thresholds) => changed(period, { thresholds })}
+                    periodLabelText={periodLabel(period)}
+                    thresholds={draft[period].thresholds}
+                  />
+                )}
               </fieldset>
             ))}
           </div>
+          <fieldset className="quota-period-card rate-limits-card">
+            <legend><span>Rate limits</span><small>Per UTC minute · 0 disables</small></legend>
+            <p className="field-help">Counted from metered invocations: requests, and uncached input + output tokens. A breach blocks the subject through the automatic path and lifts on its own once the next minute is under the limit.</p>
+            <div className="field-grid">
+              <label><span>Requests per minute</span><input aria-label="Requests per minute limit" disabled={busy} min="0" step="1" type="number" value={rate.rpm} onChange={(event) => { setRate((current) => ({ ...current, rpm: event.target.value })); setError(""); }} /></label>
+              <label><span>Tokens per minute</span><input aria-label="Tokens per minute limit" disabled={busy} min="0" step="1" type="number" value={rate.tpm} onChange={(event) => { setRate((current) => ({ ...current, tpm: event.target.value })); setError(""); }} /></label>
+            </div>
+          </fieldset>
           {periodChanges.length > 0 && (
             <div className="safety-warning" role="status"><ShieldAlert aria-hidden="true" size={18} /><span>Enabling or disabling {formatList(periodChanges)} changes enforcement immediately. Newly enabled periods include usage accumulated since their UTC boundary.</span></div>
+          )}
+          {alertOnlyPeriods.length > 0 && (
+            <div className="safety-warning" role="status"><ShieldAlert aria-hidden="true" size={18} /><span>The {formatList(alertOnlyPeriods)} has no block threshold: it becomes alert-only and will never block this subject automatically.</span></div>
           )}
           {belowUsageFields.length > 0 && (
             <div className="safety-warning" role="status">
@@ -1127,7 +1683,7 @@ export function LimitsDialog({
           </label>
           <p className="field-help" id="limits-reason-help">
             {reasonRequired
-              ? "Required for period enable/disable, Unlimited limits, or finite limits below current-period usage. "
+              ? "Required for period enable/disable, Unlimited limits, alert-only thresholds, or finite limits below current-period usage. "
               : "Optional for this limit change. "}
             When provided, the trimmed reason is stored with the immutable limit-change audit event.
           </p>
@@ -1180,6 +1736,9 @@ export function StatusDialog({
   const reasonRef = useRef<HTMLTextAreaElement>(null);
   const nextStatus: UserStatus = user.status === "active" ? "blocked" : "active";
   const blocking = nextStatus === "blocked";
+  const workload = isWorkload(user) ? user.workload ?? null : null;
+  const subjectLabel = isWorkload(user) ? "workload" : "user";
+  const recordOnly = isWorkload(user) && (!workload || !workload.enforcement_ready);
   useModalLifecycle(busy, onClose, dialogRef, reasonRef);
 
   function submit(event: React.FormEvent) {
@@ -1229,14 +1788,14 @@ export function StatusDialog({
             {QUOTA_PERIODS.map((period) => {
               const limits = user.limits[period];
               const usage = user.current_usage[period];
-              return <div key={period}><dt>{periodLabel(period)}</dt><dd>{limits ? `${formatUsd(usage.cost_usd, 4)} / ${formatLimit(limits.usd, (value) => formatUsd(value, 4))} · ${formatCompact(usage.input_tokens)} / ${formatLimit(limits.input_tokens, formatCompact)} input · ${formatCompact(usage.output_tokens)} / ${formatLimit(limits.output_tokens, formatCompact)} output` : "Disabled"}</dd></div>;
+              return <div key={period}><dt>{periodLabel(period)}</dt><dd>{limits ? `${formatUsd(usage.cost_usd)} / ${formatLimit(limits.usd, (value) => formatUsd(value))} · ${formatCompact(usage.input_tokens)} / ${formatLimit(limits.input_tokens, formatCompact)} input · ${formatCompact(usage.output_tokens)} / ${formatLimit(limits.output_tokens, formatCompact)} output` : "Disabled"}</dd></div>;
             })}
           </dl>
           <div className={`enforcement-warning${blocking ? " enforcement-warning-destructive" : ""}`} id="status-enforcement-message">
             <ShieldAlert aria-hidden="true" size={18} />
             <div>
-              <strong>{formatOperationalLabel(enforcement.mode)} mode</strong>
-              <p>{statusEnforcementMessage(enforcement, nextStatus)}</p>
+              <strong>{isWorkload(user) ? (recordOnly ? "Not enforced" : "IAM Deny on workload role") : `${formatOperationalLabel(enforcement.mode)} mode`}</strong>
+              <p>{statusEnforcementMessage(enforcement, nextStatus, user)}</p>
             </div>
           </div>
           <label className="reason-field">
@@ -1263,7 +1822,7 @@ export function StatusDialog({
               type="submit"
             >
               {busy ? <RefreshCw className="spin" aria-hidden="true" size={17} /> : blocking ? <Lock aria-hidden="true" size={17} /> : <Unlock aria-hidden="true" size={17} />}
-              {busy ? "Saving" : blocking ? "Block user" : "Unblock user"}
+              {busy ? "Saving" : blocking ? (recordOnly ? "Record block" : `Block ${subjectLabel}`) : `Unblock ${subjectLabel}`}
             </button>
           </div>
         </form>
@@ -1275,7 +1834,24 @@ export function StatusDialog({
 export function statusEnforcementMessage(
   enforcement: Summary["enforcement"],
   nextStatus: UserStatus,
+  user?: Pick<AdminUser, "user_id" | "granularity" | "workload">,
 ): string {
+  if (user && isWorkload(user)) {
+    const workload = user.workload;
+    if (workload && !workload.registered) {
+      return nextStatus === "blocked"
+        ? "This workload is not in the deployed roster, so no IAM role is known: the block is recorded and alerted but no traffic is stopped. Re-add it to workloads.json with a role_arn and redeploy to enforce."
+        : "Unblocking clears the recorded status. The workload is not in the deployed roster, so nothing was being enforced.";
+    }
+    if (workload && !workload.enforcement_ready) {
+      return nextStatus === "blocked"
+        ? "This workload has no IAM role configured: the block is recorded and alerted but traffic is NOT stopped. Add role_arn to workloads.json and redeploy to enforce it."
+        : "Unblocking clears the recorded status. This workload has no IAM role, so no Deny was in place.";
+    }
+    return nextStatus === "blocked"
+      ? "Blocking attaches an inline IAM Deny for Bedrock invoke actions to the workload role. It converges through the users-table stream within seconds and is re-applied by the scheduled repair pass; in-flight requests complete."
+      : "Unblocking removes the inline IAM Deny from the workload role. All configured calendar limits continue to apply.";
+  }
   if (nextStatus === "active") {
     return "Unblocking allows new credentials to be issued. All configured calendar limits continue to apply.";
   }
@@ -1305,11 +1881,11 @@ function Brand() {
   );
 }
 
-function SystemDetail({ label, value }: { label: string; value: string }) {
+function SystemDetail({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
   return (
     <div className="system-detail">
-      <span>{label}</span>
-      <strong title={value}>{value}</strong>
+      <dt>{label}</dt>
+      <dd className={mono ? "mono" : undefined} title={value}>{value}</dd>
     </div>
   );
 }
@@ -1475,19 +2051,3 @@ function formatTimestamp(value: string): string {
   return Number.isNaN(timestamp.getTime()) ? "Invalid timestamp" : timestamp.toLocaleString();
 }
 
-function formatUsd(value: number, digits = 2): string {
-  return new Intl.NumberFormat(undefined, {
-    style: "currency",
-    currency: "USD",
-    minimumFractionDigits: digits,
-    maximumFractionDigits: digits,
-  }).format(value);
-}
-
-function formatCompact(value: number): string {
-  if (Math.abs(value) < 1000) return value.toLocaleString();
-  return new Intl.NumberFormat(undefined, {
-    notation: "compact",
-    maximumFractionDigits: 1,
-  }).format(value);
-}

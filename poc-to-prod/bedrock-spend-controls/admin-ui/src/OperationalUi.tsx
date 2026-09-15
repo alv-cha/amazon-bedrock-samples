@@ -20,24 +20,51 @@ import {
   api,
   apiErrorMessage,
   normalizeUsd,
+  thresholdsError,
   type AdminUser,
   type AuditEvent,
   type CreateUserRequest,
   type CurrentUsage,
   type QuotaLimits,
   type QuotaPeriod,
+  type QuotaThreshold,
   type Operations,
   type UsageHistoryResponse,
   type UserAuditListResponse,
   type UserRow,
+  type WorkloadIdentity,
 } from "./api";
+import { formatNumber, formatRatioPercent, formatUsd } from "./format";
 import { useModalLifecycle } from "./modal";
 
 const PAGE_SIZE = 25;
-const RESERVED_PREFIXES = ["SESSION#", "VEND#", "REVOCATION#", "CONFIG#", "EMERGENCY_AUDIT#"];
+// "workload:" is reserved too: workload rows come from the deployed roster.
+const RESERVED_PREFIXES = ["SESSION#", "VEND#", "REVOCATION#", "CONFIG#", "EMERGENCY_AUDIT#", "RATE#", "RECONCILE#", "workload:"];
 const QUOTA_PERIODS: QuotaPeriod[] = ["daily", "weekly", "monthly"];
 
 type DrawerTab = "overview" | "usage" | "changes";
+
+/** Enforcement posture of a workload, for badges and detail rows. */
+export function workloadEnforcementLabel(workload: WorkloadIdentity): { label: string; tone: "green" | "amber" | "gray"; detail: string } {
+  if (!workload.registered) {
+    return { label: "Unregistered", tone: "gray", detail: "This row is not in the deployed roster (removed from workloads.json or created out of band). It keeps its metering history but nothing enforces it." };
+  }
+  if (!workload.enforcement_ready) {
+    return { label: "Metering only", tone: "amber", detail: "No IAM role configured: usage is metered and alerted but a block is recorded, not enforced. Add role_arn to workloads.json and redeploy." };
+  }
+  return { label: "Enforced", tone: "green", detail: "A block attaches an inline IAM Deny to the workload role and unblocking removes it; the deny converges via the table stream and the scheduled repair pass." };
+}
+
+export function WorkloadIdentitySection({ workload }: { workload: WorkloadIdentity }) {
+  const enforcement = workloadEnforcementLabel(workload);
+  return <section aria-label="Workload identity"><h3>Workload identity</h3><dl className="detail-list detail-list-wide">
+    <div><dt>Model</dt><dd>{workload.model ? <code>{workload.model}</code> : "Unknown (not in roster)"}</dd></div>
+    <div><dt>Inference profile</dt><dd>{workload.profile_arn ? <code className="break-all">{workload.profile_arn}</code> : "Unknown (not in roster)"}</dd></div>
+    <div><dt>IAM role</dt><dd>{workload.role_arn ? <code className="break-all">{workload.role_arn}</code> : "None configured"}</dd></div>
+    <div><dt>Enforcement</dt><dd><span className={`ops-status ops-status-plain ops-status-${enforcement.tone}`}><span aria-hidden="true" />{enforcement.label}</span><p className="field-help">{enforcement.detail}</p></dd></div>
+    <div><dt>Cost-allocation tag</dt><dd><code>{workload.tag.key}={workload.tag.value}</code></dd></div>
+  </dl></section>;
+}
 
 function ErrorMessage({ message }: { message: string }) {
   return <div className="message message-error" role="alert"><AlertCircle aria-hidden="true" size={18} /><span>{message}</span></div>;
@@ -47,14 +74,6 @@ function BusyLabel({ children }: { children: string }) {
   return <span className="inline-busy"><RefreshCw className="spin" aria-hidden="true" size={16} />{children}</span>;
 }
 
-function formatUsd(value: number, digits = 2): string {
-  return new Intl.NumberFormat(undefined, {
-    style: "currency",
-    currency: "USD",
-    minimumFractionDigits: digits,
-    maximumFractionDigits: digits,
-  }).format(value);
-}
 
 function formatTimestamp(value: string | null): string {
   if (!value) return "Not available";
@@ -251,7 +270,7 @@ export function CreateUserWizard({
                 <div><dt>Display name</dt><dd>{name.trim()}</dd></div>
                 {QUOTA_PERIODS.map((period) => {
                   const value = limits[period];
-                  return <div key={period}><dt>{periodLabel(period)}</dt><dd>{value ? `${formatLimit(value.usd, (item) => formatUsd(item, 6))} · ${formatLimit(value.input_tokens, (item) => item.toLocaleString())} input · ${formatLimit(value.output_tokens, (item) => item.toLocaleString())} output` : "Disabled"}</dd></div>;
+                  return <div key={period}><dt>{periodLabel(period)}</dt><dd>{value ? `${formatLimit(value.usd, (item) => formatUsd(item))} · ${formatLimit(value.input_tokens, (item) => formatNumber(item))} input · ${formatLimit(value.output_tokens, (item) => formatNumber(item))} output` : "Disabled"}</dd></div>;
                 })}
               </dl>
               <div className="safety-warning"><ShieldAlert aria-hidden="true" size={18} /><span>Creating this user grants quota-managed access for the immutable identity shown above. No request is sent until you select Create user.</span></div>
@@ -384,7 +403,7 @@ function UsageTab({ active, cfg, session, userId }: { active: boolean; cfg: Admi
         <>
           <div aria-label={`${periodLabel(period)} usage history`} className="drawer-table-scroll" role="region" tabIndex={0}>
             <table className="compact-table"><thead><tr><th>Window start</th><th>Resets</th><th>USD</th><th>Input tokens</th><th>Output tokens</th><th>Requests</th></tr></thead><tbody>
-              {page.usage.map((row) => <tr key={row.window}><td>{row.window}</td><td>{formatTimestamp(row.resets_at)}</td><td>{formatUsd(row.cost_usd, 4)}</td><td>{row.input_tokens.toLocaleString()}</td><td>{row.output_tokens.toLocaleString()}</td><td>{row.requests.toLocaleString()}</td></tr>)}
+              {page.usage.map((row) => <tr key={row.window}><td>{row.window}</td><td>{formatTimestamp(row.resets_at)}</td><td>{formatUsd(row.cost_usd)}</td><td>{formatNumber(row.input_tokens)}</td><td>{formatNumber(row.output_tokens)}</td><td>{formatNumber(row.requests)}</td></tr>)}
             </tbody></table>
             {page.usage.length === 0 && <div className="compact-empty">No usage was recorded in this date range.</div>}
           </div>
@@ -395,12 +414,25 @@ function UsageTab({ active, cfg, session, userId }: { active: boolean; cfg: Admi
   );
 }
 
+function formatThresholds(thresholds: Array<{ at_bps: number; action: string }> | undefined): string {
+  if (!thresholds || thresholds.length === 0) return "default";
+  const list = thresholds.map((entry) => `${entry.at_bps / 100}% ${entry.action}`).join(", ");
+  return thresholds.some((entry) => entry.action === "block") ? list : `${list} (alert-only)`;
+}
+
+function sameAuditThresholds(a: Array<{ at_bps: number; action: string }> | undefined, b: Array<{ at_bps: number; action: string }> | undefined): boolean {
+  if (!a || !b) return a === b;
+  return a.length === b.length && a.every((entry, index) => entry.at_bps === b[index].at_bps && entry.action === b[index].action);
+}
+
 export function summarizeAuditEvent(event: AuditEvent): string {
   if (!event.before) {
     const periods = QUOTA_PERIODS.map((period) => {
       const limits = event.after.limits[period];
-      return limits ? `${periodLabel(period)}: ${formatLimit(limits.usd_micro / 1_000_000, (value) => formatUsd(value, 6))}, ${formatLimit(limits.input_tokens, (value) => value.toLocaleString())} input, ${formatLimit(limits.output_tokens, (value) => value.toLocaleString())} output` : `${periodLabel(period)}: disabled`;
+      return limits ? `${periodLabel(period)}: ${formatLimit(limits.usd_micro / 1_000_000, (value) => formatUsd(value))}, ${formatLimit(limits.input_tokens, (value) => formatNumber(value))} input, ${formatLimit(limits.output_tokens, (value) => formatNumber(value))} output` : `${periodLabel(period)}: disabled`;
     });
+    const rate = event.after.rate;
+    if (rate && (rate.rpm > 0 || rate.tpm > 0)) periods.push(`Rate: ${rate.rpm || "∞"} rpm, ${rate.tpm || "∞"} tpm`);
     return `Created ${event.after.status}; ${periods.join("; ")}.`;
   }
   const changes: string[] = [];
@@ -412,16 +444,21 @@ export function summarizeAuditEvent(event: AuditEvent): string {
     if (before === null || after === null) {
       if (before !== after) {
         const afterDetail = after
-          ? `enabled (${formatLimit(after.usd_micro / 1_000_000, (value) => formatUsd(value, 6))}, ${formatLimit(after.input_tokens, (value) => value.toLocaleString())} input, ${formatLimit(after.output_tokens, (value) => value.toLocaleString())} output)`
+          ? `enabled (${formatLimit(after.usd_micro / 1_000_000, (value) => formatUsd(value))}, ${formatLimit(after.input_tokens, (value) => formatNumber(value))} input, ${formatLimit(after.output_tokens, (value) => formatNumber(value))} output)`
           : "disabled";
         changes.push(`${periodLabel(period)}: ${before ? "enabled" : "disabled"} → ${afterDetail}`);
       }
       continue;
     }
-    if (before.usd_micro !== after.usd_micro) changes.push(`${periodLabel(period)} USD: ${formatLimit(before.usd_micro / 1_000_000, (value) => formatUsd(value, 6))} → ${formatLimit(after.usd_micro / 1_000_000, (value) => formatUsd(value, 6))}`);
-    if (before.input_tokens !== after.input_tokens) changes.push(`${periodLabel(period)} input: ${formatLimit(before.input_tokens, (value) => value.toLocaleString())} → ${formatLimit(after.input_tokens, (value) => value.toLocaleString())}`);
-    if (before.output_tokens !== after.output_tokens) changes.push(`${periodLabel(period)} output: ${formatLimit(before.output_tokens, (value) => value.toLocaleString())} → ${formatLimit(after.output_tokens, (value) => value.toLocaleString())}`);
+    if (before.usd_micro !== after.usd_micro) changes.push(`${periodLabel(period)} USD: ${formatLimit(before.usd_micro / 1_000_000, (value) => formatUsd(value))} → ${formatLimit(after.usd_micro / 1_000_000, (value) => formatUsd(value))}`);
+    if (before.input_tokens !== after.input_tokens) changes.push(`${periodLabel(period)} input: ${formatLimit(before.input_tokens, (value) => formatNumber(value))} → ${formatLimit(after.input_tokens, (value) => formatNumber(value))}`);
+    if (before.output_tokens !== after.output_tokens) changes.push(`${periodLabel(period)} output: ${formatLimit(before.output_tokens, (value) => formatNumber(value))} → ${formatLimit(after.output_tokens, (value) => formatNumber(value))}`);
+    if (!sameAuditThresholds(before.thresholds, after.thresholds)) changes.push(`${periodLabel(period)} thresholds: ${formatThresholds(before.thresholds)} → ${formatThresholds(after.thresholds)}`);
   }
+  const rateBefore = event.before.rate ?? { rpm: 0, tpm: 0 };
+  const rateAfter = event.after.rate ?? { rpm: 0, tpm: 0 };
+  if (rateBefore.rpm !== rateAfter.rpm) changes.push(`rpm: ${formatLimit(rateBefore.rpm, String)} → ${formatLimit(rateAfter.rpm, String)}`);
+  if (rateBefore.tpm !== rateAfter.tpm) changes.push(`tpm: ${formatLimit(rateBefore.tpm, String)} → ${formatLimit(rateAfter.tpm, String)}`);
   return changes.length > 0 ? changes.join("; ") : `Configuration version ${event.before.version} → ${event.after.version}.`;
 }
 
@@ -537,12 +574,16 @@ export function UserDetailDrawer({
     else if (event.key === "End") { event.preventDefault(); selectTab(tabs.length - 1); }
   }
 
+  const workload = user.workload;
+  const subjectLabel = workload ? "workload" : "user";
+  const blockLabel = user.status === "active" ? `Block ${subjectLabel}` : `Unblock ${subjectLabel}`;
+
   return <div className="drawer-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
     <aside aria-hidden={suspended || undefined} aria-labelledby="user-detail-title" aria-modal={suspended ? undefined : true} className="detail-drawer" ref={drawerRef} role="dialog" tabIndex={-1}>
-      <div className="drawer-header"><div><p className="eyebrow">User details</p><h2 id="user-detail-title">{user.name || "Unnamed identity"}</h2><code>{user.user_id}</code></div><button aria-label="Close user details" className="icon-button" onClick={onClose} ref={closeRef} type="button"><X aria-hidden="true" size={20} /></button></div>
-      {detailError && <div className="drawer-message"><ErrorMessage message={detailError} /><span className="ops-status ops-status-amber"><span aria-hidden="true" />Showing configuration from the current users page</span></div>}
+      <div className="drawer-header"><div><p className="eyebrow">{workload ? "Workload details" : "User details"}</p><h2 id="user-detail-title">{user.name || "Unnamed identity"}</h2><code>{user.user_id}</code></div><button aria-label={`Close ${subjectLabel} details`} className="icon-button" onClick={onClose} ref={closeRef} type="button"><X aria-hidden="true" size={20} /></button></div>
+      {detailError && <div className="drawer-message"><ErrorMessage message={detailError} /><span className="ops-status ops-status-amber"><span aria-hidden="true" />Showing configuration from the current page</span></div>}
       {detailLoading && <span className="detail-refresh"><BusyLabel>Refreshing detail</BusyLabel></span>}
-      <div aria-label="User detail sections" className="drawer-tabs" role="tablist">
+      <div aria-label={`${workload ? "Workload" : "User"} detail sections`} className="drawer-tabs" role="tablist">
         {tabs.map((item, index) => <button aria-controls={`user-${item.id}-panel`} aria-selected={tab === item.id} id={`user-${item.id}-tab`} key={item.id} onClick={() => setTab(item.id)} onKeyDown={(event) => tabKeyDown(event, index)} ref={(element) => { tabRefs.current[index] = element; }} role="tab" tabIndex={tab === item.id ? 0 : -1} type="button">{item.label}</button>)}
       </div>
       <section aria-labelledby="user-overview-tab" hidden={tab !== "overview"} id="user-overview-panel" role="tabpanel" tabIndex={0}>
@@ -550,18 +591,21 @@ export function UserDetailDrawer({
           <div className="drawer-actions">
             <button className="button button-secondary" onClick={onEdit} type="button"><Pencil aria-hidden="true" size={16} />Edit limits</button>
             <button
-              aria-label={statusActionAvailable ? (user.status === "active" ? "Block user" : "Unblock user") : "Status change unavailable until a fresh enforcement summary loads"}
+              aria-label={statusActionAvailable ? blockLabel : "Status change unavailable until a fresh enforcement summary loads"}
               className={`button ${user.status === "active" ? "button-danger" : "button-primary"}`}
               disabled={!statusActionAvailable}
               onClick={onStatus}
               type="button"
             >
               {user.status === "active" ? <Lock aria-hidden="true" size={16} /> : <Unlock aria-hidden="true" size={16} />}
-              {user.status === "active" ? "Block user" : "Unblock user"}
+              {blockLabel}
             </button>
           </div>
+          {workload && <WorkloadIdentitySection workload={workload} />}
           <section><h3>Identity and status</h3><dl className="detail-list"><div><dt>Status</dt><dd><span className={`status-badge status-${user.status}`}><span aria-hidden="true" />{user.status}</span></dd></div><div><dt>Status origin</dt><dd>{user.status_origin || "Not provided"}</dd></div><div><dt>Status reason</dt><dd>{user.status_reason || "Not provided"}</dd></div><div><dt>Created</dt><dd>{formatTimestamp(user.created_at)}</dd></div><div><dt>Updated</dt><dd>{formatTimestamp(user.updated_at)}</dd></div><div><dt>Version</dt><dd>{user.version}</dd></div></dl></section>
-          <section><h3>Calendar quota windows</h3><div className="detail-periods">{QUOTA_PERIODS.map((period) => { const limits = user.limits[period]; const usage = detailUsage[period]; return <article className="detail-period" key={period}><div><h4>{periodLabel(period)}</h4><span>Resets {formatTimestamp(usage.resets_at)}</span></div>{limits ? <dl className="detail-list"><div><dt>USD</dt><dd>{formatUsd(usage.cost_usd, 6)} of {formatLimit(limits.usd, (value) => formatUsd(value, 6))}</dd></div><div><dt>Input tokens</dt><dd>{usage.input_tokens.toLocaleString()} of {formatLimit(limits.input_tokens, (value) => value.toLocaleString())}</dd></div><div><dt>Output tokens</dt><dd>{usage.output_tokens.toLocaleString()} of {formatLimit(limits.output_tokens, (value) => value.toLocaleString())}</dd></div><div><dt>Requests</dt><dd>{usage.requests.toLocaleString()}</dd></div></dl> : <p className="operations-muted">Disabled</p>}</article>; })}</div></section>
+          <section><h3>Calendar quota windows</h3><div className="detail-periods">{QUOTA_PERIODS.map((period) => { const limits = user.limits[period]; const usage = detailUsage[period]; const thresholds = limits?.thresholds ?? []; const alertOnly = thresholds.length > 0 && thresholds.every((entry) => entry.action !== "block"); return <article className="detail-period" key={period}><div><h4>{periodLabel(period)}</h4><span>Resets {formatTimestamp(usage.resets_at)}</span></div>{limits ? <dl className="detail-list"><div><dt>USD</dt><dd>{formatUsd(usage.cost_usd)} of {formatLimit(limits.usd, (value) => formatUsd(value))}</dd></div><div><dt>Input tokens</dt><dd>{formatNumber(usage.input_tokens)} of {formatLimit(limits.input_tokens, (value) => formatNumber(value))}</dd></div><div><dt>Output tokens</dt><dd>{formatNumber(usage.output_tokens)} of {formatLimit(limits.output_tokens, (value) => formatNumber(value))}</dd></div><div><dt>Requests</dt><dd>{formatNumber(usage.requests)}</dd></div><div><dt>Thresholds</dt><dd>{thresholds.length > 0 ? thresholds.map((entry) => `${formatRatioPercent(entry.at)} ${entry.action}`).join(", ") : "default"}{alertOnly && <span className="ops-status ops-status-amber"> alert-only</span>}</dd></div></dl> : <p className="operations-muted">Disabled</p>}</article>; })}</div></section>
+          <section><h3>Rate limits</h3><dl className="detail-list"><div><dt>Requests per minute</dt><dd>{user.rate?.rpm ? formatNumber(user.rate.rpm) : "Unlimited"}</dd></div><div><dt>Tokens per minute</dt><dd>{user.rate?.tpm ? formatNumber(user.rate.tpm) : "Unlimited"}</dd></div></dl></section>
+          <ModelBudgetsSection cfg={cfg} onCanonical={onCanonical} session={session} user={user} />
         </div>
       </section>
       <section aria-labelledby="user-usage-tab" hidden={tab !== "usage"} id="user-usage-panel" role="tabpanel" tabIndex={0}><UsageTab active={tab === "usage"} cfg={cfg} session={session} userId={user.user_id} /></section>
@@ -575,6 +619,206 @@ type AuditLoadRequest = Readonly<{
   targetIndex: number;
   reset: boolean;
 }>;
+
+// ---------------------------------------------------------------------------
+// Per-model budgets (optional second axis)
+// ---------------------------------------------------------------------------
+
+/** "50:warn,80:warn,100:block" -> thresholds; null on a parse error. Same
+ *  grammar as the sigv4 CLI so operators can copy between the two. */
+export function parseThresholdSpec(spec: string): QuotaThreshold[] | null | undefined {
+  const trimmed = spec.trim();
+  if (trimmed === "") return undefined;  // omitted: server applies the default
+  const entries: QuotaThreshold[] = [];
+  for (const token of trimmed.split(",")) {
+    const [percent, action] = token.trim().split(":");
+    const at = Number(percent) / 100;
+    if (!Number.isFinite(at) || (action !== "warn" && action !== "block")) return null;
+    entries.push({ at: Math.round(at * 10_000) / 10_000, action });
+  }
+  return thresholdsError(entries) === null ? entries : null;
+}
+
+export function formatThresholdSpec(thresholds: QuotaThreshold[] | undefined): string {
+  return (thresholds ?? []).map((entry) => `${Math.round(entry.at * 10_000) / 100}:${entry.action}`).join(",");
+}
+
+type ModelBudgetPeriodDraft = { enabled: boolean; usd: string; input: string; output: string; thresholds: string };
+type ModelBudgetDraft = { modelId: string; periods: Record<QuotaPeriod, ModelBudgetPeriodDraft>; reason: string };
+
+function emptyModelBudgetDraft(modelId = "", existing?: QuotaLimits): ModelBudgetDraft {
+  const period = (value: QuotaLimits[QuotaPeriod] | undefined, enabled: boolean): ModelBudgetPeriodDraft => ({
+    enabled: value ? true : enabled,
+    usd: String(value?.usd ?? 0),
+    input: String(value?.input_tokens ?? 0),
+    output: String(value?.output_tokens ?? 0),
+    thresholds: formatThresholdSpec(value?.thresholds),
+  });
+  return {
+    modelId,
+    periods: {
+      daily: period(existing?.daily, !existing),
+      weekly: period(existing?.weekly, false),
+      monthly: period(existing?.monthly, false),
+    },
+    reason: "",
+  };
+}
+
+export function parseModelBudgetDraft(draft: ModelBudgetDraft): { limits: QuotaLimits } | { error: string } {
+  const result: Partial<QuotaLimits> = {};
+  let enabledCount = 0;
+  for (const period of QUOTA_PERIODS) {
+    const value = draft.periods[period];
+    if (!value.enabled) { result[period] = null; continue; }
+    enabledCount += 1;
+    const usd = value.usd.trim() === "" ? Number.NaN : Number(value.usd);
+    const input = value.input.trim() === "" ? Number.NaN : Number(value.input);
+    const output = value.output.trim() === "" ? Number.NaN : Number(value.output);
+    if (!Number.isFinite(usd) || usd < 0 || !Number.isInteger(input) || input < 0 || !Number.isInteger(output) || output < 0) {
+      return { error: `Enter a non-negative USD amount and whole token values for the ${period} period.` };
+    }
+    const thresholds = parseThresholdSpec(value.thresholds);
+    if (thresholds === null) return { error: `${periodLabel(period)} thresholds must look like "50:warn,80:warn,100:block" with a single trailing block.` };
+    result[period] = { usd: normalizeUsd(usd), input_tokens: input, output_tokens: output, ...(thresholds ? { thresholds } : {}) };
+  }
+  if (enabledCount === 0) return { error: "Enable at least one period for the model budget." };
+  return { limits: result as QuotaLimits };
+}
+
+export function ModelBudgetsSection({
+  cfg,
+  session,
+  user,
+  onCanonical,
+}: {
+  cfg: AdminConfig;
+  session: Session;
+  user: AdminUser;
+  onCanonical: (user: AdminUser) => void;
+}) {
+  const [draft, setDraft] = useState<ModelBudgetDraft | null>(null);
+  const [editing, setEditing] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [usage, setUsage] = useState<Record<string, CurrentUsage>>({});
+  const budgets = user.model_budgets ?? {};
+  const modelIds = Object.keys(budgets).sort();
+
+  useEffect(() => {
+    let active = true;
+    setUsage({});
+    for (const modelId of modelIds) {
+      void api.modelUsage(cfg, session, user.user_id, modelId).then((result) => {
+        if (active) setUsage((current) => ({ ...current, [modelId]: result.current_usage }));
+      }).catch(() => { /* usage is informational; the budget list still renders */ });
+    }
+    return () => { active = false; };
+  }, [user.user_id, user.version, modelIds.join("|")]);
+
+  async function save() {
+    if (!draft) return;
+    const modelId = draft.modelId.trim();
+    if (!modelId) { setError("Enter the model or inference-profile ID as it appears in the invocation log."); return; }
+    if (modelId.startsWith("arn:")) { setError("Use the model ID, not an ARN."); return; }
+    const parsed = parseModelBudgetDraft(draft);
+    if ("error" in parsed) { setError(parsed.error); return; }
+    setBusy(true);
+    setError("");
+    try {
+      const result = await api.setModelBudget(cfg, session, user, modelId, parsed.limits, draft.reason);
+      onCanonical(result.data.user);
+      setDraft(null);
+      setEditing(null);
+    } catch (caught) {
+      setError(apiErrorMessage(caught));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove(modelId: string) {
+    const reason = window.prompt(`Reason for removing the ${modelId} budget (stored in the audit trail):`, "");
+    if (reason === null) return;
+    setBusy(true);
+    setError("");
+    try {
+      const result = await api.removeModelBudget(cfg, session, user, modelId, reason);
+      onCanonical(result.data.user);
+    } catch (caught) {
+      setError(apiErrorMessage(caught));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function setPeriod(period: QuotaPeriod, patch: Partial<ModelBudgetPeriodDraft>) {
+    setDraft((current) => current ? { ...current, periods: { ...current.periods, [period]: { ...current.periods[period], ...patch } } } : current);
+    setError("");
+  }
+
+  return (
+    <section aria-labelledby="model-budgets-title" className="model-budgets">
+      <div className="panel-heading-inline">
+        <h3 id="model-budgets-title">Per-model budgets</h3>
+        {!draft && <button className="button button-secondary button-small" disabled={busy} onClick={() => { setDraft(emptyModelBudgetDraft()); setEditing(null); }} type="button">Add model budget</button>}
+      </div>
+      <p className="field-help">A second axis on top of the subject limits, evaluated against this subject's per-model ledger. <strong>A breach on any model budget blocks the whole subject</strong> — enforcement is on the identity, not the model — and model budgets are not checked at credential vend time.</p>
+      {error && <ErrorMessage message={error} />}
+      {modelIds.length === 0 && !draft && <p className="operations-muted">No model budgets configured.</p>}
+      {modelIds.length > 0 && (
+        <div className="drawer-table-scroll" role="region" aria-label="Model budgets" tabIndex={0}>
+          <table className="compact-table"><thead><tr><th>Model</th><th>Period</th><th>USD</th><th>Input tokens</th><th>Output tokens</th><th>Thresholds</th><th></th></tr></thead><tbody>
+            {modelIds.flatMap((modelId) => QUOTA_PERIODS.filter((period) => budgets[modelId][period] !== null).map((period, index, enabled) => {
+              const limits = budgets[modelId][period]!;
+              const current = usage[modelId]?.[period];
+              const alertOnly = (limits.thresholds ?? []).length > 0 && (limits.thresholds ?? []).every((entry) => entry.action !== "block");
+              return (
+                <tr key={`${modelId}-${period}`}>
+                  {index === 0 && <td rowSpan={enabled.length}><code>{modelId}</code></td>}
+                  <td>{periodLabel(period)}</td>
+                  <td>{current ? `${formatUsd(current.cost_usd)} of ` : ""}{formatLimit(limits.usd, (value) => formatUsd(value))}</td>
+                  <td>{current ? `${formatNumber(current.input_tokens)} of ` : ""}{formatLimit(limits.input_tokens, (value) => formatNumber(value))}</td>
+                  <td>{current ? `${formatNumber(current.output_tokens)} of ` : ""}{formatLimit(limits.output_tokens, (value) => formatNumber(value))}</td>
+                  <td>{formatThresholdSpec(limits.thresholds) || "default"}{alertOnly && <span className="ops-status ops-status-amber"> alert-only</span>}</td>
+                  {index === 0 && (
+                    <td rowSpan={enabled.length} className="compact-actions">
+                      <button aria-label={`Edit ${modelId} budget`} className="icon-button" disabled={busy} onClick={() => { setDraft(emptyModelBudgetDraft(modelId, budgets[modelId])); setEditing(modelId); }} type="button"><Pencil aria-hidden="true" size={14} /></button>
+                      <button aria-label={`Remove ${modelId} budget`} className="icon-button" disabled={busy} onClick={() => void remove(modelId)} type="button"><X aria-hidden="true" size={14} /></button>
+                    </td>
+                  )}
+                </tr>
+              );
+            }))}
+          </tbody></table>
+        </div>
+      )}
+      {draft && (
+        <form aria-label={editing ? `Edit ${editing} budget` : "New model budget"} className="model-budget-form" onSubmit={(event) => { event.preventDefault(); void save(); }}>
+          <label><span>Model or inference-profile ID</span><input aria-label="Model budget model ID" autoComplete="off" disabled={busy || editing !== null} onChange={(event) => { setDraft((current) => current ? { ...current, modelId: event.target.value } : current); setError(""); }} placeholder="us.anthropic.claude-opus-4-7" value={draft.modelId} /></label>
+          <div className="quota-limit-matrix">
+            {QUOTA_PERIODS.map((period) => (
+              <fieldset className="quota-period-card" key={period}>
+                <legend><label className="quota-period-toggle"><input aria-label={`Model budget ${period} enabled`} checked={draft.periods[period].enabled} disabled={busy} onChange={(event) => setPeriod(period, { enabled: event.target.checked })} type="checkbox" /><span>{periodLabel(period)}</span></label></legend>
+                <div className="field-grid">
+                  <label><span>USD</span><input aria-label={`Model budget ${period} USD limit`} disabled={busy || !draft.periods[period].enabled} min="0" onChange={(event) => setPeriod(period, { usd: event.target.value })} step="0.000001" type="number" value={draft.periods[period].usd} /></label>
+                  <label><span>Input tokens</span><input aria-label={`Model budget ${period} input token limit`} disabled={busy || !draft.periods[period].enabled} min="0" onChange={(event) => setPeriod(period, { input: event.target.value })} step="1" type="number" value={draft.periods[period].input} /></label>
+                  <label><span>Output tokens</span><input aria-label={`Model budget ${period} output token limit`} disabled={busy || !draft.periods[period].enabled} min="0" onChange={(event) => setPeriod(period, { output: event.target.value })} step="1" type="number" value={draft.periods[period].output} /></label>
+                  <label><span>Thresholds</span><input aria-label={`Model budget ${period} thresholds`} disabled={busy || !draft.periods[period].enabled} onChange={(event) => setPeriod(period, { thresholds: event.target.value })} placeholder="80:warn,100:block (blank = default)" value={draft.periods[period].thresholds} /></label>
+                </div>
+              </fieldset>
+            ))}
+          </div>
+          <label className="reason-field"><span>Reason</span><textarea aria-label="Model budget reason" disabled={busy} onChange={(event) => setDraft((current) => current ? { ...current, reason: event.target.value } : current)} rows={2} value={draft.reason} /></label>
+          <div className="dialog-actions">
+            <button className="button button-secondary" disabled={busy} onClick={() => { setDraft(null); setEditing(null); setError(""); }} type="button">Cancel</button>
+            <button className="button button-primary" disabled={busy} type="submit">{busy ? <BusyLabel>Saving</BusyLabel> : editing ? "Save model budget" : "Add model budget"}</button>
+          </div>
+        </form>
+      )}
+    </section>
+  );
+}
 
 export function GlobalAuditView({ cfg, session, onTargetUser }: { cfg: AdminConfig; session: Session; onTargetUser: (userId: string) => void }) {
   const [events, setEvents] = useState<AuditEvent[]>([]);

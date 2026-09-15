@@ -67,8 +67,8 @@ Direct `-c key=value` values override the file.
 | Key | Default | Validation and meaning |
 |---|---:|---|
 | `auto_provision_users` | `true` | Boolean; create a quota row on first valid JWT |
-| `default_limits` | Daily finite; weekly/monthly `null` | Object with `daily`, `weekly`, `monthly`; enabled periods contain non-negative `usd`, `input_tokens`, `output_tokens`; `null` disables a period |
-| `warn_threshold` | `0.8` | Greater than 0 and less than 1 |
+| `default_limits` | Daily finite; weekly/monthly `null` | Object with `daily`, `weekly`, `monthly`, optional `rate`; enabled periods contain non-negative `usd`, `input_tokens`, `output_tokens` and an optional `thresholds` list; `null` disables a period. See [Thresholds and rate limits](#thresholds-and-rate-limits) |
+| `warn_threshold` | `0.8` | Greater than 0 and less than 1; the `warn` level of the default thresholds list applied to rows and periods without their own list |
 | `usage_retention_days` | `35` | At least 31; canonical daily ledger retention used to derive current monthly totals |
 | `retain_tables_on_delete` | `false` | `true` maps tables to `RETAIN` |
 | `vended_ttl_seconds` | `900` | 900–3600; Lambda broker role chaining rejects longer sessions |
@@ -96,17 +96,83 @@ Direct `-c key=value` values override the file.
 | `snapstart` | `false` | Enable Python Lambda SnapStart for the broker |
 | `adapter_layer_arn` | regional default | Override Lambda Web Adapter layer |
 | `workloads` | empty | Workload-mode roster (inline JSON or file path); see [Workload mode](#workload-mode-per-workload-quotas) |
+| `reconciliation_enabled` | `false` | Boolean; deploys the daily ledger-vs-Cost-Explorer comparison; see [Reconciliation (optional)](#reconciliation-optional) |
+| `reconcile_lag_days` | `2` | 1–14; which settled day (`today − lag`, UTC) each run compares |
+| `reconciliation_alarm_percent` | `10` | Greater than 0 and at most 100; absolute `ReconciliationDeltaPercent` that, over two consecutive daily runs, raises `reconciliation_delta` |
 
 Calendar quota windows are fixed in UTC: days reset at 00:00, weeks reset
 Monday at 00:00, and months reset on the first at 00:00. All enabled periods
 are enforced simultaneously. Weekly/monthly values are not rolling windows.
 
-The usage table retains one exactly-once daily ledger row per subject. The
+### Thresholds and rate limits
+
+Every enabled period carries an ordered `thresholds` list; a subject may
+also carry per-minute `rate` limits. Both can be set per subject through the
+admin API/UI and defaulted for new subjects through `default_limits`:
+
+```json
+{
+  "default_limits": {
+    "daily": {
+      "usd": 25,
+      "input_tokens": 10000000,
+      "output_tokens": 2000000,
+      "thresholds": [
+        {"at": 0.5, "action": "warn"},
+        {"at": 0.8, "action": "warn"},
+        {"at": 1.0, "action": "block"}
+      ]
+    },
+    "weekly": {
+      "usd": 100,
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "thresholds": [{"at": 1.0, "action": "warn"}]
+    },
+    "monthly": null,
+    "rate": {"rpm": 60, "tpm": 100000}
+  }
+}
+```
+
+Synthesis validates the list with the same rules the runtime applies:
+non-empty, `0 < at <= 10`, strictly increasing `at`, `action` in
+`warn`/`block`, at most one `block` and only as the last entry. A period
+whose list has no `block` is alert-only: it warns at each level and never
+blocks. Omitting `thresholds` keeps the pre-existing behaviour
+(`[{warn_threshold: warn}, {1.0: block}]`); omitting `rate` (or setting a
+dimension to `0`) leaves rate limiting off.
+
+The metering processor sends one SNS warning per level per calendar window
+(`warning_sent_<period>_<at_bps>_window` markers on the user row) and blocks
+only when a `block` level is reached, which may be above 100 %. Rate limits
+are counted from metered invocations per UTC minute — requests, and uncached
+input + output tokens (cache read/write tokens are excluded) — in a
+short-lived `RATE#<subject>` / `<UTC minute>` counter row in the usage table
+that is written only for subjects with a positive `rpm`/`tpm`. A breach uses
+the same automatic block path as a calendar breach (`status_origin:
+automatic`, revocation sentinel, SNS `BLOCKED <subject> reason=rpm|tpm`) and
+lifts automatically once the current minute is under the limit, at the next
+credential vend or workload-enforcer pass. Rate blocks therefore never
+require a manual unblock; a manual admin block still never auto-lifts.
+
+Existing rows need no migration: rows without stored thresholds resolve to
+the deployment default, `rate` is absent (off), and the first admin edit
+materializes the list on the row.
+
+The usage table retains one exactly-once daily ledger row per subject **and
+one per (subject, model)** — `<subject>#model#<model_id>` — written in the
+same transaction so the `REQUEST#` idempotency marker covers both. The
 broker, usage processor, and workload enforcer derive current weekly/monthly
 totals with strongly consistent range queries over those daily rows. This
-avoids a rollup migration gap when a longer period is enabled mid-window. It
-adds a small read cost (up to 37 small rows) to vends and metered invocations
-for period-aware evaluation. Increasing retention does not restore rows that
+avoids a rollup migration gap when a longer period is enabled mid-window, and
+lets a per-model budget added mid-period include usage already recorded. It
+adds a small read cost (up to 37 small rows per ledger) to vends and metered
+invocations for period-aware evaluation, and — since the model row exists —
+**two ledger `UpdateItem`s per metered invocation instead of one** (three
+items in the transaction with the marker). Subjects with model budgets pay one
+extra range query per budgeted model on each metered invocation and vend.
+Increasing retention does not restore rows that
 already expired; a deployment previously below 31 days must wait for a clean
 month boundary or backfill from retained invocation logs before enabling a
 monthly cap.
@@ -143,8 +209,13 @@ from `usage_retention_days`, which bounds usage history.
 search filters. Canonical exact-user operations use query routes:
 
 - `GET /admin/user?user_id=<encoded>` for detail.
-- `PUT /admin/user/limits?user_id=<encoded>` for limits.
+- `PUT /admin/user/limits?user_id=<encoded>` for limits (periods, thresholds, `rate`).
 - `PUT /admin/user/status?user_id=<encoded>` for status.
+- `PUT` / `DELETE /admin/user/model-budget?user_id=<encoded>&model_id=<id>`
+  for one per-model budget (same `If-Match`/`Idempotency-Key`/reason rules;
+  `model_id` must be covered by `allowed_model_arns`).
+- `GET /admin/user/model-usage?user_id=<encoded>&model_id=<id>` for a model
+  ledger's current calendar usage.
 - `GET /admin/user/usage?user_id=<encoded>&window=...` for usage.
 - `GET /admin/user/usage-history?user_id=<encoded>` for retained history.
 - `GET /admin/user/audit?user_id=<encoded>` for per-user audit.
@@ -404,8 +475,32 @@ fast path plus a 5-minute schedule) attaches an inline
 overspend. The Deny applies to sessions the role has already issued. When
 the daily window resets, the enforcer lifts automatic blocks and removes the
 Deny; admin-origin blocks never lift automatically. All admin operations use
-the standard endpoints with `user_id=workload:<name>`, and
-`GET /admin/users?granularity=workload` filters the roster.
+the standard endpoints with `user_id=workload:<name>`;
+`GET /admin/users?granularity=workload` filters rows, and
+`GET /admin/workloads` returns the deployed roster joined with them.
+
+**Roster parameter.** The stack writes `{workload_id: {name, model,
+profile_arn, role_arn, enforcement_ready}}` to the `WorkloadRosterParameter`
+SSM parameter (intelligent tiering, so large rosters are promoted past the
+4 KB standard cap automatically). Profile ARNs are deploy-time tokens and
+about 100 characters each, which is why the roster is not a Lambda
+environment variable: the broker's environment is capped at 4 KB. The broker
+reads the parameter with a five-minute cache (`WORKLOAD_ROSTER_CACHE_SECONDS`)
+and falls back to the inline `WORKLOAD_ROSTER_JSON` (empty in deployments;
+used by local runs and tests) if Parameter Store is unreadable, logging a
+warning. `GET /admin/workloads` reports which source answered as
+`roster_source`. Roster changes therefore take effect at most five minutes
+after a deploy without a broker restart.
+
+**Console.** The Users tab lists JWT identities only (`granularity=user`);
+the Workloads tab shows the roster with per-workload model, inference profile,
+IAM role, and an enforcement pill: *Enforced* (role attached), *Metering
+only* (no role), *Unregistered* (a metered row no longer in the config), or
+*Awaiting traffic* (configured, no invocation since deploy — no quota row
+yet, so limits and status become editable after its first call). The
+Overview reports users and workloads as separate groups with an all-subject
+total in the enforcement strip. `POST /admin/users` rejects the `workload:`
+prefix; workload rows only come from metering.
 
 Scale envelope: 1,000 application inference profiles per account
 (adjustable), 1,000 IAM roles per account (adjustable); the deny document is
@@ -418,20 +513,21 @@ about 300 bytes against the 10,240-character inline policy limit.
 ```json
 {
   "catalog_models": {
-    "price-list-model-name": ["runtime-model-id"]
+    "price-list-model-name": ["runtime-model-id"],
+    "Nova Canvas": ["amazon.nova-canvas-v1:0"]
   },
   "price_overrides": {
     "anthropic.claude-opus-4-7": {
       "input_per_mtok": 5,
-      "output_per_mtok": 25
-    },
-    "global.anthropic.claude-opus-4-7": {
-      "input_per_mtok": 5,
-      "output_per_mtok": 25
+      "output_per_mtok": 25,
+      "cache_read_per_mtok": 0.5,
+      "cache_write_per_mtok": 6.25,
+      "reason": "Marketplace-billed; no Pricing API entry"
     },
     "us.anthropic.claude-opus-4-7": {
       "input_per_mtok": 5.5,
-      "output_per_mtok": 27.5
+      "output_per_mtok": 27.5,
+      "reason": "US geographic uplift"
     }
   },
   "fallback_price": {
@@ -441,12 +537,34 @@ about 300 bytes against the 10,240-character inline policy limit.
 }
 ```
 
+Every price entry requires `input_per_mtok` and `output_per_mtok` (USD per
+million tokens) and may add `cache_read_per_mtok`, `cache_write_per_mtok`
+(USD per million tokens) and `per_image` (USD per generated image).
+Unknown keys fail synthesis. The token pair must be positive except for an
+image model (`per_image > 0`), whose token rates are pinned at `0` because
+the Price List publishes none; `fallback_price` must always carry a positive
+token pair. `cache_write_per_mtok` may be `0` (the Nova catalog value).
+
 AWS Price List is queried during deployment and the resulting snapshot seeds
-an SSM parameter plus a usage-processor environment fallback. A daily
+an SSM parameter plus a usage-processor environment fallback. For each
+`catalog_models` entry the resolver reads the standard on-demand
+`Input tokens` / `Output tokens` rows and, when published, the
+`Prompt cache read input tokens` / `Prompt cache write input tokens` rows
+(matched literally on `inferenceType`, unit `1K tokens`) and the smallest
+standard text-to-image `image`-unit row. An ambiguous catalog (two
+different rates for one dimension) fails the resolve rather than averaging.
+The conservative fallback is raised, per dimension, to at least the highest
+known rate for that dimension, so a record whose dimension is missing from
+its own model's entry is priced conservatively rather than at zero.
+A daily
 EventBridge schedule re-resolves catalog prices and rewrites the parameter,
 so Pricing API changes reach metering without a redeploy; if Parameter Store
-or a refresh fails, metering continues on the deployment snapshot and the
-refresh failure surfaces through the Lambda error metric. Current official
+or a refresh fails, metering continues on the last value it read (or the
+processor's built-in conservative defaults before its first read) and the
+refresh failure surfaces through the Lambda error metric. The snapshot is
+deliberately **not** copied into the Lambda environment: Lambda caps
+environment variables at 4 KB and the resolved catalog with cache and image
+dimensions is already ~3 KB. Current official
 standard rates in `us-east-1` are resolved dynamically for GPT OSS
 20B (`$0.07/$0.30` input/output per MTok) and 120B (`$0.15/$0.60`). Claude
 Opus 4.7 is billed through Marketplace, so this sample pins its exact runtime
@@ -488,9 +606,9 @@ time. Each normalized row retains Region, model, provider, SKU, feature,
 service tier, inference/token type, routing, term, unit, currency, unit price,
 and the original product attributes.
 
-Do not inject the complete catalog into `MODEL_PRICES_JSON`: it contains many
-Regions and incompatible units and can exceed CloudFormation and Lambda
-environment limits. Use it for discovery/audit, then map only the exact Runtime
+Do not inject the complete catalog into the price configuration: it contains
+many Regions and incompatible units and would exceed the SSM standard
+parameter limit (4 KB). Use it for discovery/audit, then map only the exact Runtime
 model and inference-profile IDs needed by the deployed Region. `--metering-compatible`
 selects the standard on-demand input/output USD token rows and computes
 `price_per_million_tokens`, but it deliberately does not guess Runtime IDs.
@@ -501,9 +619,15 @@ the highest input and output rates in the known snapshot. The configured
 price. It can make USD usage higher than the final bill. It is not a universal
 upper bound for a more expensive model or a modality that is not billed by
 input/output tokens. Review pricing before adding models, inference profiles,
-service tiers, prompt caching, provisioned throughput, image/video generation,
-or separately billed tools. Updating pricing changes future events only;
-existing DynamoDB daily aggregates and blocked status are not repriced.
+service tiers, provisioned throughput, or separately billed tools. Prompt
+caching and image generation are priced when the catalog entry carries the
+dimension (see the README "Priced dimensions" table and its caveats); a
+record carrying a dimension its entry lacks is priced at the fallback's rate
+for that dimension, flagged on the daily row (`unpriced_requests`,
+`missing_dimensions`), and alarmed via `pricing_fallback`. List flagged rows
+with `tools/unpriced_usage.py --table <UsageTableName>`. Updating pricing
+changes future events only; existing DynamoDB daily aggregates and blocked
+status are not repriced.
 
 ### Invocation logging ownership
 
@@ -528,6 +652,86 @@ Use this only in a demo or account where the stack owns the setting.
 In a shared account, confirm that the log group already receives Runtime
 invocation logs and has available subscription-filter capacity. This stack
 must not displace a security or central logging subscription.
+
+### Reconciliation (optional)
+
+The ledger prices every invocation from the catalog; it is an *estimate*. To
+check daily that the estimate tracks the bill, enable reconciliation:
+
+```json
+{
+  "reconciliation_enabled": true,
+  "reconcile_lag_days": 2,
+  "reconciliation_alarm_percent": 10
+}
+```
+
+This deploys `SpendReconciliationFn`, a `cron(0 6 * * ? *)` schedule, the
+`reconciliation_delta` alarm, a dashboard widget, and grants the function
+`ce:GetCostAndUsage` (no resource-level scoping exists for Cost Explorer;
+this is the only `ce:` action granted). Each run compares, for day
+`today − reconcile_lag_days` in UTC:
+
+- **Aggregate** — the sum of every metered subject's daily ledger row against
+  Cost Explorer `UnblendedCost` for `SERVICE ∈ {Amazon Bedrock, Amazon Bedrock
+  Service}` in the stack's Region.
+- **Per workload** — each `workload:<name>` row against Cost Explorer
+  filtered on the cost-allocation tag `bedrock-spend-controls-workload=<name>`
+  that the stack already stamps on every application inference profile.
+
+Results are stored as `RECONCILE#<day>` rows in the usage table (same TTL as
+the ledger) and served by `GET /admin/reconciliation`; the Operations tab
+shows a **Spend reconciliation** card. When the feature is off the endpoint
+and card say so explicitly rather than showing an empty comparison.
+
+**Before the first run:**
+
+1. *Cost Explorer must be enabled on the payer account.* Open Billing and
+   Cost Management → Cost Explorer once; the API can take up to 24 h to start
+   answering, during which the function emits `ReconciliationFailure` and one
+   SNS message per day.
+2. *Activate the cost-allocation tag* if you use workloads, or every workload
+   reports `tag_inactive` (ledger has spend, CE sees none for the tag):
+   Billing and Cost Management → **Cost allocation tags** → select
+   `bedrock-spend-controls-workload` → **Activate**, or
+   ```bash
+   aws ce update-cost-allocation-tags-status \
+     --cost-allocation-tags-status TagKey=bedrock-spend-controls-workload,Status=Active
+   ```
+   The tag appears in the list only after a tagged resource has incurred
+   cost; CE starts attributing ~24 h after activation and does not backfill.
+   Until then the function sends `RECONCILIATION: cost-allocation tag not
+   active` daily and emits `ReconciliationTagInactive = 1` per workload.
+   **In an AWS Organization this is a management (payer) account action**:
+   a linked account gets `AccessDeniedException: Linked account doesn't have
+   access to cost allocation tags` from both the console and the CLI, so ask
+   the payer administrator to activate the key once for the organization.
+   Aggregate reconciliation does not depend on the tag and works from the
+   linked account as long as Cost Explorer is enabled there.
+
+**Reading the delta.** `delta = billed − estimated`; `delta_percent` is that
+difference relative to the *larger* of the two figures, so it is always
+within ±100 % (−100 % = the bill saw nothing the ledger metered, +100 % = the
+ledger saw nothing the bill charged; `null` only when both are zero). A
+*positive* delta is
+expected wherever other principals in the account call Bedrock in that
+Region (console Playground, other roles, direct calls): the ledger holds only
+metered subjects, CE holds the whole account. Set
+`reconciliation_alarm_percent` above that floor, or route those callers
+through the gateway or a workload profile. A *negative* delta means the
+catalog over-prices (fallback-priced models, a high override, a cross-Region
+profile priced at the base model's rate) or the account has credits or
+private pricing; see
+[docs/runbooks/alarms/reconciliation-delta.md](docs/runbooks/alarms/reconciliation-delta.md).
+
+**Limits.** Cost Explorer data lags 24–48 h, which is why the default compares
+D-2, and daily figures for the last day may still change (`Estimated: true`).
+JWT-vended users share one IAM role and therefore one line in the bill: there
+is **no per-user reconciliation**, aggregate is the finest grain for them.
+Cost Explorer bills $0.01 per API request — one run is `1 + workloads`
+requests, roughly $0.30 per month plus $0.30 per workload. The historical
+ledger is never repriced by a run; reconciliation is a drift signal, not a
+correction.
 
 ### TTL and reset
 
@@ -966,7 +1170,9 @@ inference exception:
       "Action": [
         "bedrock:InvokeModel",
         "bedrock:InvokeModelWithResponseStream",
-        "bedrock:CallWithBearerToken"
+        "bedrock:CallWithBearerToken",
+        "bedrock-mantle:CreateInference",
+        "bedrock-mantle:CallWithBearerToken"
       ],
       "Resource": "*",
       "Condition": {
@@ -978,6 +1184,12 @@ inference exception:
   ]
 }
 ```
+
+The two `bedrock-mantle:*` actions are included because the Bedrock Mantle
+endpoint is not captured by model-invocation logging: any principal that can
+call it spends outside the ledger. The vended role never receives those
+actions, so the exception for `BEDROCK_USER_ROLE_ARN` does not reopen the
+gap.
 
 Validate any SCP in a non-production OU. Account administrators and
 organization administrators remain capable of changing the policy.

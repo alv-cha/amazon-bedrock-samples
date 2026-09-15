@@ -34,6 +34,9 @@ _DEPLOYMENT_KEYS = {
     "manage_invocation_logging",
     "model_config",
     "permission_lease_seconds",
+    "reconcile_lag_days",
+    "reconciliation_alarm_percent",
+    "reconciliation_enabled",
     "refresh_jitter_seconds",
     "refresh_overlap_seconds",
     "retain_tables_on_delete",
@@ -74,6 +77,9 @@ _DEFAULTS = {
     "jwt_user_claim": "sub",
     "model_config": "config/model-pricing.json",
     "permission_lease_seconds": 300,
+    "reconcile_lag_days": 2,
+    "reconciliation_alarm_percent": 10,
+    "reconciliation_enabled": False,
     "refresh_jitter_seconds": 5,
     "refresh_overlap_seconds": 10,
     "retain_tables_on_delete": False,
@@ -122,13 +128,30 @@ class QuotaLimitConfig:
     usd: float
     input_tokens: int
     output_tokens: int
+    # Storage-form thresholds ([{at_bps, action}]); None = deployment
+    # default derived from warn_threshold at runtime.
+    thresholds: tuple[dict[str, Any], ...] | None = None
 
-    def as_dict(self) -> dict[str, float | int]:
-        return {
+    def as_dict(self) -> dict[str, Any]:
+        value: dict[str, Any] = {
             "usd": self.usd,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
         }
+        if self.thresholds is not None:
+            value["thresholds"] = [dict(entry) for entry in self.thresholds]
+        return value
+
+
+@dataclass(frozen=True)
+class RateLimitConfig:
+    """Subject-level per-minute rate limits applied to new rows (0 = off)."""
+
+    rpm: int = 0
+    tpm: int = 0
+
+    def as_dict(self) -> dict[str, int]:
+        return {"rpm": self.rpm, "tpm": self.tpm}
 
 
 @dataclass(frozen=True)
@@ -145,6 +168,7 @@ class DeploymentConfig:
     default_daily_limits: QuotaLimitConfig
     default_weekly_limits: QuotaLimitConfig | None
     default_monthly_limits: QuotaLimitConfig | None
+    default_rate_limits: RateLimitConfig | None
     invocation_log_group_name: str
     invoker_principal_arns: tuple[str, ...]
     jwt_audience: str
@@ -154,6 +178,9 @@ class DeploymentConfig:
     manage_invocation_logging: bool
     model_pricing: ModelPricingConfig
     permission_lease_seconds: int
+    reconcile_lag_days: int
+    reconciliation_alarm_percent: float
+    reconciliation_enabled: bool
     refresh_jitter_seconds: int
     refresh_overlap_seconds: int
     retain_tables_on_delete: bool
@@ -168,22 +195,22 @@ class DeploymentConfig:
 
     @property
     def default_limits_json(self) -> str:
-        return json.dumps(
-            {
-                "daily": self.default_daily_limits.as_dict(),
-                "weekly": (
-                    self.default_weekly_limits.as_dict()
-                    if self.default_weekly_limits is not None
-                    else None
-                ),
-                "monthly": (
-                    self.default_monthly_limits.as_dict()
-                    if self.default_monthly_limits is not None
-                    else None
-                ),
-            },
-            sort_keys=True,
-        )
+        payload: dict[str, Any] = {
+            "daily": self.default_daily_limits.as_dict(),
+            "weekly": (
+                self.default_weekly_limits.as_dict()
+                if self.default_weekly_limits is not None
+                else None
+            ),
+            "monthly": (
+                self.default_monthly_limits.as_dict()
+                if self.default_monthly_limits is not None
+                else None
+            ),
+        }
+        if self.default_rate_limits is not None:
+            payload["rate"] = self.default_rate_limits.as_dict()
+        return json.dumps(payload, sort_keys=True)
 
     @classmethod
     def from_node(cls, node: Node) -> "DeploymentConfig":
@@ -393,6 +420,27 @@ class DeploymentConfig:
                 "quota evaluation cannot lose retained daily usage"
             )
 
+        reconciliation_enabled = _boolean(
+            "reconciliation_enabled", value("reconciliation_enabled")
+        )
+        reconcile_lag_days = _positive_int(
+            "reconcile_lag_days", value("reconcile_lag_days")
+        )
+        if reconcile_lag_days > 14:
+            raise ValueError(
+                "reconcile_lag_days must be at most 14: Cost Explorer daily "
+                f"data settles within 48 h; got {reconcile_lag_days}"
+            )
+        reconciliation_alarm_percent = _positive_float(
+            "reconciliation_alarm_percent",
+            value("reconciliation_alarm_percent"),
+        )
+        if reconciliation_alarm_percent > 100:
+            raise ValueError(
+                "reconciliation_alarm_percent must be at most 100; "
+                f"got {reconciliation_alarm_percent}"
+            )
+
         return cls(
             adapter_layer_arn=_string(
                 "adapter_layer_arn", value("adapter_layer_arn")
@@ -410,6 +458,7 @@ class DeploymentConfig:
             default_daily_limits=default_limits["daily"],
             default_weekly_limits=default_limits["weekly"],
             default_monthly_limits=default_limits["monthly"],
+            default_rate_limits=default_limits["rate"],
             invocation_log_group_name=existing_log_group,
             invoker_principal_arns=tuple(invoker_arns),
             jwt_audience=jwt_audience,
@@ -419,6 +468,9 @@ class DeploymentConfig:
             manage_invocation_logging=manage_logging,
             model_pricing=model_pricing,
             permission_lease_seconds=permission_lease_seconds,
+            reconcile_lag_days=reconcile_lag_days,
+            reconciliation_alarm_percent=reconciliation_alarm_percent,
+            reconciliation_enabled=reconciliation_enabled,
             refresh_jitter_seconds=refresh_jitter_seconds,
             refresh_overlap_seconds=refresh_overlap_seconds,
             retain_tables_on_delete=_boolean(
@@ -513,7 +565,9 @@ def _model_pricing(raw: Any, base_dir: Path) -> ModelPricingConfig:
         raise ValueError(
             "model_config must define at least one catalog model or price override"
         )
-    fallback = _price("fallback_price", data["fallback_price"])
+    fallback = _price(
+        "fallback_price", data["fallback_price"], allow_image_model=False
+    )
     return ModelPricingConfig(catalog_models, price_overrides, fallback)
 
 
@@ -622,13 +676,63 @@ def _boolean(name: str, raw: Any) -> bool:
     raise ValueError(f"{name} must be true or false; got {raw!r}")
 
 
+_THRESHOLD_ACTIONS = ("warn", "block")
+_MAX_THRESHOLD_RATIO = 10.0  # 1000 %
+
+
+def _thresholds(name: str, raw: Any) -> tuple[dict[str, Any], ...]:
+    """Validate a thresholds list at synth time.
+
+    Same rules the runtime layer enforces (kept in sync deliberately so a
+    config that synthesizes never fails at runtime): non-empty list of
+    ``{at, action}`` with ``0 < at <= 10``, strictly increasing ``at``,
+    actions in {warn, block}, at most one ``block`` and only last. A list
+    with no ``block`` is an alert-only period.
+    """
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(f"{name} must be a non-empty list")
+    if len(raw) > 20:
+        raise ValueError(f"{name} may contain at most 20 entries")
+    result: list[dict[str, Any]] = []
+    for index, entry in enumerate(raw):
+        label = f"{name}[{index}]"
+        if not isinstance(entry, dict):
+            raise ValueError(f"{label} must be an object")
+        unknown = sorted(set(entry) - {"at", "action"})
+        if unknown:
+            raise ValueError(f"{label} has unknown keys: {', '.join(unknown)}")
+        if "at" not in entry or "action" not in entry:
+            raise ValueError(f"{label} must contain at and action")
+        at = _positive_float(f"{label}.at", entry["at"])
+        if at > _MAX_THRESHOLD_RATIO:
+            raise ValueError(
+                f"{label}.at must be at most {_MAX_THRESHOLD_RATIO:g} (1000 %)"
+            )
+        at_bps = int(round(at * 10_000))
+        action = entry["action"]
+        if action not in _THRESHOLD_ACTIONS:
+            raise ValueError(
+                f"{label}.action must be one of {', '.join(_THRESHOLD_ACTIONS)}"
+            )
+        if result and at_bps <= result[-1]["at_bps"]:
+            raise ValueError(
+                f"{name} entries must be strictly increasing in at"
+            )
+        if result and result[-1]["action"] == "block":
+            raise ValueError(
+                f"{name}: a 'block' entry must be the last threshold"
+            )
+        result.append({"at_bps": at_bps, "action": action})
+    return tuple(result)
+
+
 def _quota_default_limits(
     raw: Any,
-) -> dict[str, QuotaLimitConfig | None]:
+) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("default_limits must be an object")
     periods = {"daily", "weekly", "monthly"}
-    unknown = sorted(set(raw) - periods)
+    unknown = sorted(set(raw) - periods - {"rate"})
     if unknown:
         raise ValueError(
             "Invalid default_limits: unknown " + ", ".join(unknown)
@@ -636,8 +740,9 @@ def _quota_default_limits(
     if "daily" not in raw:
         raise ValueError("Invalid default_limits: missing daily")
 
-    result: dict[str, QuotaLimitConfig | None] = {}
+    result: dict[str, Any] = {}
     expected = {"usd", "input_tokens", "output_tokens"}
+    optional = {"thresholds"}
     for period in ("daily", "weekly", "monthly"):
         value = raw.get(period)
         if value is None:
@@ -647,7 +752,7 @@ def _quota_default_limits(
             continue
         if not isinstance(value, dict):
             raise ValueError(f"default_limits.{period} must be an object or null")
-        unknown_fields = sorted(set(value) - expected)
+        unknown_fields = sorted(set(value) - expected - optional)
         missing_fields = sorted(expected - set(value))
         if unknown_fields or missing_fields:
             details = []
@@ -670,6 +775,28 @@ def _quota_default_limits(
                 f"default_limits.{period}.output_tokens",
                 value["output_tokens"],
             ),
+            thresholds=(
+                _thresholds(
+                    f"default_limits.{period}.thresholds", value["thresholds"]
+                )
+                if value.get("thresholds") is not None
+                else None
+            ),
+        )
+    rate_raw = raw.get("rate")
+    if rate_raw is None:
+        result["rate"] = None
+    else:
+        if not isinstance(rate_raw, dict):
+            raise ValueError("default_limits.rate must be an object or null")
+        unknown_rate = sorted(set(rate_raw) - {"rpm", "tpm"})
+        if unknown_rate:
+            raise ValueError(
+                "Invalid default_limits.rate: unknown " + ", ".join(unknown_rate)
+            )
+        result["rate"] = RateLimitConfig(
+            rpm=_non_negative_int("default_limits.rate.rpm", rate_raw.get("rpm", 0)),
+            tpm=_non_negative_int("default_limits.rate.tpm", rate_raw.get("tpm", 0)),
         )
     return result
 
@@ -782,15 +909,45 @@ def _string_list(name: str, raw: Any) -> list[str]:
     return values
 
 
-def _price(name: str, raw: Any) -> dict[str, float]:
+# Price entry keys. ``input_per_mtok``/``output_per_mtok`` are required; the
+# optional dimensions are USD per million tokens (cache) or USD per generated
+# image, matching the usage processor's price vocabulary.
+_REQUIRED_PRICE_KEYS = ("input_per_mtok", "output_per_mtok")
+_OPTIONAL_PRICE_KEYS = (
+    "cache_read_per_mtok",
+    "cache_write_per_mtok",
+    "per_image",
+)
+
+
+def _price(name: str, raw: Any, *, allow_image_model: bool = True) -> dict[str, float]:
     if not isinstance(raw, dict):
         raise ValueError(f"{name} must be an object")
-    expected = {"input_per_mtok", "output_per_mtok"}
-    if set(raw) != expected:
+    allowed = set(_REQUIRED_PRICE_KEYS) | set(_OPTIONAL_PRICE_KEYS)
+    missing = sorted(set(_REQUIRED_PRICE_KEYS) - set(raw))
+    unknown = sorted(set(raw) - allowed)
+    if missing or unknown:
+        details = []
+        if missing:
+            details.append("missing " + ", ".join(missing))
+        if unknown:
+            details.append("unknown " + ", ".join(unknown))
         raise ValueError(
-            f"{name} must contain exactly input_per_mtok and output_per_mtok"
+            f"{name} must contain input_per_mtok and output_per_mtok, "
+            f"optionally {', '.join(_OPTIONAL_PRICE_KEYS)}: "
+            + "; ".join(details)
         )
-    return {
-        field: _positive_float(f"{name}.{field}", raw[field])
-        for field in sorted(expected)
-    }
+    price: dict[str, float] = {}
+    # Cache write is legitimately $0 for some models (Nova), so optional
+    # dimensions are non-negative. The required token pair must be positive
+    # unless this is an image model (positive per_image) whose token rates
+    # are pinned at zero because the Price List publishes none.
+    image_model = allow_image_model and _non_negative_float(
+        f"{name}.per_image", raw.get("per_image", 0)
+    ) > 0
+    for field in sorted(raw):
+        if field in _REQUIRED_PRICE_KEYS and not image_model:
+            price[field] = _positive_float(f"{name}.{field}", raw[field])
+        else:
+            price[field] = _non_negative_float(f"{name}.{field}", raw[field])
+    return price

@@ -443,6 +443,199 @@ class _WireShortCircuit(Exception):
     """Raised by the before-send hook after capturing the signed request."""
 
 
+# ---------------------------------------------------------------------------
+# Thresholds and rate limits: storage round-trip and evaluation
+# ---------------------------------------------------------------------------
+
+
+def test_thresholds_round_trip_through_storage_and_snapshot(fake_dynamodb):
+    store = QuotaStore(dynamodb=fake_dynamodb)
+    store.put_user(
+        "alice",
+        "Alice",
+        limits={
+            "daily": {
+                "usd": 10,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "thresholds": [
+                    {"at": 0.5, "action": "warn"},
+                    {"at": 0.8, "action": "warn"},
+                    {"at": 1.5, "action": "block"},
+                ],
+            },
+            "weekly": {
+                "usd": 50,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "thresholds": [{"at": 1.0, "action": "warn"}],  # alert-only
+            },
+            "monthly": None,
+            "rate": {"rpm": 30, "tpm": 0},
+        },
+    )
+    user = store.get_user("alice")
+    assert user.daily_thresholds == (
+        {"at_bps": 5000, "action": "warn"},
+        {"at_bps": 8000, "action": "warn"},
+        {"at_bps": 15000, "action": "block"},
+    )
+    assert user.weekly_thresholds == ({"at_bps": 10000, "action": "warn"},)
+    assert user.monthly_thresholds is None  # disabled period stores []
+    assert user.rpm == 30 and user.tpm == 0 and user.rate_limited
+
+    # Audit snapshot -> user keeps every threshold and the rate limits.
+    snapshot = QuotaStore._user_snapshot(user)
+    assert snapshot["limits"]["daily"]["thresholds"][2] == {
+        "at_bps": 15000, "action": "block",
+    }
+    assert snapshot["rate"] == {"rpm": 30, "tpm": 0}
+    restored = QuotaStore._snapshot_to_user(snapshot)
+    assert restored.daily_thresholds == user.daily_thresholds
+    assert restored.rpm == 30
+
+
+def test_legacy_row_resolves_to_deployment_default_thresholds(
+    fake_dynamodb, monkeypatch
+):
+    from dataclasses import replace
+
+    from app import quota as quota_module
+
+    monkeypatch.setattr(
+        quota_module,
+        "settings",
+        replace(quota_module.settings, warn_threshold=0.75),
+    )
+    store = QuotaStore(dynamodb=fake_dynamodb)
+    store._users.put_item(  # noqa: SLF001 - authentic pre-thresholds row
+        Item={
+            "user_id": "legacy",
+            "name": "Legacy",
+            "status": "active",
+            "daily_usd_micro": MICRO,
+            "daily_input_tokens": 100,
+            "daily_output_tokens": 50,
+        }
+    )
+    user = store.get_user("legacy")
+    assert user.daily_thresholds is None
+    assert user.period_limits["daily"]["thresholds"] == [
+        {"at_bps": 7500, "action": "warn"},
+        {"at_bps": 10000, "action": "block"},
+    ]
+    assert not user.rate_limited
+
+
+def test_alert_only_period_is_never_over_budget_at_vend(fake_dynamodb):
+    store = QuotaStore(dynamodb=fake_dynamodb)
+    store.put_user(
+        "alice",
+        "Alice",
+        limits={
+            "daily": {
+                "usd": 1,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "thresholds": [{"at": 1.0, "action": "warn"}],
+            },
+            "weekly": None,
+            "monthly": None,
+        },
+    )
+    _put_usage(store, "alice", cost_micro=50 * MICRO)  # 5000 %
+    user = store.get_user("alice")
+    evaluation = store.evaluate_user_quota(user)
+    assert not evaluation.over_budget
+    assert [w.at_bps for w in evaluation.warnings] == [10000]
+    assert evaluation.ratios["daily.usd"] == 50.0
+
+
+def test_block_threshold_above_limit_blocks_only_when_reached(fake_dynamodb):
+    store = QuotaStore(dynamodb=fake_dynamodb)
+    store.put_user(
+        "alice",
+        "Alice",
+        limits={
+            "daily": {
+                "usd": 1,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "thresholds": [{"at": 1.2, "action": "block"}],
+            },
+            "weekly": None,
+            "monthly": None,
+        },
+    )
+    _put_usage(store, "alice", cost_micro=int(1.19 * MICRO))
+    assert not store.is_over_budget(store.get_user("alice"))
+    _put_usage(store, "alice", cost_micro=int(1.2 * MICRO))
+    evaluation = store.evaluate_user_quota(store.get_user("alice"))
+    assert evaluation.over_budget
+    assert evaluation.breaches[0].at_bps == 12000
+
+
+def test_rate_limit_evaluation_reads_current_minute_counter(fake_dynamodb):
+    store = QuotaStore(dynamodb=fake_dynamodb)
+    store.put_user(
+        "alice",
+        "Alice",
+        limits={
+            "daily": {"usd": 100, "input_tokens": 0, "output_tokens": 0},
+            "weekly": None,
+            "monthly": None,
+            "rate": {"rpm": 3, "tpm": 0},
+        },
+    )
+    now = datetime(2030, 1, 1, 10, 30, 15, tzinfo=timezone.utc)
+    store._usage.put_item(  # noqa: SLF001 - what the processor writes
+        Item={"user_id": "RATE#alice", "window": "2030-01-01T10:30",
+              "requests": 3, "tokens": 900}
+    )
+    user = store.get_user("alice")
+    blocked = store.evaluate_user_quota(user, now)
+    assert blocked.over_budget
+    assert blocked.breaches[0].period == "minute"
+    assert blocked.breaches[0].dimension == "rpm"
+    from app.quota import quota_reason
+    assert quota_reason(blocked) == (
+        "auto: rpm rate limit reached in minute 2030-01-01T10:30"
+    )
+    # Next minute: no counter row, under quota -> automatic block would lift.
+    assert not store.evaluate_user_quota(
+        user, now + timedelta(minutes=1)
+    ).over_budget
+
+
+def test_limit_change_can_disable_rate_limits_with_null(fake_dynamodb):
+    store = QuotaStore(dynamodb=fake_dynamodb)
+    store.put_user(
+        "alice", "Alice",
+        limits={
+            "daily": {"usd": 1, "input_tokens": 0, "output_tokens": 0},
+            "weekly": None, "monthly": None, "rate": {"rpm": 5, "tpm": 5},
+        },
+    )
+    assert store.get_user("alice").rate_limited
+    result = store.update_admin_limits(
+        "alice",
+        {
+            "daily": {"usd": 1, "input_tokens": 0, "output_tokens": 0},
+            "weekly": None,
+            "monthly": None,
+            "rate": None,
+        },
+        reason="drop rate limits",
+        expected_version=1,
+        actor="admin",
+        auth_method="shared-key",
+        idempotency_key="drop-rate",
+        request_hash="h",
+    )
+    assert not result.user.rate_limited
+    assert store.get_user("alice").rpm == 0
+
+
 def test_transaction_client_sends_typed_values_unmodified(monkeypatch):
     """Transactions must go through a genuine low-level DynamoDB client.
 
@@ -478,3 +671,102 @@ def test_transaction_client_sends_typed_values_unmodified(monkeypatch):
     sent = jsonlib.loads(captured["body"])["TransactItems"][0]["Put"]["Item"]
     assert sent["user_id"] == {"S": "alice"}
     assert sent["version"] == {"N": "1"}
+
+
+# ---------------------------------------------------------------------------
+# Per-model budgets: derivation and admin mutation
+# ---------------------------------------------------------------------------
+
+
+def test_model_scoped_weekly_and_monthly_derive_from_model_daily_rows(
+    fake_dynamodb,
+):
+    store = QuotaStore(dynamodb=fake_dynamodb)
+    now = datetime(2026, 9, 9, 12, tzinfo=timezone.utc)  # Wednesday
+    store.put_user(
+        "alice", "Alice",
+        limits={"daily": {"usd": 1000, "input_tokens": 0, "output_tokens": 0},
+                "weekly": None, "monthly": None},
+    )
+    store.update_admin_model_budget(
+        "alice", "opus",
+        {
+            "daily": None,
+            "weekly": {"usd": 0.000006, "input_tokens": 0, "output_tokens": 0},
+            "monthly": {"usd": 0.000020, "input_tokens": 0, "output_tokens": 0},
+        },
+        reason="cap opus per week/month",
+        expected_version=1, actor="admin", auth_method="shared-key",
+        idempotency_key="opus-budget", request_hash="h",
+    )
+    # Per-model daily rows written by the processor; the subject rows carry
+    # more (other models) and must NOT be what the model budget sees.
+    for window, cost in (("2026-09-01", 10), ("2026-09-07", 4), ("2026-09-09", 3)):
+        store._usage.put_item(  # noqa: SLF001
+            Item={"user_id": "alice#model#opus", "window": window, "cost_micro": cost}
+        )
+        store._usage.put_item(  # noqa: SLF001
+            Item={"user_id": "alice", "window": window, "cost_micro": cost * 100}
+        )
+
+    usage = store.get_model_usage("alice", "opus", now)
+    assert usage["daily"]["cost_micro"] == 3
+    assert usage["weekly"]["cost_micro"] == 7
+    assert usage["monthly"]["cost_micro"] == 17
+
+    user = store.get_user("alice")
+    evaluation = store.evaluate_user_quota(user, now)
+    assert [(b.model_id, b.period, b.dimension) for b in evaluation.breaches] == [
+        ("opus", "weekly", "usd")
+    ]
+    assert evaluation.ratios["model.opus.monthly.usd"] == 17 / 20
+    from app.quota import quota_reason
+    assert quota_reason(evaluation) == (
+        "auto: weekly USD quota exhausted for model opus in 2026-09-07"
+    )
+
+
+def test_model_budget_round_trips_through_snapshot(fake_dynamodb):
+    store = QuotaStore(dynamodb=fake_dynamodb)
+    store.put_user("alice", "Alice", 1, 100, 50)
+    result = store.update_admin_model_budget(
+        "alice", "opus",
+        {"daily": {"usd": 2, "input_tokens": 0, "output_tokens": 0,
+                   "thresholds": [{"at": 1.0, "action": "warn"}]},
+         "weekly": None, "monthly": None},
+        reason="soft cap", expected_version=1, actor="admin",
+        auth_method="shared-key", idempotency_key="k1", request_hash="h1",
+    )
+    assert result.user.version == 2
+    assert result.user.model_budget_limits["opus"]["daily"]["usd_micro"] == 2 * MICRO
+    assert result.user.model_budget_limits["opus"]["daily"]["thresholds"] == [
+        {"at_bps": 10000, "action": "warn"}
+    ]
+    snapshot = QuotaStore._user_snapshot(result.user)
+    restored = QuotaStore._snapshot_to_user(snapshot)
+    assert restored.model_budget_limits == result.user.model_budget_limits
+
+    # Replay with the same key/hash returns the same result without a write.
+    replay = store.update_admin_model_budget(
+        "alice", "opus", {"daily": {"usd": 9, "input_tokens": 0, "output_tokens": 0},
+                          "weekly": None, "monthly": None},
+        reason="ignored", expected_version=2, actor="admin",
+        auth_method="shared-key", idempotency_key="k1", request_hash="h1",
+    )
+    assert replay.replayed and replay.user.version == 2
+
+    # Removing the only budget drops the attribute entirely.
+    removed = store.update_admin_model_budget(
+        "alice", "opus", None, reason="done", expected_version=2, actor="admin",
+        auth_method="shared-key", idempotency_key="k2", request_hash="h2",
+    )
+    assert removed.user.model_budgets is None
+    assert "model_budgets" not in store._users.get_item(  # noqa: SLF001
+        Key={"user_id": "alice"}
+    )["Item"]
+    with pytest.raises(KeyError):
+        store.update_admin_model_budget(
+            "alice", "opus", None, reason="again", expected_version=3,
+            actor="admin", auth_method="shared-key",
+            idempotency_key="k3", request_hash="h3",
+        )

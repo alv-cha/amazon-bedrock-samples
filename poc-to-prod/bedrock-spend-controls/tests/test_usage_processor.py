@@ -444,10 +444,13 @@ def test_warning_threshold_is_tracked_per_calendar_period(
     assert len(fake_sns.published) == 1
     payload = json.loads(fake_sns.published[0]["Message"])
     assert payload["period"] == "weekly"
+    assert payload["threshold"] == 0.8
     row = fake_dynamodb.Table(os.environ["USERS_TABLE"]).get_item(
         Key={"user_id": "alice"}
     )["Item"]
-    assert row["warning_sent_weekly_window"] == "2026-09-07"
+    # Markers are per threshold (basis points) per period so a multi-level
+    # list sends each level exactly once per calendar window.
+    assert row["warning_sent_weekly_8000_window"] == "2026-09-07"
 
 
 def test_duplicate_delivery_repairs_failed_status_convergence(
@@ -858,7 +861,10 @@ def test_stale_parameter_value_outlives_a_failed_refresh(monkeypatch, capsys):
     )
 
     first = processor._parameter_prices(ssm, 1_000.0)
-    assert first == ({"m": (1.0, 2.0)}, (40.0, 90.0))
+    assert first == (
+        {"m": {"input": 1.0, "output": 2.0}},
+        {"input": 40.0, "output": 90.0},
+    )
     assert ssm.calls == 1
 
     # Within the TTL, no new fetch.
@@ -1226,3 +1232,813 @@ def test_metadata_less_duplicate_record_is_not_metered(
     )["Item"]
     assert row["requests"] == 1
     assert row["input_tokens"] == 100
+
+
+# ---------------------------------------------------------------------------
+# Multi-dimension pricing: prompt cache read/write, images
+# ---------------------------------------------------------------------------
+
+
+def _cached_record(
+    *,
+    request_id="cache-1",
+    model="anthropic.claude-haiku-4-5-20251001-v1:0",
+    input_tokens=11,
+    output_tokens=4,
+    cache_read=0,
+    cache_write=0,
+) -> dict:
+    """Shape observed in a real Converse record with a cachePoint: the
+    cache counters sit beside inputTokenCount on the input side."""
+    record = _record(
+        request_id=request_id,
+        model=model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
+    message = json.loads(record["message"])
+    message["input"]["cacheReadInputTokenCount"] = cache_read
+    message["input"]["cacheWriteInputTokenCount"] = cache_write
+    record["message"] = json.dumps(message)
+    return record
+
+
+def _today_row(fake_dynamodb, user_id="alice") -> dict:
+    return fake_dynamodb.Table(os.environ["USAGE_TABLE"]).get_item(
+        Key={
+            "user_id": user_id,
+            "window": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        }
+    )["Item"]
+
+
+def test_cache_read_and_write_tokens_are_priced_per_dimension(
+    fake_dynamodb, fake_sns, monkeypatch, capsys
+):
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    monkeypatch.setenv(
+        "MODEL_PRICES_JSON",
+        json.dumps({
+            "anthropic.claude-haiku-4-5-20251001-v1:0": {
+                "input_per_mtok": 1.0,
+                "output_per_mtok": 5.0,
+                "cache_read_per_mtok": 0.1,
+                "cache_write_per_mtok": 1.25,
+            }
+        }),
+    )
+    _seed_user(fake_dynamodb, "alice", usd=1000)
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+
+    _run(
+        _subscription([
+            _cached_record(
+                request_id="write",
+                input_tokens=1_000_000,
+                output_tokens=1_000_000,
+                cache_write=1_000_000,
+            ),
+            _cached_record(
+                request_id="read",
+                input_tokens=1_000_000,
+                output_tokens=0,
+                cache_read=1_000_000,
+            ),
+        ]),
+        fake_dynamodb,
+        fake_sns,
+    )
+
+    row = _today_row(fake_dynamodb)
+    # write: 1 + 5 + 1.25 = 7.25 ; read: 1 + 0.1 = 1.10 ; total 8.35 USD
+    assert row["cost_micro"] == 8_350_000
+    # Token quotas keep their pre-caching meaning: cached tokens are
+    # accounted separately, never folded into input_tokens.
+    assert row["input_tokens"] == 2_000_000
+    assert row["cache_write_tokens"] == 1_000_000
+    assert row["cache_read_tokens"] == 1_000_000
+    assert row["unpriced_requests"] == 0
+    assert "missing_dimensions" not in row
+    emf = _emf_records(capsys)
+    assert emf[0]["CacheWriteTokens"] == 1_000_000
+    assert emf[1]["CacheReadTokens"] == 1_000_000
+    assert all(e["FallbackPricedRequests"] == 0 for e in emf)
+    assert all(e["UnpricedDimensionRequests"] == 0 for e in emf)
+
+
+def test_image_generation_is_priced_per_image_not_per_token(
+    fake_dynamodb, fake_sns, monkeypatch, capsys
+):
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    monkeypatch.setenv(
+        "MODEL_PRICES_JSON",
+        json.dumps({
+            "amazon.nova-canvas-v1:0": {
+                "input_per_mtok": 0.0,
+                "output_per_mtok": 0.0,
+                "per_image": 0.04,
+            }
+        }),
+    )
+    _seed_user(fake_dynamodb, "alice", usd=1000)
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+
+    record = _record(request_id="canvas-1", model="amazon.nova-canvas-v1:0")
+    message = json.loads(record["message"])
+    # Real Nova Canvas records carry no token counts. When image data
+    # delivery is enabled the body lists the generated images.
+    message["input"] = {"inputContentType": "application/json"}
+    message["output"] = {
+        "outputContentType": "application/json",
+        "outputBodyJson": {"images": ["<b64>", "<b64>"]},
+    }
+    record["message"] = json.dumps(message)
+
+    result = _run(_subscription([record]), fake_dynamodb, fake_sns)
+
+    assert result["processed"] == 1
+    row = _today_row(fake_dynamodb)
+    assert row["cost_micro"] == 80_000  # 2 images * $0.04
+    assert row["images"] == 2
+    assert row["input_tokens"] == 0
+    assert row["output_tokens"] == 0
+    assert row["requests"] == 1
+    emf = _emf_records(capsys)[0]
+    assert emf["ImagesGenerated"] == 2
+    assert emf["PriceSource"] == "snapshot"
+    assert emf["FallbackPricedRequests"] == 0
+
+
+def test_image_model_record_without_image_count_is_metered_and_flagged(
+    fake_dynamodb, fake_sns, monkeypatch, capsys
+):
+    """With image data delivery disabled (this stack's default), a Nova
+    Canvas record has no token counts and no body. It must still count as a
+    request and be flagged as unpriced rather than silently dropped."""
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    monkeypatch.setenv(
+        "MODEL_PRICES_JSON",
+        json.dumps({
+            "amazon.nova-canvas-v1:0": {
+                "input_per_mtok": 0.0,
+                "output_per_mtok": 0.0,
+                "per_image": 0.04,
+            }
+        }),
+    )
+    _seed_user(fake_dynamodb, "alice", usd=1000)
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+
+    record = _record(request_id="canvas-blind", model="amazon.nova-canvas-v1:0")
+    message = json.loads(record["message"])
+    message["input"] = {"inputContentType": "application/json"}
+    message["output"] = {"outputContentType": "application/json"}
+    record["message"] = json.dumps(message)
+
+    result = _run(_subscription([record]), fake_dynamodb, fake_sns)
+
+    assert result["processed"] == 1
+    row = _today_row(fake_dynamodb)
+    assert row["requests"] == 1
+    assert row["images"] == 0
+    # No image count means no image dimension to price: the row is not
+    # flagged missing-dimension (nothing was present), but cost is zero and
+    # the operator sees the request in the ledger.
+    assert row["cost_micro"] == 0
+
+
+def test_input_output_only_pricing_is_unchanged_regression(
+    fake_dynamodb, fake_sns, monkeypatch, capsys
+):
+    """A model with only the legacy input/output pair prices exactly as it
+    did before multi-dimension support; cache fields absent from the log
+    never appear as missing dimensions."""
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    monkeypatch.setenv(
+        "MODEL_PRICES_JSON",
+        '{"openai.gpt-oss-20b":{"input_per_mtok":1,"output_per_mtok":2}}',
+    )
+    _seed_user(fake_dynamodb, "alice")
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+
+    _run(_subscription([_record()]), fake_dynamodb, fake_sns)
+
+    row = _today_row(fake_dynamodb)
+    assert row["cost_micro"] == 200
+    assert row["input_tokens"] == 100
+    assert row["output_tokens"] == 50
+    assert row["cache_read_tokens"] == 0
+    assert row["cache_write_tokens"] == 0
+    assert row["images"] == 0
+    assert row["unpriced_requests"] == 0
+    assert "missing_dimensions" not in row
+    emf = _emf_records(capsys)[0]
+    assert emf["PriceSource"] == "snapshot"
+    assert emf["FallbackPricedRequests"] == 0
+    assert emf["UnpricedDimensionRequests"] == 0
+    assert emf["MissingDimensions"] == []
+
+
+def test_dimension_present_in_log_but_absent_from_catalog_is_flagged(
+    fake_dynamodb, fake_sns, monkeypatch, capsys
+):
+    """Known model, input/output-only catalog entry, but the record carries
+    cache tokens. The request must not be priced at zero for that
+    dimension: it uses the fallback's rate when one exists, is flagged in
+    the ledger, and raises the fallback/alarm signal."""
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    monkeypatch.setenv(
+        "MODEL_PRICES_JSON",
+        json.dumps({
+            "anthropic.claude-haiku-4-5-20251001-v1:0": {
+                "input_per_mtok": 1.0,
+                "output_per_mtok": 5.0,
+            }
+        }),
+    )
+    monkeypatch.setenv(
+        "MODEL_FALLBACK_PRICE_JSON",
+        json.dumps({
+            "input_per_mtok": 15.0,
+            "output_per_mtok": 75.0,
+            "cache_read_per_mtok": 1.5,
+            "cache_write_per_mtok": 18.75,
+        }),
+    )
+    _seed_user(fake_dynamodb, "alice", usd=1000)
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+
+    result = _run(
+        _subscription([
+            _cached_record(
+                request_id="mixed",
+                input_tokens=1_000_000,
+                output_tokens=0,
+                cache_read=1_000_000,
+            )
+        ]),
+        fake_dynamodb,
+        fake_sns,
+    )
+
+    assert result["processed"] == 1
+    assert result["unpriced"] == 1
+    row = _today_row(fake_dynamodb)
+    # input at the model's own rate (1.0) + cache_read at the FALLBACK rate
+    # (1.5), never zero.
+    assert row["cost_micro"] == 2_500_000
+    assert row["unpriced_requests"] == 1
+    assert row["missing_dimensions"] == {"cache_read"}
+    emf = _emf_records(capsys)[0]
+    assert emf["PriceSource"] == "snapshot"
+    assert emf["MissingDimensions"] == ["cache_read"]
+    assert emf["FallbackPricedRequests"] == 1
+    assert emf["UnpricedDimensionRequests"] == 1
+
+
+def test_missing_dimension_with_no_fallback_rate_is_still_flagged(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    """Legacy two-rate fallback and a record with an image count: nothing
+    can price the image dimension, so it contributes zero but the request
+    is flagged so the undercount is discoverable."""
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    monkeypatch.setenv(
+        "MODEL_PRICES_JSON",
+        '{"openai.gpt-oss-20b":{"input_per_mtok":1,"output_per_mtok":2}}',
+    )
+    monkeypatch.setenv(
+        "MODEL_FALLBACK_PRICE_JSON",
+        '{"input_per_mtok":15,"output_per_mtok":75}',
+    )
+    _seed_user(fake_dynamodb, "alice", usd=1000)
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+
+    record = _record(request_id="text-plus-image")
+    message = json.loads(record["message"])
+    message["output"]["outputImageCount"] = 1
+    record["message"] = json.dumps(message)
+
+    _run(_subscription([record]), fake_dynamodb, fake_sns)
+
+    row = _today_row(fake_dynamodb)
+    assert row["cost_micro"] == 200  # tokens only
+    assert row["images"] == 1
+    assert row["unpriced_requests"] == 1
+    assert row["missing_dimensions"] == {"image"}
+
+
+def test_missing_dimensions_accumulate_as_a_set_on_the_daily_row(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    monkeypatch.setenv(
+        "MODEL_PRICES_JSON",
+        '{"openai.gpt-oss-20b":{"input_per_mtok":1,"output_per_mtok":2}}',
+    )
+    _seed_user(fake_dynamodb, "alice", usd=1000)
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+
+    first = _cached_record(
+        request_id="r1", model="openai.gpt-oss-20b", cache_read=10
+    )
+    second = _cached_record(
+        request_id="r2", model="openai.gpt-oss-20b", cache_write=10
+    )
+    third = _cached_record(
+        request_id="r3", model="openai.gpt-oss-20b", cache_read=10
+    )
+    _run(_subscription([first, second, third]), fake_dynamodb, fake_sns)
+
+    row = _today_row(fake_dynamodb)
+    assert row["requests"] == 3
+    assert row["unpriced_requests"] == 3
+    assert row["missing_dimensions"] == {"cache_read", "cache_write"}
+
+
+def test_nested_dimensions_map_in_price_entry_is_accepted():
+    rates = processor._rates_from_entry(
+        {
+            "input_per_mtok": 1.0,
+            "output_per_mtok": 2.0,
+            "dimensions": {"cache_read": 0.1, "image": 0.04, "unknown": 9},
+        }
+    )
+    assert rates == {"input": 1.0, "output": 2.0, "cache_read": 0.1, "image": 0.04}
+    with pytest.raises(ValueError, match="input and output"):
+        processor._rates_from_entry({"cache_read_per_mtok": 0.1})
+
+
+# ---------------------------------------------------------------------------
+# Thresholds: multi-level warnings, alert-only budgets, rate limits
+# ---------------------------------------------------------------------------
+
+
+def _thresholds(*entries: tuple[float, str]) -> list[dict]:
+    return [{"at_bps": int(at * 10_000), "action": action} for at, action in entries]
+
+
+def test_multi_threshold_warnings_send_each_level_exactly_once(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    monkeypatch.setenv("SNS_TOPIC_ARN", "arn:aws:sns:us-east-1:1:alerts")
+    _seed_user(
+        fake_dynamodb,
+        "alice",
+        in_limit=100,
+        out_limit=0,
+        daily_thresholds=_thresholds((0.5, "warn"), (0.8, "warn"), (1.0, "block")),
+    )
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+
+    _run(_subscription([_record(request_id="a", input_tokens=50, output_tokens=0)]),
+         fake_dynamodb, fake_sns)
+    assert [m["Subject"] for m in fake_sns.published] == [
+        "[bedrock-spend-controls] WARNING alice daily 50%"
+    ]
+    # Same level again: no duplicate.
+    _run(_subscription([_record(request_id="b", input_tokens=10, output_tokens=0)]),
+         fake_dynamodb, fake_sns)
+    assert len(fake_sns.published) == 1
+
+    _run(_subscription([_record(request_id="c", input_tokens=20, output_tokens=0)]),
+         fake_dynamodb, fake_sns)
+    assert fake_sns.published[1]["Subject"] == (
+        "[bedrock-spend-controls] WARNING alice daily 80%"
+    )
+    assert json.loads(fake_sns.published[1]["Message"])["threshold"] == 0.8
+
+    _run(_subscription([_record(request_id="d", input_tokens=20, output_tokens=0)]),
+         fake_dynamodb, fake_sns)
+    assert len(fake_sns.published) == 3
+    assert fake_sns.published[2]["Subject"] == (
+        "[bedrock-spend-controls] BLOCKED alice reason=daily-input_tokens"
+    )
+    user = fake_dynamodb.Table(os.environ["USERS_TABLE"]).get_item(
+        Key={"user_id": "alice"}
+    )["Item"]
+    assert user["status"] == "blocked"
+    assert user["warning_sent_daily_5000_window"]
+    assert user["warning_sent_daily_8000_window"]
+
+
+def test_one_request_crossing_two_levels_sends_both_once(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    monkeypatch.setenv("SNS_TOPIC_ARN", "arn:aws:sns:us-east-1:1:alerts")
+    _seed_user(
+        fake_dynamodb, "alice", in_limit=100, out_limit=0,
+        daily_thresholds=_thresholds((0.5, "warn"), (0.8, "warn"), (1.0, "block")),
+    )
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+
+    _run(_subscription([_record(request_id="a", input_tokens=85, output_tokens=0)]),
+         fake_dynamodb, fake_sns)
+    assert [m["Subject"] for m in fake_sns.published] == [
+        "[bedrock-spend-controls] WARNING alice daily 50%",
+        "[bedrock-spend-controls] WARNING alice daily 80%",
+    ]
+    _run(_subscription([_record(request_id="b", input_tokens=1, output_tokens=0)]),
+         fake_dynamodb, fake_sns)
+    assert len(fake_sns.published) == 2
+
+
+def test_alert_only_budget_warns_but_never_blocks(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    monkeypatch.setenv("SNS_TOPIC_ARN", "arn:aws:sns:us-east-1:1:alerts")
+    _seed_user(
+        fake_dynamodb, "alice", in_limit=100, out_limit=0,
+        daily_thresholds=_thresholds((1.0, "warn"), (2.0, "warn")),
+    )
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+
+    # 500 % of the limit: warnings at 100 % and 200 %, no block.
+    _run(_subscription([_record(request_id="a", input_tokens=500, output_tokens=0)]),
+         fake_dynamodb, fake_sns)
+    user = fake_dynamodb.Table(os.environ["USERS_TABLE"]).get_item(
+        Key={"user_id": "alice"}
+    )["Item"]
+    assert user["status"] == "active"
+    assert [m["Subject"] for m in fake_sns.published] == [
+        "[bedrock-spend-controls] WARNING alice daily 100%",
+        "[bedrock-spend-controls] WARNING alice daily 200%",
+    ]
+    assert "Item" not in fake_dynamodb.Table(os.environ["USERS_TABLE"]).get_item(
+        Key={"user_id": "REVOCATION#alice"}
+    )
+
+
+def test_block_threshold_above_one_hundred_percent(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    _seed_user(
+        fake_dynamodb, "alice", in_limit=100, out_limit=0,
+        daily_thresholds=_thresholds((1.0, "warn"), (1.5, "block")),
+    )
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+    users = fake_dynamodb.Table(os.environ["USERS_TABLE"])
+
+    _run(_subscription([_record(request_id="a", input_tokens=120, output_tokens=0)]),
+         fake_dynamodb, fake_sns)
+    assert users.get_item(Key={"user_id": "alice"})["Item"]["status"] == "active"
+
+    _run(_subscription([_record(request_id="b", input_tokens=30, output_tokens=0)]),
+         fake_dynamodb, fake_sns)
+    user = users.get_item(Key={"user_id": "alice"})["Item"]
+    assert user["status"] == "blocked"
+    assert user["status_reason"].startswith(
+        "auto: daily input tokens quota exhausted at 150%"
+    )
+
+
+def test_legacy_row_without_thresholds_behaves_exactly_as_before(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    """Regression: WARN_THRESHOLD + block-at-100 % for rows that predate
+    thresholds. Mirrors test_processor_warns_once_then_blocks_at_any_limit."""
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    monkeypatch.setenv("SNS_TOPIC_ARN", "arn:aws:sns:us-east-1:1:alerts")
+    monkeypatch.setenv("WARN_THRESHOLD", "0.75")
+    _seed_user(fake_dynamodb, "alice", in_limit=100, out_limit=1000)
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+
+    _run(_subscription([_record(request_id="a", input_tokens=74, output_tokens=0)]),
+         fake_dynamodb, fake_sns)
+    assert fake_sns.published == []
+    _run(_subscription([_record(request_id="b", input_tokens=1, output_tokens=0)]),
+         fake_dynamodb, fake_sns)
+    assert len(fake_sns.published) == 1
+    assert "WARNING alice daily 75%" in fake_sns.published[0]["Subject"]
+    _run(_subscription([_record(request_id="c", input_tokens=25, output_tokens=0)]),
+         fake_dynamodb, fake_sns)
+    user = fake_dynamodb.Table(os.environ["USERS_TABLE"]).get_item(
+        Key={"user_id": "alice"}
+    )["Item"]
+    assert user["status"] == "blocked"
+    assert user["status_reason"] == (
+        f"auto: daily input tokens quota exhausted in "
+        f"{datetime.now(timezone.utc).date().isoformat()}"
+    )
+
+
+def test_rpm_breach_blocks_and_recovers_next_minute(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    fixed = datetime(2026, 9, 9, 12, 0, 30, tzinfo=timezone.utc)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return FrozenDateTime._now if tz is not None else FrozenDateTime._now.replace(tzinfo=None)
+
+    FrozenDateTime._now = fixed
+    monkeypatch.setattr(processor, "datetime", FrozenDateTime)
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    monkeypatch.setenv("SNS_TOPIC_ARN", "arn:aws:sns:us-east-1:1:alerts")
+    _seed_user(fake_dynamodb, "alice", usd=1000, in_limit=0, out_limit=0, rpm=2, tpm=0)
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+    users = fake_dynamodb.Table(os.environ["USERS_TABLE"])
+    usage_table = fake_dynamodb.Table(os.environ["USAGE_TABLE"])
+
+    _run(_subscription([_record(request_id="a", when=fixed)]), fake_dynamodb, fake_sns)
+    assert users.get_item(Key={"user_id": "alice"})["Item"]["status"] == "active"
+    counter = usage_table.get_item(
+        Key={"user_id": "RATE#alice", "window": "2026-09-09T12:00"}
+    )["Item"]
+    assert counter["requests"] == 1
+    assert counter["tokens"] == 150
+
+    _run(_subscription([_record(request_id="b", when=fixed)]), fake_dynamodb, fake_sns)
+    user = users.get_item(Key={"user_id": "alice"})["Item"]
+    assert user["status"] == "blocked"
+    assert user["status_origin"] == "automatic"
+    assert user["status_reason"] == "auto: rpm rate limit reached in minute 2026-09-09T12:00"
+    assert fake_sns.published[-1]["Subject"] == (
+        "[bedrock-spend-controls] BLOCKED alice reason=rpm"
+    )
+    payload = json.loads(fake_sns.published[-1]["Message"])
+    assert payload["breaches"][0] == {
+        "period": "minute",
+        "dimension": "rpm",
+        "usage": 2,
+        "limit": 2,
+        "at": 1.0,
+        "window_start": "2026-09-09T12:00:00+00:00",
+        "resets_at": "2026-09-09T12:01:00+00:00",
+    }
+    assert payload["rate_usage"]["requests"] == 2
+
+    # Next minute: the automatic block lifts through the broker's
+    # refresh_auto_status path (same rule as calendar blocks); here we assert
+    # the store-level evaluation is under quota again.
+    from app.quota import QuotaStore
+    store = QuotaStore(dynamodb=fake_dynamodb)
+    later = fixed + timedelta(minutes=1)
+    refreshed = store.get_user("alice")
+    assert store.evaluate_user_quota(refreshed, later).over_budget is False
+    assert store.evaluate_user_quota(refreshed, fixed).over_budget is True
+
+
+def test_tpm_breach_counts_uncached_input_plus_output_tokens(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    _seed_user(fake_dynamodb, "alice", usd=1000, in_limit=0, out_limit=0, rpm=0, tpm=200)
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+    users = fake_dynamodb.Table(os.environ["USERS_TABLE"])
+    now = datetime.now(timezone.utc).replace(second=1, microsecond=0)
+
+    # 100 in + 50 out = 150 < 200; cached tokens do not count.
+    _run(_subscription([_cached_record(request_id="a", model="openai.gpt-oss-20b",
+                                       input_tokens=100, output_tokens=50, cache_read=5000)]),
+         fake_dynamodb, fake_sns)
+    assert users.get_item(Key={"user_id": "alice"})["Item"]["status"] == "active"
+    _run(_subscription([_record(request_id="b", when=now, input_tokens=40, output_tokens=20)]),
+         fake_dynamodb, fake_sns)
+    user = users.get_item(Key={"user_id": "alice"})["Item"]
+    assert user["status"] == "blocked"
+    assert user["status_reason"].startswith("auto: tpm rate limit reached")
+
+
+def test_rate_counter_not_written_for_subjects_without_rate_limits(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    _seed_user(fake_dynamodb, "alice")
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+    _run(_subscription([_record()]), fake_dynamodb, fake_sns)
+    rate_rows = [
+        key for key in fake_dynamodb.Table(os.environ["USAGE_TABLE"]).items
+        if str(key[0]).startswith("RATE#")
+    ]
+    assert rate_rows == []
+
+
+def test_rate_counter_is_keyed_by_occurrence_minute_not_processing_time(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    _seed_user(fake_dynamodb, "alice", rpm=100)
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+    late = datetime(2026, 9, 9, 8, 15, 5, tzinfo=timezone.utc)
+    _run(_subscription([_record(when=late)]), fake_dynamodb, fake_sns)
+    assert "Item" in fake_dynamodb.Table(os.environ["USAGE_TABLE"]).get_item(
+        Key={"user_id": "RATE#alice", "window": "2026-09-09T08:15"}
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-model budgets (optional second axis)
+# ---------------------------------------------------------------------------
+
+
+def _model_budget(usd: float, **thresholds_kwargs) -> dict:
+    """Storage form of one model budget (daily only)."""
+    return {
+        "daily_limits_enabled": True,
+        "daily_usd_micro": int(usd * processor.MICRO),
+        "daily_input_tokens": 0,
+        "daily_output_tokens": 0,
+        "daily_thresholds": thresholds_kwargs.get(
+            "thresholds",
+            _thresholds((0.8, "warn"), (1.0, "block")),
+        ),
+        "weekly_limits_enabled": False,
+        "monthly_limits_enabled": False,
+    }
+
+
+def _today() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def test_model_scoped_ledger_row_is_written_in_the_same_transaction(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    monkeypatch.setenv(
+        "MODEL_PRICES_JSON",
+        '{"openai.gpt-oss-20b":{"input_per_mtok":1,"output_per_mtok":2}}',
+    )
+    _seed_user(fake_dynamodb, "alice")
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+    usage_table = fake_dynamodb.Table(os.environ["USAGE_TABLE"])
+
+    _run(_subscription([_record()]), fake_dynamodb, fake_sns)
+
+    subject_row = usage_table.get_item(
+        Key={"user_id": "alice", "window": _today()}
+    )["Item"]
+    model_row = usage_table.get_item(
+        Key={"user_id": "alice#model#openai.gpt-oss-20b", "window": _today()}
+    )["Item"]
+    for field in ("cost_micro", "input_tokens", "output_tokens", "requests"):
+        assert model_row[field] == subject_row[field]
+    assert model_row["expires_at"] == subject_row["expires_at"]
+
+
+def test_duplicate_request_skips_both_subject_and_model_rows(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    _seed_user(fake_dynamodb, "alice")
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+    usage_table = fake_dynamodb.Table(os.environ["USAGE_TABLE"])
+    event = _subscription([_record()])
+
+    _run(event, fake_dynamodb, fake_sns)
+    duplicate = _run(event, fake_dynamodb, fake_sns)
+
+    assert duplicate["duplicates"] == 1
+    assert usage_table.get_item(
+        Key={"user_id": "alice", "window": _today()}
+    )["Item"]["requests"] == 1
+    assert usage_table.get_item(
+        Key={"user_id": "alice#model#openai.gpt-oss-20b", "window": _today()}
+    )["Item"]["requests"] == 1
+
+
+def test_model_budget_blocks_subject_while_total_budget_has_headroom(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    monkeypatch.setenv("SNS_TOPIC_ARN", "arn:aws:sns:us-east-1:1:alerts")
+    monkeypatch.setenv(
+        "MODEL_PRICES_JSON",
+        json.dumps({
+            "opus": {"input_per_mtok": 10.0, "output_per_mtok": 10.0},
+            "haiku": {"input_per_mtok": 1.0, "output_per_mtok": 1.0},
+        }),
+    )
+    # $100 total, but only $2 of it may go to opus.
+    _seed_user(
+        fake_dynamodb, "alice", usd=100, in_limit=0, out_limit=0,
+        model_budgets={"opus": _model_budget(2.0)},
+    )
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+    users = fake_dynamodb.Table(os.environ["USERS_TABLE"])
+
+    # $1.50 of opus: under both.
+    _run(_subscription([_record(request_id="a", model="opus",
+                                input_tokens=100_000, output_tokens=50_000)]),
+         fake_dynamodb, fake_sns)
+    assert users.get_item(Key={"user_id": "alice"})["Item"]["status"] == "active"
+    # $2.00 total on opus: model budget reached, total is $2 of $100.
+    _run(_subscription([_record(request_id="b", model="opus",
+                                input_tokens=50_000, output_tokens=0)]),
+         fake_dynamodb, fake_sns)
+    user = users.get_item(Key={"user_id": "alice"})["Item"]
+    assert user["status"] == "blocked"
+    assert user["status_origin"] == "automatic"
+    assert user["status_reason"] == (
+        f"auto: daily USD quota exhausted for model opus in {_today()}"
+    )
+    assert fake_sns.published[-1]["Subject"] == (
+        "[bedrock-spend-controls] BLOCKED alice reason=model:opus:daily-usd"
+    )
+    payload = json.loads(fake_sns.published[-1]["Message"])
+    assert payload["breaches"][0]["model_id"] == "opus"
+    assert payload["breaches"][0]["usage"] == 2_000_000
+    assert "Item" in users.get_item(Key={"user_id": "REVOCATION#alice"})
+
+
+def test_model_budget_breach_blocks_other_models_too_documented_limitation(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    """Enforcement is subject-wide: once the opus budget blocks alice, a
+    haiku call is still metered but the subject stays blocked. The deny
+    primitives (SourceIdentity shards / role inline deny) cannot be made
+    model-selective without blowing the shard cap; see README."""
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    monkeypatch.setenv(
+        "MODEL_PRICES_JSON",
+        json.dumps({
+            "opus": {"input_per_mtok": 10.0, "output_per_mtok": 10.0},
+            "haiku": {"input_per_mtok": 1.0, "output_per_mtok": 1.0},
+        }),
+    )
+    _seed_user(
+        fake_dynamodb, "alice", usd=100, in_limit=0, out_limit=0,
+        model_budgets={"opus": _model_budget(1.0)},
+    )
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+    users = fake_dynamodb.Table(os.environ["USERS_TABLE"])
+
+    _run(_subscription([_record(request_id="a", model="opus",
+                                input_tokens=100_000, output_tokens=0)]),
+         fake_dynamodb, fake_sns)
+    assert users.get_item(Key={"user_id": "alice"})["Item"]["status"] == "blocked"
+
+    # A haiku call (no budget) arrives from an already-authorized session.
+    _run(_subscription([_record(request_id="b", model="haiku",
+                                input_tokens=10, output_tokens=0)]),
+         fake_dynamodb, fake_sns)
+    user = users.get_item(Key={"user_id": "alice"})["Item"]
+    assert user["status"] == "blocked"
+    assert "for model opus" in user["status_reason"]
+    # ...and its usage still lands in the haiku model ledger.
+    assert fake_dynamodb.Table(os.environ["USAGE_TABLE"]).get_item(
+        Key={"user_id": "alice#model#haiku", "window": _today()}
+    )["Item"]["requests"] == 1
+
+
+def test_model_budget_warn_thresholds_are_tracked_per_model(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    monkeypatch.setenv("SNS_TOPIC_ARN", "arn:aws:sns:us-east-1:1:alerts")
+    monkeypatch.setenv(
+        "MODEL_PRICES_JSON",
+        json.dumps({"opus": {"input_per_mtok": 10.0, "output_per_mtok": 10.0}}),
+    )
+    _seed_user(
+        fake_dynamodb, "alice", usd=100, in_limit=0, out_limit=0,
+        model_budgets={
+            "opus": _model_budget(
+                2.0, thresholds=_thresholds((0.5, "warn"), (1.0, "block"))
+            )
+        },
+    )
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+
+    _run(_subscription([_record(request_id="a", model="opus",
+                                input_tokens=100_000, output_tokens=0)]),
+         fake_dynamodb, fake_sns)  # $1.00 = 50 %
+    assert [m["Subject"] for m in fake_sns.published] == [
+        "[bedrock-spend-controls] WARNING alice model opus daily 50%"
+    ]
+    assert json.loads(fake_sns.published[0]["Message"])["model_id"] == "opus"
+    user = fake_dynamodb.Table(os.environ["USERS_TABLE"]).get_item(
+        Key={"user_id": "alice"}
+    )["Item"]
+    assert user["warning_sent_model_opus_daily_5000_window"] == _today()
+    # Same level again is not re-sent.
+    _run(_subscription([_record(request_id="b", model="opus",
+                                input_tokens=1_000, output_tokens=0)]),
+         fake_dynamodb, fake_sns)
+    assert len(fake_sns.published) == 1
+
+
+def test_subject_without_model_budgets_pays_no_extra_reads(
+    fake_dynamodb, fake_sns, monkeypatch
+):
+    monkeypatch.setenv("BEDROCK_USER_ROLE_NAME", ROLE_NAME)
+    _seed_user(fake_dynamodb, "alice")
+    _seed_session(fake_dynamodb, "alice-session", "alice")
+    usage_table = fake_dynamodb.Table(os.environ["USAGE_TABLE"])
+    calls: list[str] = []
+    original_query = usage_table.query
+
+    def counting_query(**kwargs):
+        calls.append(kwargs["ExpressionAttributeValues"][":user_id"])
+        return original_query(**kwargs)
+
+    usage_table.query = counting_query
+    _run(_subscription([_record()]), fake_dynamodb, fake_sns)
+    # Only the subject ledger is queried during evaluation.
+    assert calls == ["alice"]

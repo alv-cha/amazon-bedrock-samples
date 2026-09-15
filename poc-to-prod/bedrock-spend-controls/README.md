@@ -17,9 +17,9 @@ There is no inference proxy and no second Bedrock endpoint.
 
 Each subject can independently enable daily, weekly, and monthly limits for
 estimated USD, input tokens, and output tokens. Every enabled period is
-enforced concurrently; reaching any finite limit blocks the subject. `0`
-means Unlimited for that one dimension, while `null` disables the entire
-period.
+enforced concurrently; reaching a period's **block threshold** on any finite
+limit blocks the subject. `0` means Unlimited for that one dimension, while
+`null` disables the entire period.
 
 Windows are fixed UTC calendars, not rolling intervals:
 
@@ -34,6 +34,98 @@ was recorded before the limit existed, with no backfill or dual-write cutover.
 Deployments must retain at least 31 days of usage. Subjects with only daily
 limits retain the same accounting semantics; longer-period evaluation adds a
 small DynamoDB read cost on each vend and metered invocation.
+
+### Thresholds and alert-only budgets
+
+Each enabled period carries an ordered `thresholds` list of
+`{"at": <ratio>, "action": "warn" | "block"}` entries. `at` is utilization
+(`1.0` = 100 %, up to `10.0`); entries must be strictly increasing; at most
+one `block` is allowed and it must be last. The metering processor sends one
+SNS warning per `warn` level per calendar window (idempotency markers are
+per level, so crossing 50 % then 80 % sends two distinct messages and a
+duplicate delivery sends none) and blocks only when the `block` level is
+reached — which may be above 100 % (`{"at": 1.2, "action": "block"}`).
+
+A list with **no `block` entry is an alert-only budget**: it warns at every
+configured level but never blocks the subject, however far over 100 % it
+runs. The admin UI flags such periods and requires a reason when a period
+becomes alert-only.
+
+Rows created before thresholds existed, and periods submitted without a
+list, resolve to the deployment default
+`[{"at": <warn_threshold>, "action": "warn"}, {"at": 1.0, "action": "block"}]`,
+so existing deployments change behaviour only when an operator configures a
+list. `default_limits.<period>.thresholds` sets the list applied to
+auto-provisioned and admin-created subjects.
+
+### Rate limits (rpm / tpm)
+
+A subject may also carry `rate: {"rpm": N, "tpm": N}` — requests and
+uncached input + output tokens per UTC minute, counted from metered
+invocations (not credential vends; the separate
+`vend_rate_limit_per_minute` still bounds broker calls). `0` disables a
+dimension. The processor increments a short-lived per-minute counter
+(`RATE#<subject>` / `<UTC minute>` in the usage table) only for subjects
+with a rate limit; reaching either limit blocks the subject through the
+same automatic path as a calendar breach with a distinct reason
+(`auto: rpm rate limit reached in minute ...`) and SNS subject
+(`BLOCKED <subject> reason=rpm`). Rate blocks are `status_origin:
+automatic`, so they lift on their own at the next vend or enforcer pass
+once the current minute is under the limit; no manual unblock is needed.
+Cached tokens never count toward `tpm`. `default_limits.rate` sets the
+deployment default.
+
+### Per-model budgets
+
+A subject may carry, next to its subject-level limits, zero or more budgets
+keyed by model or inference-profile ID (as it appears in the invocation log:
+`us.anthropic.claude-opus-4-7`, never an ARN). Each model budget has the
+same daily/weekly/monthly + thresholds shape as the subject limits — "user X
+gets $10/day in total but only $2/day of that may go to Opus". Rate limits
+are subject-level only.
+
+The usage processor writes a **second daily ledger row per (subject, day,
+model)** — `<subject>#model#<model_id>` in the usage table — in the same
+`TransactWriteItems` as the subject row, so the `REQUEST#<id>` idempotency
+marker covers both and a duplicate delivery skips both. Model rows are
+written for every subject and model (not only where a budget exists), so a
+budget added mid-period includes usage already recorded, exactly like
+enabling a weekly limit mid-week. Weekly/monthly model totals are derived
+from the model's daily rows with the same strongly consistent range query.
+This doubles ledger writes per invocation; see the cost note in
+DEPLOYMENT.md.
+
+**Known limitation — a model budget breach blocks the whole subject.** The
+enforcement primitives in this design act on the identity, not the model:
+the revocation shards deny `aws:SourceIdentity` values and the workload
+enforcer attaches a role-wide inline deny. When any model budget reaches its
+`block` threshold the subject is blocked exactly as for a subject-level
+breach (`status_reason: auto: daily USD quota exhausted for model <id> in
+...`, SNS `BLOCKED <subject> reason=model:<id>:<period>-<dimension>`), and
+calls to *other* models are refused too until the window resets or the
+budget is raised/removed. Making the deny model-selective would require
+per-identity resource lists inside the 19 revocation shards and would exceed
+the 6,144-character managed-policy cap almost immediately, so it is
+deliberately not attempted. Use per-model budgets as a cost guardrail, not as
+a model allowlist — `allowed_model_arns` remains the allowlist.
+
+Model budgets are **not** part of the credential-vend pre-flight: at vend
+time the model is unknown, so the broker checks subject-level limits and
+rate limits only. A subject at 99 % of a model budget vends normally; the
+first invocation that crosses the block threshold is metered, the subject is
+blocked, and the layered enforcement (revocation shards, lease expiry) cuts
+access as for any automatic block.
+
+Admin API: `PUT /admin/user/model-budget?user_id=…&model_id=…` with
+`{"limits": {daily|weekly|monthly: {...} | null}, "reason": ...}` sets or
+replaces one model budget; `DELETE` on the same route removes it;
+`GET /admin/user/model-usage?user_id=…&model_id=…` returns the model's
+current calendar usage. Both mutations use the same `If-Match` /
+`Idempotency-Key` / audit conventions as the limits route, reconcile the
+automatic status immediately (a budget below current model usage blocks at
+once; removing the binding budget lifts an automatic block), and reject a
+`model_id` that is not covered by `allowed_model_arns`. The admin UI exposes
+the same operations in the user detail drawer under "Per-model budgets".
 
 ## Architecture
 
@@ -69,6 +161,16 @@ Vended credentials can call them, and that spend never reaches the ledger.
 If strict accounting matters, do not include models that are used through
 those APIs (for example, video-generation or speech-to-speech models) in
 `allowed_model_arns`.
+
+A third surface is structurally outside this design: the **`bedrock-mantle`
+endpoint** (`bedrock-mantle:CreateInference`, `bedrock-mantle:
+CallWithBearerToken`) is a separate IAM service prefix whose calls are not
+captured by model-invocation logging. Vended sessions cannot reach it — the
+role, permissions boundary, and session policy grant `bedrock:*` actions
+only, so it is denied by omission — but any *other* principal with
+`bedrock-mantle:*` spends unmetered. The `DenyDirectBedrockPolicy` helper
+and the SCP example in DEPLOYMENT.md deny both prefixes; extend your own
+guardrails the same way (threat model T-08, T-26).
 
 ## Enforcement guarantee
 
@@ -125,12 +227,13 @@ outside this direct-to-Runtime architecture.
 | Broker/admin Lambda | JWT validation, quota check, logical lease, STS vending, admin API |
 | BedrockUserRole | Runtime-only permissions restricted by model ARN and permissions boundary |
 | Users table | Identity, status, limits, logical leases, session maps, control state |
-| Usage table | Canonical daily ledger and invocation idempotency markers |
+| Usage table | Canonical daily ledger (tokens, cache tokens, images, USD, unpriced flags), per-minute rate counters, invocation idempotency markers, and stored reconciliation runs |
 | Admin audit table | Routine mutation audit events and idempotency records (365-day retention) |
 | Invocation logging | Trusted principal ARN, model, request ID, and tokens |
 | Usage processor | Event-driven pricing, deduplication, counters, blocking, detection-lag metric |
 | Revocation processor | Always-on sharded `SourceIdentity` deny reconciliation |
 | Emergency processor | Operator-controlled role-wide deny state machine |
+| Spend reconciliation processor (opt-in) | Daily ledger-vs-Cost-Explorer comparison, aggregate and per workload |
 | CloudWatch/SNS | Operational metrics, alarms, warnings, and block notifications |
 | Admin UI | Overview with per-model usage charts, user management, runtime enforcement controls, live leases, emergency stop, alarms, and audit history |
 
@@ -166,6 +269,28 @@ rather than healthy.
 
 CloudWatch is the observability system. DynamoDB remains necessary because the
 broker needs a low-latency quota decision when credentials are requested.
+
+Because the ledger is priced from a catalog, its USD figure is an estimate.
+With `reconciliation_enabled: true` a daily Lambda compares the ledger's total
+for a settled day (D-2 by default) with Cost Explorer's Bedrock spend for the
+same day and Region — in aggregate, and per workload through the
+`bedrock-spend-controls-workload` cost-allocation tag — stores the result,
+emits `ReconciliationDeltaPercent`, and alarms when two consecutive days drift
+past `reconciliation_alarm_percent`. The Operations tab shows the latest
+comparison; `GET /admin/reconciliation` lists recent runs. There is no
+per-user reconciliation: JWT users share one IAM role and therefore one line
+in the bill. Setup, the tag activation step, and how to read a positive vs a
+negative delta are in
+[DEPLOYMENT.md § Reconciliation (optional)](DEPLOYMENT.md#reconciliation-optional).
+
+Every alarm the stack creates, and every Lambda component, has a runbook
+under [`docs/runbooks/`](docs/runbooks/README.md): what the alarm means in
+terms of customer impact, when it is page-worthy, likely causes with exact
+CLI/Logs Insights checks, remediation, and how to re-run or reconcile a
+component by hand. [`docs/cost-estimate.md`](docs/cost-estimate.md) prices
+the deployed resources for a demo and a 1 000-user production scenario, and
+[`docs/threat-model.md`](docs/threat-model.md) is the STRIDE review of the
+seven trust boundaries with the status of each mitigation.
 
 An admin API limit of `0` disables that one dimension and is displayed as
 **Unlimited**. A `null` period is disabled. The UI requires explicit
@@ -229,7 +354,11 @@ code change. Each configured workload gets:
   directly; without it the policy is emitted as a stack output to attach
   manually.
 - A quota row `workload:<name>` in the same users table, with the same
-  limits schema, windows, admin endpoints, and dashboard as JWT identities.
+  limits schema and windows as JWT identities. The console keeps the two
+  kinds apart: the **Users** tab lists JWT identities only, the
+  **Workloads** tab lists the deployed roster (model, inference profile, IAM
+  role, enforceability) joined with each metered row, and the Overview
+  reports the two groups side by side.
 - **Enforcement**: when the budget is exhausted the metering processor blocks
   the row, and the workload enforcer Lambda attaches an inline
   `bedrock:InvokeModel*` Deny to the workload's role (users-table stream fast
@@ -242,7 +371,14 @@ Configure workloads in `cdk/config/workloads.json` (see
 `cdk/config/workloads.example.json`) and pass `-c workloads=config/workloads.json`
 or the `workloads` key of `deployment_config`. Workloads without `role_arn`
 are metered and alerted but cannot be hard-blocked; they surface as
-`enforcement_ready: false` in the admin API and as "metering only" in the UI.
+`enforcement_ready: false` in the admin API and as "Metering only" in the UI,
+and a manual block on one is presented as *Record block* — stored and
+alerted, not enforced. The deployed roster (name, model, profile ARN, role
+ARN, enforceability) is written to the `WorkloadRosterParameter` Parameter
+Store parameter; the broker reads it with a five-minute cache to label rows
+and to answer `GET /admin/workloads`. The `workload:` namespace is reserved:
+`POST /admin/users` rejects it, because a hand-made row would be an
+unregistered orphan nothing enforces.
 
 Enforcement latency is metering lag plus IAM propagation or the remaining
 permission lease, whichever cuts access first. It remains bounded overspend;
@@ -258,12 +394,17 @@ The processor:
 2. Resolves the STS session to the quota identity, or the profile ARN to its
    `workload:<name>` row (auto-provisioned with deploy defaults on first
    usage and priced by the profile's underlying model).
-3. Prices input and output tokens.
+3. Prices every dimension the record carries (input/output tokens,
+   prompt-cache read/write tokens, generated images) and flags dimensions
+   the catalog cannot price.
 4. Creates a `requestId` idempotency marker.
-5. Updates the canonical daily ledger in the same DynamoDB transaction.
-6. Derives all current enabled calendar totals from retained daily rows.
+5. Updates the canonical daily ledger and the per-model daily ledger in the
+   same DynamoDB transaction.
+6. Derives all current enabled calendar totals from retained daily rows, for
+   the subject and for each model that has a budget.
 7. Emits CloudWatch EMF metrics.
-8. Sends period-qualified warnings or blocks when any limit is reached.
+8. Sends period-qualified warnings at each configured `warn` threshold and
+   blocks when a `block` threshold or a per-minute rate limit is reached.
 
 There is no periodic Logs Insights scan or EventBridge reconciler.
 
@@ -337,9 +478,77 @@ affects only future invocation events; existing daily DynamoDB aggregates and
 blocked status are not repriced automatically.
 
 USD quotas are estimates against the deployed catalog, not a billing
-guarantee. Prompt caching, service tiers, provisioned throughput, tools, and
-other separately billed features can require additional pricing logic. Token
-quotas remain independent of the USD estimate.
+guarantee. Token quotas remain independent of the USD estimate.
+
+### Priced dimensions
+
+The usage processor prices every dimension an invocation-log record carries
+against the resolved catalog entry for its model:
+
+| Dimension | Log field | Catalog key | Unit | Status |
+|---|---|---|---|---|
+| Input tokens | `input.inputTokenCount` | `input_per_mtok` | USD / MTok | Priced (required) |
+| Output tokens | `output.outputTokenCount` | `output_per_mtok` | USD / MTok | Priced (required) |
+| Prompt-cache read | `input.cacheReadInputTokenCount` | `cache_read_per_mtok` | USD / MTok | Priced when the catalog publishes it |
+| Prompt-cache write | `input.cacheWriteInputTokenCount` | `cache_write_per_mtok` | USD / MTok | Priced when the catalog publishes it |
+| Generated images | `output.outputBodyJson.images[]` length (or `output.outputImageCount`) | `per_image` | USD / image | Priced when the count is present; see caveat |
+| Video / audio seconds | not present in the invocation log | — | — | **Not priced** |
+
+The cache field placement was verified against real `Converse` records with
+a `cachePoint` (the counters sit beside `inputTokenCount` on the input side).
+The Price List resolver reads `Prompt cache read input tokens` /
+`Prompt cache write input tokens` rows for catalog models that publish them
+(Nova Micro/Lite/Pro/Premier in `us-east-1` at the time of writing) and the
+smallest standard text-to-image `image` row for image models (Nova Canvas).
+Models billed through Marketplace (Anthropic) have no Price List rows, so
+their cache rates must be pinned in `price_overrides` alongside the token
+pair; the shipped file pins Opus 4.7 cache read/write at the published
+10%/125%-of-input ratios as an example.
+
+Token quotas count only `inputTokenCount` (uncached tokens) plus
+`outputTokenCount`, exactly as before; cached tokens are accumulated in
+separate `cache_read_tokens` / `cache_write_tokens` ledger counters and in
+the USD estimate but never against the input-token limit.
+
+**Caveats — read before trusting the USD figure for these modalities.**
+
+- *Image generation with image delivery disabled.* This stack's managed
+  logging configuration sets `imageDataDeliveryEnabled: false`, and a real
+  Nova Canvas record then carries **no token counts and no body**, so the
+  processor can meter the request (`requests`, `images: 0`) but cannot
+  count the images and prices the call at `$0`. Enable image data delivery
+  on the invocation-logging configuration (the record then includes
+  `outputBodyJson.images`) or keep image models out of `allowed_model_arns`
+  if their spend must be enforced.
+- *Image size/quality tiers.* The log reports a count only. The resolver
+  uses the smallest **standard** text-to-image rate as the per-image
+  estimate; premium or 2048px generations are under-counted unless you pin
+  the higher rate in `price_overrides`.
+- *Cache write at `$0`.* Some catalog models (Nova) publish a `$0` cache
+  write rate; the processor records the tokens and prices them at zero as
+  published. This is the catalog value, not a gap.
+- *Video, audio, and embeddings.* No invocation-log field carries duration
+  or embedding counts, and `StartAsyncInvoke` is not logged at all, so these
+  are unmetered. Do not include such models in `allowed_model_arns` if
+  strict accounting matters.
+
+**Flag now, repair later.** When a record carries a dimension the resolved
+entry has no rate for (for example a cache-enabled call to a model whose
+pin lacks `cache_*_per_mtok`, or an image count against an entry with no
+`per_image`), the processor prices that dimension at the conservative
+fallback's rate when the fallback has one (it does for every dimension any
+known model prices, at the maximum known rate), increments
+`unpriced_requests` on the subject's daily row, unions the dimension name
+into the row's `missing_dimensions` string set, and raises the
+`FallbackPricedRequests` / `UnpricedDimensionRequests` metrics (the
+`pricing_fallback` alarm fires). Nothing is ever silently priced at zero.
+`tools/unpriced_usage.py` lists the affected rows; the admin API surfaces
+`unpriced_requests` on every usage response. Historical aggregates are
+never repriced automatically: add the rate to the catalog for future events
+and decide on a manual repair for past ones.
+
+Service tiers (flex/priority), provisioned throughput, batch inference, and
+separately billed tools remain outside the estimate.
 
 ## Security boundaries
 
@@ -412,10 +621,17 @@ python examples/sigv4_gateway.py \
   --daily-usd 5 \
   --daily-input-tokens 1000000 \
   --daily-output-tokens 200000 \
+  --daily-thresholds "50:warn,80:warn,100:block" \
   --weekly-usd 25 \
   --weekly-input-tokens 5000000 \
-  --weekly-output-tokens 1000000
+  --weekly-output-tokens 1000000 \
+  --weekly-thresholds "100:warn" \
+  --rpm 60 --tpm 100000
 ```
+
+`--<period>-thresholds` takes comma-separated `<percent>:<warn|block>`
+entries (omit the `block` entry for an alert-only period); `--rpm`/`--tpm`
+set per-minute rate limits and `--disable-rate` removes both on update.
 
 Scripted clients should follow the same safe routine-write flow: perform an
 exact GET before deciding whether to create, so reruns do not rely on
@@ -427,12 +643,24 @@ standardized legacy audit fallback.
 The canonical exact-user route family is:
 
 - `GET /admin/user?user_id=<encoded>` for detail.
-- `PUT /admin/user/limits?user_id=<encoded>` for limits.
+- `PUT /admin/user/limits?user_id=<encoded>` for limits (periods, thresholds, rate).
 - `PUT /admin/user/status?user_id=<encoded>` for status.
+- `PUT` / `DELETE /admin/user/model-budget?user_id=<encoded>&model_id=<id>`
+  for one model-scoped budget; `GET /admin/user/model-usage` for its usage.
 - `GET /admin/user/usage?user_id=<encoded>&period=weekly&window=...` for a
   calendar usage window (`period` defaults to `daily`).
 - `/admin/user/usage-history` and `/admin/user/audit` with the same `user_id`
   query parameter for retained history and per-user audit.
+
+Deployment-wide read routes: `GET /admin/summary` (all-subject figures plus
+an `enforcement.subjects` split into `users` and `workloads`, the latter with
+`configured`, `metering_only`, `unregistered`, and `awaiting_traffic`
+counts), `GET /admin/workloads` (the deployed roster joined with metered
+rows; `subject` is `null` for a workload that has not invoked since deploy),
+`GET /admin/operations`, `GET /admin/usage/metrics` (each `top_users` entry
+carries its `granularity`), `GET /admin/audit`, and
+`GET /admin/reconciliation?limit=N` (recent ledger-vs-bill runs, or an
+explicit `enabled: false` payload when reconciliation is not deployed).
 
 First-party clients pass the raw identity as a request parameter and let the
 HTTP client encode it once before SigV4 signing. The legacy-compatible
@@ -492,13 +720,19 @@ semgrep scan --config r/python --config r/typescript --config r/javascript \
   --exclude cdk.out --exclude node_modules --exclude dist .
 bandit -r gateway usage_processor cdk/stacks tools examples tests \
   enforcement_dispatcher emergency_processor revocation_processor \
-  workload_enforcer quota_periods_layer --skip B101
+  workload_enforcer reconciliation_processor quota_periods_layer --skip B101
 gitleaks git .   # tracked history; build artifacts are git-ignored
 ```
 
 Remaining findings are intentional and documented inline: the few `nosec`
 and `nosemgrep` markers each carry a justification (host-side `pip` argv
 for asset bundling, the Lambda entrypoint's `0o755` mode, `https`-only
-`urlopen` calls, and test-only fixture secrets). The React
+`urlopen` calls, the `ce:GetCostAndUsage` wildcard resource that Cost
+Explorer requires, and test-only fixture secrets). The React
 `jsx-not-internationalized` advisories are accepted — the administration
-console is a single-locale sample and is not internationalized.
+console is a single-locale sample and is not internationalized. Semgrep's
+`return-not-in-function` / `return-in-init` findings on
+`gateway/app/config.py`, `gateway/app/broker.py`, and
+`examples/refreshable_bedrock.py` are parser false positives on
+`lambda:` expressions (reproducible with a one-line
+`field(default_factory=lambda: …)`); the code contains no such `return`.

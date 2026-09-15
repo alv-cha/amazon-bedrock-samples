@@ -7,7 +7,14 @@ import {
   apiErrorMessage,
   type UsageMetricKey,
   type UsageMetrics,
+  type UsageTopUser,
 } from "./api";
+import { formatNumber, formatUsd } from "./format";
+
+/** Server label when present; the id prefix is the fallback for older brokers. */
+export function isWorkloadSpender(entry: UsageTopUser): boolean {
+  return entry.granularity === "workload" || (entry.granularity === undefined && entry.user_id.startsWith("workload:"));
+}
 
 const METRIC_OPTIONS: Array<{ key: UsageMetricKey; label: string }> = [
   { key: "cost_usd", label: "Spend (USD)" },
@@ -29,10 +36,8 @@ export function modelColor(index: number): string {
 }
 
 export function formatMetricValue(metric: UsageMetricKey, value: number): string {
-  if (metric === "cost_usd") {
-    return `$${value.toFixed(value >= 1 ? 2 : 4)}`;
-  }
-  return Math.round(value).toLocaleString();
+  if (metric === "cost_usd") return formatUsd(value);
+  return formatNumber(Math.round(value));
 }
 
 function dayLabel(day: string): string {
@@ -206,15 +211,18 @@ export function OverviewCharts({
                 </p>
               </div>
 
-              <aside aria-label="Top users by spend" className="usage-top-users">
-                <h3><Users aria-hidden="true" size={15} /> Top users by spend</h3>
-                {data.top_users.length === 0 && <p className="usage-chart-empty">No user activity in range.</p>}
+              <aside aria-label="Top spenders" className="usage-top-users">
+                <h3><Users aria-hidden="true" size={15} /> Top spenders</h3>
+                {data.top_users.length === 0 && <p className="usage-chart-empty">No activity in range.</p>}
                 <ul>
                   {data.top_users.map((user) => (
                     <li key={user.user_id}>
                       <div className="usage-user-row">
-                        <span className="usage-user-name" title={user.user_id}>{userName(user)}</span>
-                        <span className="usage-user-cost">{formatMetricValue("cost_usd", user.cost_usd)} · {user.requests.toLocaleString()} req</span>
+                        <span className="usage-user-name" title={user.user_id}>
+                          {isWorkloadSpender(user) && <span className="status-badge status-workload usage-user-kind" title="Workload: app on its own IAM role, attributed by inference profile">workload</span>}
+                          {userName(user)}
+                        </span>
+                        <span className="usage-user-cost">{formatMetricValue("cost_usd", user.cost_usd)} · {formatNumber(user.requests)} req</span>
                       </div>
                       <div className="progress-track usage-user-track">
                         <div

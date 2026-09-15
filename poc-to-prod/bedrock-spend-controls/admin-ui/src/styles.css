@@ -294,22 +294,49 @@ textarea:focus-visible {
 }
 
 .system-strip {
-  display: grid;
-  grid-template-columns: minmax(190px, 1.25fr) repeat(5, minmax(110px, 1fr));
-  gap: 0;
   margin: 14px 0 24px;
-  padding: 12px 16px;
-  background: #eef1f4;
-  border: 1px solid #d9dee5;
-  border-radius: 6px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(23, 32, 46, 0.04);
 }
 
 .system-status {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
   min-width: 0;
-  padding-right: 18px;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.system-status strong {
+  font-size: 13px;
+}
+
+.system-chip {
+  padding: 3px 9px;
+  color: #0b5c3e;
+  background: #e7f6ef;
+  border: 1px solid #bfe6d2;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: capitalize;
+}
+
+.system-chip-muted {
+  color: #344054;
+  background: #f1f3f6;
+  border-color: #dde2e8;
+}
+
+.system-window {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
 }
 
 .status-dot {
@@ -321,31 +348,46 @@ textarea:focus-visible {
   box-shadow: 0 0 0 4px rgba(22, 132, 91, 0.12);
 }
 
-.system-status > div,
+.system-details {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px 24px;
+  margin: 0;
+  padding: 14px 18px 16px;
+}
+
 .system-detail {
   display: grid;
+  gap: 3px;
   min-width: 0;
 }
 
-.system-status strong,
-.system-detail strong {
-  overflow: hidden;
-  font-size: 12px;
-  line-height: 1.4;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.system-status span,
-.system-detail span {
+.system-detail dt {
   color: var(--muted);
   font-size: 11px;
   line-height: 1.4;
 }
 
-.system-detail {
-  padding: 0 16px;
-  border-left: 1px solid #d4dae2;
+.system-detail dd {
+  margin: 0;
+  overflow: hidden;
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.system-detail dd.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  font-weight: 500;
+}
+
+@media (max-width: 980px) {
+  .system-details {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 .operations-panel {
@@ -398,7 +440,7 @@ textarea:focus-visible {
 
 .operations-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
   padding: 16px 18px;
 }
@@ -409,6 +451,18 @@ textarea:focus-visible {
   background: #f8f9fb;
   border: 1px solid #e0e4e9;
   border-radius: 6px;
+}
+
+/* The reconciliation card is the fifth in a four-column grid: give it the
+   whole second row and lay its rows out three abreast so USD figures and
+   workload lists are not truncated. */
+.operations-card-wide {
+  grid-column: 1 / -1;
+}
+
+.operations-card-wide dl {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  column-gap: 24px;
 }
 
 .operations-card-heading,
@@ -1291,6 +1345,10 @@ tbody tr:hover {
 @media (max-width: 980px) {
   .metric-grid,
   .operations-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .operations-card-wide dl {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -2590,8 +2648,8 @@ tbody tr:hover {
 
 .control-meta {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-  gap: 8px 14px;
+  grid-template-columns: repeat(auto-fit, minmax(104px, 1fr));
+  gap: 8px 12px;
   margin: 0;
 }
 
@@ -2658,9 +2716,17 @@ tbody tr:hover {
 /* --- Calendar quota periods ------------------------------------------ */
 
 .period-display-note {
-  margin: 0 0 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 11px;
+}
+
+.period-display-note svg {
+  flex: 0 0 auto;
+  color: #7a8493;
 }
 
 .highest-utilization {
@@ -2683,10 +2749,18 @@ tbody tr:hover {
 .quota-period-card,
 .detail-period {
   min-width: 0;
-  padding: 14px;
+  padding: 14px 16px 16px;
   background: #fafbfc;
   border: 1px solid var(--line);
   border-radius: 10px;
+}
+
+/* Fieldsets reset: the browser's inset border and legend offset are what
+   made the limits editor look uneven. Every section in the dialog shares
+   the same card, header, and 14px rhythm. */
+.quota-period-card {
+  margin: 0;
+  min-inline-size: 0;
 }
 
 .quota-period-card legend {
@@ -2694,8 +2768,158 @@ tbody tr:hover {
   gap: 12px;
   align-items: center;
   justify-content: space-between;
+  float: left;
   width: 100%;
-  padding: 0 2px 8px;
+  margin: 0 0 12px;
+  padding: 0;
+}
+
+.quota-period-card legend + * {
+  clear: both;
+}
+
+.quota-period-card legend > span:first-child {
+  font-weight: 750;
+}
+
+.quota-period-card .field-grid {
+  gap: 12px 14px;
+}
+
+.quota-period-card .field-grid input {
+  height: 38px;
+  font-size: 13px;
+}
+
+.quota-period-card .field-help {
+  margin: 0 0 12px;
+}
+
+.rate-limits-card {
+  margin-top: 12px;
+}
+
+/* Two rate fields side by side; the full-width first column is for USD. */
+.rate-limits-card .field-grid label:first-child {
+  grid-column: auto;
+}
+
+/* A disabled period keeps its fields visible but visibly inert. */
+.quota-period-card:has(.quota-period-toggle input:not(:checked)) .field-grid {
+  opacity: 0.55;
+}
+
+/* --- Thresholds editor -------------------------------------------- */
+
+.thresholds-editor {
+  margin: 14px 0 0;
+  padding: 12px 0 0;
+  border: 0;
+  border-top: 1px dashed #d9dee5;
+  min-inline-size: 0;
+}
+
+.thresholds-editor legend {
+  float: left;
+  width: 100%;
+  margin: 0 0 8px;
+  padding: 0;
+  color: #344054;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.thresholds-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  clear: both;
+  list-style: none;
+  counter-reset: threshold;
+}
+
+.thresholds-list li {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 120px) minmax(0, 120px) 34px;
+  gap: 8px;
+  align-items: center;
+  counter-increment: threshold;
+}
+
+.thresholds-list li::before {
+  content: counter(threshold);
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.thresholds-list label {
+  display: block;
+  min-width: 0;
+}
+
+.thresholds-list .number-input > span {
+  left: auto;
+  right: 11px;
+  font-size: 12px;
+}
+
+.thresholds-list input,
+.thresholds-list select {
+  width: 100%;
+  height: 34px;
+  padding: 0 10px;
+  background: #ffffff;
+  border: 1px solid #b8c0ca;
+  border-radius: 6px;
+  font: inherit;
+  font-size: 13px;
+}
+
+.thresholds-list .number-input input {
+  padding-right: 26px;
+  padding-left: 10px;
+  text-align: right;
+}
+
+.thresholds-list select {
+  appearance: auto;
+}
+
+.thresholds-list .icon-button {
+  width: 34px;
+  height: 34px;
+}
+
+.thresholds-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.thresholds-editor .field-error {
+  margin: 8px 0 0;
+}
+
+.dialog-wide {
+  width: min(100%, 600px);
+}
+
+.field-error {
+  margin: 8px 0 0;
+  color: var(--red);
+  font-size: 11.5px;
+  line-height: 1.4;
+}
+
+.button-small {
+  min-height: 32px;
+  padding: 0 12px;
+  font-size: 12px;
 }
 
 .quota-period-card legend small,
@@ -2911,4 +3135,212 @@ tbody tr:hover {
 .usage-user-track {
   height: 6px;
   border-radius: 3px;
+}
+
+/* ---------------------------------------------------------------------------
+ * Subject kinds: users (JWT) vs workloads (own IAM role)
+ * ------------------------------------------------------------------------- */
+.page-subtitle {
+  max-width: 760px;
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.page-subtitle .link-button {
+  font-size: inherit;
+}
+
+.subject-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+@media (max-width: 1100px) {
+  .subject-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.subject-group {
+  min-width: 0;
+  padding: 16px 18px 18px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  border-top: 3px solid #2f6fb3;
+}
+
+.subject-group-workloads {
+  border-top-color: #6b58c7;
+}
+
+.subject-group-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+
+.subject-group-title {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-width: 0;
+}
+
+.subject-group-title h2 {
+  margin: 0;
+  color: var(--ink);
+  font-size: 16px;
+  line-height: 1.2;
+}
+
+.subject-group-title p {
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.subject-group-icon {
+  display: grid;
+  flex: 0 0 36px;
+  width: 36px;
+  height: 36px;
+  border-radius: 6px;
+  place-items: center;
+}
+
+.subject-group-icon-users {
+  color: #26527d;
+  background: #e7f0f8;
+}
+
+.subject-group-icon-workloads {
+  color: #4c3d99;
+  background: #f4f1ff;
+}
+
+.subject-group-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.subject-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+@media (max-width: 1400px) {
+  .subject-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.metric-card-compact {
+  gap: 10px;
+  min-height: 74px;
+  padding: 12px 12px;
+  background: #fafbfc;
+  box-shadow: none;
+}
+
+.metric-card-compact .metric-icon {
+  flex-basis: 32px;
+  width: 32px;
+  height: 32px;
+}
+
+.metric-card-compact p {
+  margin-bottom: 4px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+/* Money is the value these cards exist for: never truncate it. Shrink the
+ * digits first, wrap as a last resort. */
+.metric-card-compact strong {
+  overflow: visible;
+  font-size: clamp(15px, 1.2vw, 19px);
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.subject-group-tools .ops-status {
+  text-transform: none;
+}
+
+.user-avatar-workload {
+  color: #4c3d99;
+  background: #f4f1ff;
+  border-radius: 8px;
+}
+
+.user-name-static {
+  display: block;
+  max-width: 100%;
+  margin: 0 0 3px;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workload-row-silent td {
+  background: #fbfbfc;
+}
+
+.workloads-table {
+  min-width: 1020px;
+}
+
+.ops-status-plain {
+  text-transform: none;
+}
+
+.model-id {
+  display: inline-block;
+  max-width: 320px;
+  overflow: hidden;
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.break-all {
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+.status-details code {
+  display: block;
+  margin-top: 6px;
+  font-size: 10.5px;
+  line-height: 1.4;
+}
+
+.detail-list-wide dd code {
+  font-size: 12px;
+}
+
+.detail-list-wide dd .field-help {
+  margin: 6px 0 0;
+}
+
+.usage-user-kind {
+  margin-right: 6px;
+  padding: 2px 6px;
+  font-size: 9.5px;
+  vertical-align: middle;
 }

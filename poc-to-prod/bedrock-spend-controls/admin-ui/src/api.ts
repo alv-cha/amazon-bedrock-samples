@@ -165,16 +165,60 @@ export type UserStatus = "active" | "blocked";
 
 export type QuotaPeriod = "daily" | "weekly" | "monthly";
 
+export type ThresholdAction = "warn" | "block";
+
+/** One entry of a period's ordered thresholds list. `at` is a utilization
+ *  ratio (1 = 100 %). At most one `block`, and only as the last entry; a
+ *  list with no `block` is an alert-only period. */
+export interface QuotaThreshold {
+  at: number;
+  action: ThresholdAction;
+}
+
 export interface PeriodLimits {
   usd: number;
   input_tokens: number;
   output_tokens: number;
+  /** Omitted on write = keep the stored list (or the deployment default). */
+  thresholds?: QuotaThreshold[];
 }
 
 export interface QuotaLimits {
   daily: PeriodLimits | null;
   weekly: PeriodLimits | null;
   monthly: PeriodLimits | null;
+}
+
+/** Subject-level per-minute limits; 0 disables a dimension. */
+export interface RateLimits {
+  rpm: number;
+  tpm: number;
+}
+
+export const DEFAULT_THRESHOLDS: QuotaThreshold[] = [
+  { at: 0.8, action: "warn" },
+  { at: 1, action: "block" },
+];
+
+/** Client-side mirror of the server rules so the editor can explain a
+ *  rejection before the request is sent. Returns null when valid. */
+export function thresholdsError(thresholds: QuotaThreshold[]): string | null {
+  if (thresholds.length === 0) return "Add at least one threshold.";
+  let previous = 0;
+  for (const [index, entry] of thresholds.entries()) {
+    if (!Number.isFinite(entry.at) || entry.at <= 0 || entry.at > 10) {
+      return `Threshold ${index + 1} must be greater than 0% and at most 1000%.`;
+    }
+    if (entry.at <= previous) return "Thresholds must be strictly increasing.";
+    if (entry.action !== "warn" && entry.action !== "block") return "Choose warn or block for every threshold.";
+    if (index < thresholds.length - 1 && entry.action === "block") return "A block threshold must be the last entry.";
+    previous = entry.at;
+  }
+  return null;
+}
+
+export function isAlertOnly(thresholds: QuotaThreshold[] | undefined): boolean {
+  return thresholds !== undefined && thresholds.length > 0 && thresholds.every((entry) => entry.action !== "block");
 }
 
 export interface UsageTotals {
@@ -203,6 +247,20 @@ export interface LeaseState {
   lease_seconds: number;
 }
 
+/** Identity of a workload-mode subject: an app on its own IAM principal,
+ *  metered by application inference profile. `registered` is false for a
+ *  metered row whose id is no longer in the deployed roster. */
+export interface WorkloadIdentity {
+  workload_id: string;
+  name: string;
+  model: string | null;
+  profile_arn: string | null;
+  role_arn: string | null;
+  enforcement_ready: boolean;
+  registered: boolean;
+  tag: { key: string; value: string };
+}
+
 export interface AdminUser {
   user_id: string;
   name: string;
@@ -213,14 +271,106 @@ export interface AdminUser {
   created_at: string | null;
   updated_at: string | null;
   limits: QuotaLimits;
+  /** null when neither rpm nor tpm is configured. */
+  rate?: RateLimits | null;
+  /** Optional second axis: budgets keyed by model ID. A breach on any
+   *  model budget blocks the whole subject (enforcement is subject-wide). */
+  model_budgets?: Record<string, QuotaLimits>;
   lease?: LeaseState | null;
   granularity?: "user" | "workload";
   enforcement_ready?: boolean;
+  /** Present when granularity is "workload". */
+  workload?: WorkloadIdentity;
+}
+
+export function isWorkload(user: Pick<AdminUser, "user_id" | "granularity">): boolean {
+  return user.granularity === "workload" || user.user_id.startsWith("workload:");
+}
+
+export interface ModelBudgetResponse {
+  user_id: string;
+  model_id: string;
+  updated?: boolean;
+  removed?: boolean;
+  model_budgets: Record<string, QuotaLimits>;
+  user: AdminUser;
+}
+
+export interface ModelUsageResponse {
+  user_id: string;
+  model_id: string;
+  current_usage: CurrentUsage;
+}
+
+export interface ReconciliationComparison {
+  estimated_usd: number;
+  billed_usd: number;
+  delta_usd: number;
+  delta_percent: number | null;
+}
+
+export interface ReconciliationWorkload extends ReconciliationComparison {
+  workload_id: string;
+  name: string;
+  tag_inactive: boolean;
+}
+
+export interface ReconciliationRun {
+  day: string;
+  run_at: string;
+  region?: string;
+  aggregate: ReconciliationComparison;
+  workloads: ReconciliationWorkload[];
+  tag_inactive_workloads: string[];
+}
+
+export interface ReconciliationResponse {
+  enabled: boolean;
+  lag_days?: number;
+  message?: string;
+  runs: ReconciliationRun[];
+  latest?: ReconciliationRun | null;
+}
+
+function isReconciliationComparison(value: unknown): value is ReconciliationComparison {
+  return isObject(value) && hasNumber(value, "estimated_usd") && hasNumber(value, "billed_usd") &&
+    hasNumber(value, "delta_usd") && hasNullableNumber(value, "delta_percent");
+}
+
+function isReconciliationWorkload(value: unknown): value is ReconciliationWorkload {
+  return isObject(value) && isReconciliationComparison(value) && hasString(value, "name") &&
+    hasBoolean(value, "tag_inactive");
+}
+
+function isReconciliationRun(value: unknown): value is ReconciliationRun {
+  return isObject(value) && hasString(value, "day") && hasString(value, "run_at") &&
+    isReconciliationComparison(value.aggregate) &&
+    Array.isArray(value.workloads) && value.workloads.every(isReconciliationWorkload) &&
+    Array.isArray(value.tag_inactive_workloads) &&
+    value.tag_inactive_workloads.every((name) => typeof name === "string");
+}
+
+export function isReconciliationResponse(value: unknown): value is ReconciliationResponse {
+  return isObject(value) && hasBoolean(value, "enabled") &&
+    Array.isArray(value.runs) && value.runs.every(isReconciliationRun);
 }
 
 export interface UserRow extends AdminUser {
   today: UsageTotals;
   current_usage: CurrentUsage;
+}
+
+/** One entry of GET /admin/workloads: the deployed roster joined with the
+ *  metered row. `subject` is null for a workload configured at deploy time
+ *  that has not invoked yet (its row appears on first metered call). */
+export interface WorkloadEntry extends WorkloadIdentity {
+  subject: UserRow | null;
+}
+
+export interface WorkloadListResponse {
+  workloads: WorkloadEntry[];
+  roster_source: string;
+  tag_key: string;
 }
 
 export interface UserListResponse {
@@ -245,6 +395,7 @@ export interface CreateUserRequest {
   user_id: string;
   name: string;
   limits: QuotaLimits;
+  rate?: RateLimits | null;
 }
 
 export interface CreateUserResponse {
@@ -280,10 +431,16 @@ export interface UsageHistoryResponse {
   next_cursor: string | null;
 }
 
+export interface AuditThreshold {
+  at_bps: number;
+  action: ThresholdAction;
+}
+
 export interface AuditPeriodLimits {
   usd_micro: number;
   input_tokens: number;
   output_tokens: number;
+  thresholds?: AuditThreshold[];
 }
 
 export interface AuditSnapshotLimits {
@@ -302,6 +459,7 @@ export interface AuditUserSnapshot {
   created_at: string | null;
   updated_at: string | null;
   limits: AuditSnapshotLimits;
+  rate?: RateLimits | null;
 }
 
 export interface AuditEvent {
@@ -332,6 +490,23 @@ export interface UserAuditListResponse extends AuditListResponse {
   user_id: string;
 }
 
+export interface SubjectKindSummary {
+  total: number;
+  blocked: number;
+  today: UsageTotals;
+}
+
+export interface WorkloadKindSummary extends SubjectKindSummary {
+  /** Roster entries in the deployment config. */
+  configured: number;
+  /** Rows whose roster entry has no IAM role: metered and alerted, never hard-blocked. */
+  metering_only: number;
+  /** Rows with no roster entry (removed from config or created out of band). */
+  unregistered: number;
+  /** Roster entries with no row yet (no invocation since deploy). */
+  awaiting_traffic: number;
+}
+
 export interface Summary {
   enforcement: {
     source: string;
@@ -347,10 +522,16 @@ export interface Summary {
     vend_rate_limit_per_minute: number;
     revocation_policy_shards: number;
     revocation_reconcile_minutes: number;
+    /** All subjects (users + workloads). Kept for older consumers. */
     total_users: number;
     blocked_users: number;
     blocked_user_ids: string[];
     today: UsageTotals;
+    /** Same figures split by control path. Optional for older brokers. */
+    subjects?: {
+      users: SubjectKindSummary;
+      workloads: WorkloadKindSummary;
+    };
   };
   observability: {
     source: string;
@@ -425,6 +606,7 @@ export interface UsageTopUser {
   name?: string;
   cost_usd: number;
   requests: number;
+  granularity?: "user" | "workload";
 }
 
 export interface UsageMetrics {
@@ -442,6 +624,8 @@ export interface UsageMetrics {
 
 export interface SetLimitsRequest {
   limits: QuotaLimits;
+  /** Present = replace both rate limits (null disables). Absent = unchanged. */
+  rate?: RateLimits | null;
   reason?: string;
 }
 
@@ -529,11 +713,27 @@ function isUsageTotals(value: unknown): value is UsageTotals {
     isNonNegativeInteger(value.requests);
 }
 
+function isThreshold(value: unknown): value is QuotaThreshold {
+  return isObject(value) &&
+    typeof value.at === "number" && Number.isFinite(value.at) && value.at > 0 &&
+    (value.action === "warn" || value.action === "block");
+}
+
 function isPeriodLimits(value: unknown): value is PeriodLimits {
   return isObject(value) &&
     isNonNegativeNumber(value.usd) &&
     isNonNegativeInteger(value.input_tokens) &&
-    isNonNegativeInteger(value.output_tokens);
+    isNonNegativeInteger(value.output_tokens) &&
+    (value.thresholds === undefined ||
+      (Array.isArray(value.thresholds) && value.thresholds.every(isThreshold)));
+}
+
+function isRateLimits(value: unknown): value is RateLimits {
+  return isObject(value) && isNonNegativeInteger(value.rpm) && isNonNegativeInteger(value.tpm);
+}
+
+function isNullableRateLimits(value: unknown): value is RateLimits | null | undefined {
+  return value === null || value === undefined || isRateLimits(value);
 }
 
 function isQuotaLimits(value: unknown): value is QuotaLimits {
@@ -560,6 +760,23 @@ function isCurrentUsage(value: unknown): value is CurrentUsage {
     isPeriodUsage(value.monthly) && value.monthly.period === "monthly";
 }
 
+function isModelBudgets(value: unknown): value is Record<string, QuotaLimits> {
+  return value === undefined ||
+    (isObject(value) && Object.values(value).every(isQuotaLimits));
+}
+
+function isWorkloadIdentity(value: unknown): value is WorkloadIdentity {
+  return isObject(value) &&
+    hasString(value, "workload_id") &&
+    hasString(value, "name") &&
+    hasNullableString(value, "model") &&
+    hasNullableString(value, "profile_arn") &&
+    hasNullableString(value, "role_arn") &&
+    hasBoolean(value, "enforcement_ready") &&
+    hasBoolean(value, "registered") &&
+    isObject(value.tag) && hasString(value.tag, "key") && hasString(value.tag, "value");
+}
+
 export function isAdminUser(value: unknown): value is AdminUser {
   return isObject(value) &&
     hasString(value, "user_id") &&
@@ -571,7 +788,21 @@ export function isAdminUser(value: unknown): value is AdminUser {
     hasNullableString(value, "created_at") &&
     hasNullableString(value, "updated_at") &&
     isQuotaLimits(value.limits) &&
-    isNullableLeaseState((value as { lease?: unknown }).lease);
+    isNullableRateLimits((value as { rate?: unknown }).rate) &&
+    isModelBudgets((value as { model_budgets?: unknown }).model_budgets) &&
+    isNullableLeaseState((value as { lease?: unknown }).lease) &&
+    (value.workload === undefined || isWorkloadIdentity(value.workload));
+}
+
+function isModelBudgetResponse(value: unknown): value is ModelBudgetResponse {
+  return isObject(value) && hasString(value, "user_id") && hasString(value, "model_id") &&
+    isObject(value.model_budgets) && Object.values(value.model_budgets).every(isQuotaLimits) &&
+    isAdminUser(value.user);
+}
+
+function isModelUsageResponse(value: unknown): value is ModelUsageResponse {
+  return isObject(value) && hasString(value, "user_id") && hasString(value, "model_id") &&
+    isCurrentUsage(value.current_usage);
 }
 
 function isNullableLeaseState(value: unknown): value is LeaseState | null | undefined {
@@ -594,6 +825,17 @@ function isUserListResponse(value: unknown): value is UserListResponse {
   return isObject(value) &&
     Array.isArray(value.users) && value.users.every(isUserRow) &&
     (value.next_cursor === null || typeof value.next_cursor === "string");
+}
+
+function isWorkloadEntry(value: unknown): value is WorkloadEntry {
+  return isWorkloadIdentity(value) && isObject(value) &&
+    (value.subject === null || isUserRow(value.subject));
+}
+
+export function isWorkloadListResponse(value: unknown): value is WorkloadListResponse {
+  return isObject(value) &&
+    Array.isArray(value.workloads) && value.workloads.every(isWorkloadEntry) &&
+    hasString(value, "roster_source") && hasString(value, "tag_key");
 }
 
 function isAdminUserListResponse(value: unknown): value is AdminUserListResponse {
@@ -636,7 +878,11 @@ function isAuditPeriodLimits(value: unknown): value is AuditPeriodLimits {
   return isObject(value) &&
     isNonNegativeInteger(value.usd_micro) &&
     isNonNegativeInteger(value.input_tokens) &&
-    isNonNegativeInteger(value.output_tokens);
+    isNonNegativeInteger(value.output_tokens) &&
+    (value.thresholds === undefined ||
+      (Array.isArray(value.thresholds) && value.thresholds.every((entry) =>
+        isObject(entry) && isNonNegativeInteger(entry.at_bps) &&
+        (entry.action === "warn" || entry.action === "block"))));
 }
 
 function isAuditSnapshotLimits(value: unknown): value is AuditSnapshotLimits {
@@ -651,7 +897,8 @@ function isAuditUserSnapshot(value: unknown): value is AuditUserSnapshot {
     (value.status === "active" || value.status === "blocked") &&
     hasString(value, "status_reason") && hasString(value, "status_origin") &&
     isNonNegativeInteger(value.version) && hasNullableString(value, "created_at") &&
-    hasNullableString(value, "updated_at") && isAuditSnapshotLimits(value.limits);
+    hasNullableString(value, "updated_at") && isAuditSnapshotLimits(value.limits) &&
+    isNullableRateLimits((value as { rate?: unknown }).rate);
 }
 
 function isAuditEvent(value: unknown): value is AuditEvent {
@@ -675,10 +922,21 @@ function isUserAuditListResponse(value: unknown): value is UserAuditListResponse
   return isAuditListResponse(value) && isObject(value) && hasString(value, "user_id");
 }
 
+function isSubjectKindSummary(value: unknown): value is SubjectKindSummary {
+  return isObject(value) && hasNumber(value, "total") && hasNumber(value, "blocked") &&
+    isUsageTotals(value.today);
+}
+
+function isWorkloadKindSummary(value: unknown): value is WorkloadKindSummary {
+  return isSubjectKindSummary(value) && isObject(value) &&
+    ["configured", "metering_only", "unregistered", "awaiting_traffic"].every((key) => hasNumber(value, key));
+}
+
 function isSummary(value: unknown): value is Summary {
   if (!isObject(value) || !isObject(value.enforcement) || !isObject(value.observability)) return false;
   const enforcement = value.enforcement;
   const observability = value.observability;
+  const subjects = enforcement.subjects;
   return ["source", "as_of", "window", "mode"].every((key) => hasString(enforcement, key)) &&
     [
       "credential_ttl_seconds",
@@ -694,6 +952,8 @@ function isSummary(value: unknown): value is Summary {
     ].every((key) => hasNumber(enforcement, key)) &&
     Array.isArray(enforcement.blocked_user_ids) && enforcement.blocked_user_ids.every((item) => typeof item === "string") &&
     isUsageTotals(enforcement.today) &&
+    (subjects === undefined ||
+      (isObject(subjects) && isSubjectKindSummary(subjects.users) && isWorkloadKindSummary(subjects.workloads))) &&
     ["source", "delivery", "metrics_namespace", "detection_lag_metric"].every((key) => hasString(observability, key));
 }
 
@@ -805,6 +1065,14 @@ function normalizeLimits(limits: QuotaLimits): QuotaLimits {
   ) as unknown as QuotaLimits;
 }
 
+function sameThresholds(left: QuotaThreshold[] | undefined, right: QuotaThreshold[] | undefined): boolean {
+  // The server always echoes a list; the client may have omitted one to
+  // keep the stored list, in which case any echoed list is acceptable.
+  if (left === undefined || right === undefined) return true;
+  return left.length === right.length &&
+    left.every((entry, index) => Math.abs(entry.at - right[index].at) < 1e-9 && entry.action === right[index].action);
+}
+
 function sameLimits(left: QuotaLimits, right: QuotaLimits): boolean {
   return (["daily", "weekly", "monthly"] as const).every((period) => {
     const a = left[period];
@@ -812,8 +1080,16 @@ function sameLimits(left: QuotaLimits, right: QuotaLimits): boolean {
     if (a === null || b === null) return a === b;
     return a.usd === b.usd &&
       a.input_tokens === b.input_tokens &&
-      a.output_tokens === b.output_tokens;
+      a.output_tokens === b.output_tokens &&
+      sameThresholds(a.thresholds, b.thresholds);
   });
+}
+
+function sameRate(submitted: RateLimits | null | undefined, echoed: RateLimits | null | undefined): boolean {
+  if (submitted === undefined) return true;  // not part of this mutation
+  const a = submitted ?? { rpm: 0, tpm: 0 };
+  const b = echoed ?? { rpm: 0, tpm: 0 };
+  return a.rpm === b.rpm && a.tpm === b.tpm;
 }
 
 function mutationHeaders(user: AdminUser): Record<string, string> {
@@ -846,6 +1122,11 @@ export const api = {
 
   operations: async (cfg: AdminConfig, session: Session): Promise<Operations> =>
     (await transport<Operations>(cfg, session, "GET", "/admin/operations", { validate: isOperations })).data,
+
+  reconciliation: async (cfg: AdminConfig, session: Session, limit = 14): Promise<ReconciliationResponse> =>
+    (await transport<ReconciliationResponse>(cfg, session, "GET", `/admin/reconciliation?limit=${limit}`, {
+      validate: isReconciliationResponse,
+    })).data,
 
   usageMetrics: async (cfg: AdminConfig, session: Session, days: number): Promise<UsageMetrics> =>
     (await transport<UsageMetrics>(cfg, session, "GET", `/admin/usage/metrics?days=${days}`, {
@@ -930,6 +1211,15 @@ export const api = {
       { validate: isAdminUserListResponse },
     )).data,
 
+  listWorkloads: async (cfg: AdminConfig, session: Session): Promise<WorkloadListResponse> =>
+    (await transport<WorkloadListResponse>(
+      cfg,
+      session,
+      "GET",
+      "/admin/workloads",
+      { validate: isWorkloadListResponse },
+    )).data,
+
   createUser: (
     cfg: AdminConfig,
     session: Session,
@@ -950,7 +1240,8 @@ export const api = {
         value.user.user_id === body.user_id &&
         value.user.name === body.name &&
         sameLimits(value.limits, value.user.limits) &&
-        sameLimits(value.user.limits, body.limits),
+        sameLimits(value.user.limits, body.limits) &&
+        sameRate(body.rate, value.user.rate),
     });
   },
 
@@ -1047,10 +1338,11 @@ export const api = {
     user: AdminUser,
     limits: SetLimitsRequest,
   ): Promise<TransportResponse<SetLimitsResponse>> => {
-    const { reason, limits: quotaLimits } = limits;
+    const { reason, limits: quotaLimits, rate } = limits;
     const trimmedReason = reason?.trim();
     const normalized: SetLimitsRequest = {
       limits: normalizeLimits(quotaLimits),
+      ...(rate !== undefined ? { rate } : {}),
       ...(trimmedReason ? { reason: trimmedReason } : {}),
     };
     const params = new URLSearchParams({ user_id: user.user_id });
@@ -1063,7 +1355,8 @@ export const api = {
         value.user.user_id === user.user_id &&
         value.user.version > user.version &&
         sameLimits(value.limits, value.user.limits) &&
-        sameLimits(value.user.limits, normalized.limits),
+        sameLimits(value.user.limits, normalized.limits) &&
+        sameRate(normalized.rate, value.user.rate),
     });
   },
 
@@ -1088,5 +1381,65 @@ export const api = {
         value.user.status_reason === reason.trim() &&
         value.user.version > user.version,
     });
+  },
+
+  // Model-scoped budgets: PUT sets/replaces one model's budget, DELETE
+  // removes it. Same If-Match/Idempotency-Key conventions as setLimits.
+  setModelBudget: (
+    cfg: AdminConfig,
+    session: Session,
+    user: AdminUser,
+    modelId: string,
+    limits: QuotaLimits,
+    reason?: string,
+  ): Promise<TransportResponse<ModelBudgetResponse>> => {
+    const params = new URLSearchParams({ user_id: user.user_id, model_id: modelId });
+    const trimmedReason = reason?.trim();
+    const normalized = normalizeLimits(limits);
+    return transport(cfg, session, "PUT", `/admin/user/model-budget?${params.toString()}`, {
+      body: { limits: normalized, ...(trimmedReason ? { reason: trimmedReason } : {}) },
+      headers: mutationHeaders(user),
+      validate: (value): value is ModelBudgetResponse =>
+        isModelBudgetResponse(value) &&
+        value.user_id === user.user_id &&
+        value.model_id === modelId &&
+        value.user.version > user.version &&
+        modelId in value.model_budgets &&
+        sameLimits(value.model_budgets[modelId], normalized),
+    });
+  },
+
+  removeModelBudget: (
+    cfg: AdminConfig,
+    session: Session,
+    user: AdminUser,
+    modelId: string,
+    reason?: string,
+  ): Promise<TransportResponse<ModelBudgetResponse>> => {
+    const params = new URLSearchParams({ user_id: user.user_id, model_id: modelId });
+    const trimmedReason = reason?.trim();
+    return transport(cfg, session, "DELETE", `/admin/user/model-budget?${params.toString()}`, {
+      body: trimmedReason ? { reason: trimmedReason } : {},
+      headers: mutationHeaders(user),
+      validate: (value): value is ModelBudgetResponse =>
+        isModelBudgetResponse(value) &&
+        value.user_id === user.user_id &&
+        value.model_id === modelId &&
+        value.user.version > user.version &&
+        !(modelId in value.model_budgets),
+    });
+  },
+
+  modelUsage: async (
+    cfg: AdminConfig,
+    session: Session,
+    userId: string,
+    modelId: string,
+  ): Promise<ModelUsageResponse> => {
+    const params = new URLSearchParams({ user_id: userId, model_id: modelId });
+    return (await transport<ModelUsageResponse>(cfg, session, "GET", `/admin/user/model-usage?${params.toString()}`, {
+      validate: (value): value is ModelUsageResponse =>
+        isModelUsageResponse(value) && value.user_id === userId && value.model_id === modelId,
+    })).data;
   },
 };

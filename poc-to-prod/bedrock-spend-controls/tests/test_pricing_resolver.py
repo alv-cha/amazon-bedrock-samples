@@ -12,9 +12,11 @@ def _product(
     *,
     feature: str = "",
     service_tier: str = "",
+    model: str = "gpt-oss-20b",
+    unit: str = "1K tokens",
 ) -> str:
     attributes = {
-        "model": "gpt-oss-20b",
+        "model": model,
         "regionCode": "us-east-1",
         "inferenceType": inference_type,
     }
@@ -29,7 +31,7 @@ def _product(
                 f"{sku}.term": {
                     "priceDimensions": {
                         f"{sku}.dimension": {
-                            "unit": "1K tokens",
+                            "unit": unit,
                             "pricePerUnit": {"USD": usd_per_1k},
                         }
                     }
@@ -138,6 +140,166 @@ def test_fallback_is_never_lower_than_known_snapshot_prices():
     ) == {
         "input_per_mtok": 20.0,
         "output_per_mtok": 100.0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Multi-dimension pricing: cache read/write and per-image rates
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_includes_cache_dimensions_when_the_catalog_publishes_them():
+    """Observed Price List shape for Nova Lite in us-east-1: cache rows use
+    inferenceType 'Prompt cache read/write input tokens', unit '1K tokens',
+    feature 'On-demand Inference'."""
+    pricing = _FakePricing([
+        _product("in", "Input tokens", "0.0000600000",
+                 feature="On-demand Inference", model="Nova Lite"),
+        _product("out", "Output tokens", "0.0002400000",
+                 feature="On-demand Inference", model="Nova Lite"),
+        _product("cr", "Prompt cache read input tokens", "0.0000150000",
+                 feature="On-demand Inference", model="Nova Lite"),
+        _product("cw", "Prompt cache write input tokens", "0.0000000000",
+                 feature="On-demand Inference", model="Nova Lite"),
+        # Customization / batch / flex rows must be ignored.
+        _product("cr-custom", "Prompt cache read input tokens", "0.0000150000",
+                 feature="Model Customization", model="Nova Lite"),
+        _product("cr-flex", "Prompt cache read input tokens flex", "0.0000100000",
+                 feature="On-demand Inference", model="Nova Lite"),
+    ])
+
+    snapshot = resolver.resolve_snapshot(
+        pricing, "us-east-1", {"Nova Lite": ["amazon.nova-lite-v1:0"]}, {}
+    )
+
+    assert snapshot["amazon.nova-lite-v1:0"] == {
+        "input_per_mtok": 0.06,
+        "output_per_mtok": 0.24,
+        "cache_read_per_mtok": 0.015,
+        "cache_write_per_mtok": 0.0,
+    }
+
+
+def test_snapshot_omits_cache_dimensions_when_absent_and_stays_backward_compatible():
+    pricing = _FakePricing([
+        _product("in", "Input tokens", "0.0000700000"),
+        _product("out", "Output tokens", "0.0003000000"),
+    ])
+    snapshot = resolver.resolve_snapshot(
+        pricing, "us-east-1", {"gpt-oss-20b": ["openai.gpt-oss-20b"]}, {}
+    )
+    # Exactly the legacy pair: nothing extra is invented.
+    assert snapshot["openai.gpt-oss-20b"] == {
+        "input_per_mtok": 0.07,
+        "output_per_mtok": 0.3,
+    }
+
+
+def test_snapshot_rejects_ambiguous_optional_cache_price():
+    pricing = _FakePricing([
+        _product("in", "Input tokens", "0.0000700000"),
+        _product("out", "Output tokens", "0.0003000000"),
+        _product("cr-a", "Prompt cache read input tokens", "0.0000100000"),
+        _product("cr-b", "Prompt cache read input tokens", "0.0000200000"),
+    ])
+    with pytest.raises(ValueError, match="at most one .*cache_read_per_mtok"):
+        resolver.resolve_snapshot(
+            pricing, "us-east-1", {"gpt-oss-20b": ["openai.gpt-oss-20b"]}, {}
+        )
+
+
+def test_image_model_snapshot_carries_per_image_rate():
+    """Observed Nova Canvas rows: inferenceType 'T2I 1024 Standard' etc.,
+    unit 'image', and NO token rows at all. The resolver zeroes the token
+    pair by construction and contributes the smallest standard per-image
+    rate as the estimate."""
+    pricing = _FakePricing([
+        _product("t2i-1024-std", "T2I 1024 Standard", "0.04",
+                 feature="On-demand Inference", model="Nova Canvas",
+                 unit="image"),
+        _product("t2i-1024-prem", "T2I 1024 Premium", "0.06",
+                 feature="On-demand Inference", model="Nova Canvas",
+                 unit="image"),
+        _product("t2i-2048-std", "T2I 2048 Standard", "0.06",
+                 feature="On-demand Inference", model="Nova Canvas",
+                 unit="image"),
+        _product("i2i", "I2I 1024 Standard", "0.04",
+                 feature="On-demand Inference", model="Nova Canvas",
+                 unit="image"),
+    ])
+    snapshot = resolver.resolve_snapshot(
+        pricing, "us-east-1", {"Nova Canvas": ["amazon.nova-canvas-v1:0"]}, {}
+    )
+    assert snapshot["amazon.nova-canvas-v1:0"] == {
+        "input_per_mtok": 0.0,
+        "output_per_mtok": 0.0,
+        "per_image": 0.04,
+    }
+
+
+def test_model_with_neither_token_nor_image_rows_still_fails():
+    pricing = _FakePricing([
+        _product("ptu", "", "55", feature="Provisioned Throughput Inference - 1 month",
+                 model="Nova Reel", unit="hour"),
+    ])
+    with pytest.raises(ValueError, match="one standard on-demand input price"):
+        resolver.resolve_snapshot(
+            pricing, "us-east-1", {"Nova Reel": ["amazon.nova-reel-v1:0"]}, {}
+        )
+
+
+def test_pinned_prices_keep_optional_dimensions():
+    snapshot = resolver.resolve_snapshot(
+        _FakePricing([]),
+        "us-east-1",
+        {},
+        {
+            "amazon.nova-canvas-v1:0": {
+                "input_per_mtok": 0,
+                "output_per_mtok": 0,
+                "per_image": 0.08,
+            },
+            "anthropic.claude-haiku-4-5-20251001-v1:0": {
+                "input_per_mtok": 1.0,
+                "output_per_mtok": 5.0,
+                "cache_read_per_mtok": 0.1,
+                "cache_write_per_mtok": 1.25,
+            },
+        },
+    )
+    assert snapshot["amazon.nova-canvas-v1:0"]["per_image"] == 0.08
+    assert snapshot["anthropic.claude-haiku-4-5-20251001-v1:0"] == {
+        "input_per_mtok": 1.0,
+        "output_per_mtok": 5.0,
+        "cache_read_per_mtok": 0.1,
+        "cache_write_per_mtok": 1.25,
+    }
+
+
+def test_conservative_fallback_covers_every_known_dimension_at_the_max_rate():
+    fallback = resolver.conservative_fallback(
+        {
+            "a": {
+                "input_per_mtok": 1,
+                "output_per_mtok": 2,
+                "cache_read_per_mtok": 0.1,
+            },
+            "b": {
+                "input_per_mtok": 20,
+                "output_per_mtok": 80,
+                "cache_read_per_mtok": 2.0,
+                "cache_write_per_mtok": 25.0,
+            },
+            "img": {"input_per_mtok": 0, "output_per_mtok": 0, "per_image": 0.08},
+        },
+        {"input_per_mtok": 15, "output_per_mtok": 100},
+    )
+    assert fallback == {
+        "cache_read_per_mtok": 2.0,
+        "cache_write_per_mtok": 25.0,
+        "input_per_mtok": 20.0,
+        "output_per_mtok": 100.0,
+        "per_image": 0.08,
     }
 
 

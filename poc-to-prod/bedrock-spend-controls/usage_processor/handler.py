@@ -27,11 +27,21 @@ from boto3.dynamodb.types import TypeSerializer
 from botocore.exceptions import ClientError
 from bedrock_spend_controls.quota_periods import (
     PERIODS,
+    RATE_PERIOD,
     aggregate_daily_rows,
     calendar_windows,
+    default_thresholds,
     evaluate_limits,
-    limits_from_item,
+    evaluate_model_budgets,
+    limits_from_item as _layer_limits_from_item,
+    merge_evaluations,
+    model_budgets_from_item,
+    model_ledger_subject,
     quota_reason,
+    rate_limits_enabled,
+    rate_limits_from_item,
+    rate_row_key,
+    rate_usage_from_item,
 )
 
 MICRO = 1_000_000
@@ -43,16 +53,33 @@ _ASSUMED_ROLE_ARN = re.compile(
 )
 _SERIALIZER = TypeSerializer()
 
-_DEFAULT_PRICES = {
-    "openai.gpt-oss-120b": (0.15, 0.60),
-    "openai.gpt-oss-120b-1:0": (0.15, 0.60),
-    "openai.gpt-oss-20b": (0.07, 0.30),
-    "openai.gpt-oss-20b-1:0": (0.07, 0.30),
-    "anthropic.claude-opus-4-7": (5.00, 25.00),
-    "global.anthropic.claude-opus-4-7": (5.00, 25.00),
-    "us.anthropic.claude-opus-4-7": (5.50, 27.50),
+# Price dimensions. Token dimensions are USD per million tokens; ``image``
+# is USD per generated image. The names are the price-catalog vocabulary
+# shared with cdk/config/model-pricing.json, the pricing resolver, and the
+# SSM parameter; ``input``/``output`` remain the legacy ``*_per_mtok`` pair.
+TOKEN_DIMENSIONS = ("input", "output", "cache_read", "cache_write")
+UNIT_DIMENSIONS = ("image",)
+PRICE_DIMENSIONS = TOKEN_DIMENSIONS + UNIT_DIMENSIONS
+_LEGACY_RATE_KEYS = {
+    "input": "input_per_mtok",
+    "output": "output_per_mtok",
+    "cache_read": "cache_read_per_mtok",
+    "cache_write": "cache_write_per_mtok",
+    "image": "per_image",
 }
-_DEFAULT_FALLBACK_PRICE = (15.00, 75.00)
+
+# Prices are keyed by dimension name; a model that only has input/output
+# rates prices exactly as before this map existed.
+_DEFAULT_PRICES: dict[str, dict[str, float]] = {
+    "openai.gpt-oss-120b": {"input": 0.15, "output": 0.60},
+    "openai.gpt-oss-120b-1:0": {"input": 0.15, "output": 0.60},
+    "openai.gpt-oss-20b": {"input": 0.07, "output": 0.30},
+    "openai.gpt-oss-20b-1:0": {"input": 0.07, "output": 0.30},
+    "anthropic.claude-opus-4-7": {"input": 5.00, "output": 25.00},
+    "global.anthropic.claude-opus-4-7": {"input": 5.00, "output": 25.00},
+    "us.anthropic.claude-opus-4-7": {"input": 5.50, "output": 27.50},
+}
+_DEFAULT_FALLBACK_PRICE: dict[str, float] = {"input": 15.00, "output": 75.00}
 
 
 @dataclass(frozen=True)
@@ -65,10 +92,47 @@ class InvocationUsage:
     occurred_at: datetime
     workload_id: str | None = None
     workload_name: str | None = None
+    # Multi-dimension usage (Item 1). ``cache_read_tokens`` and
+    # ``cache_write_tokens`` come straight from the invocation-log record
+    # (``input.cacheReadInputTokenCount`` / ``input.cacheWriteInputTokenCount``,
+    # verified against real Converse records with a cachePoint). ``images``
+    # is the number of generated images when the record carries it.
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    images: int = 0
 
     @property
     def window(self) -> str:
         return self.occurred_at.strftime("%Y-%m-%d")
+
+    @property
+    def dimension_counts(self) -> dict[str, int]:
+        """Non-zero usage per price dimension, in catalog vocabulary."""
+        counts = {
+            "input": self.input_tokens,
+            "output": self.output_tokens,
+            "cache_read": self.cache_read_tokens,
+            "cache_write": self.cache_write_tokens,
+            "image": self.images,
+        }
+        return {name: count for name, count in counts.items() if count > 0}
+
+
+@dataclass(frozen=True)
+class PricedInvocation:
+    """Outcome of pricing one invocation against the catalog."""
+
+    cost_micro: int
+    price_source: str  # snapshot | base-model | fallback
+    # Dimensions the record carried but the resolved price had no rate for.
+    # Non-empty means the fallback rate was used for that dimension (when the
+    # fallback has one) or the dimension went unpriced; either way the
+    # request is flagged for repair rather than silently under-counted.
+    missing_dimensions: tuple[str, ...] = ()
+
+    @property
+    def unpriced(self) -> bool:
+        return bool(self.missing_dimensions) or self.price_source == "fallback"
 
 
 _dynamodb_resource = None
@@ -144,6 +208,46 @@ def _workload_profiles() -> dict[str, dict[str, str]]:
     return by_arn
 
 
+def _image_count(record: dict, output_data: dict) -> int:
+    """Generated-image count from an invocation-log record, when present.
+
+    Image models do not report token counts. With image data delivery
+    disabled (this stack's managed configuration) the record has no
+    ``outputBodyJson`` either, so the count is only available when the
+    account enables image delivery or Bedrock adds an explicit counter.
+    Checked in order: an explicit ``output.outputImageCount``, then the
+    length of ``output.outputBodyJson.images`` (the Nova Canvas / Stability
+    response shape). Absence yields 0 and the request is flagged as
+    unpriced downstream instead of being silently free.
+    """
+    explicit = output_data.get("outputImageCount")
+    if explicit is not None:
+        return _non_negative_int(explicit)
+    body = output_data.get("outputBodyJson")
+    if isinstance(body, dict):
+        images = body.get("images")
+        if isinstance(images, list):
+            return len(images)
+    return 0
+
+
+def _is_image_model(model_id: str) -> bool:
+    """Heuristic for models whose on-demand price is per image.
+
+    Used only to decide whether a record with no token counts is a
+    generation we must still meter (and flag) rather than a metadata-less
+    duplicate we should skip. Pricing itself never uses this: it is driven
+    by the dimensions present in the catalog entry.
+    """
+    tail = model_id.rsplit("/", 1)[-1].lower()
+    return any(
+        marker in tail
+        for marker in (
+            "canvas", "titan-image", "stability.", "sd3", "stable-",
+        )
+    )
+
+
 def _parse_invocation(
     log_event: dict,
     expected_role_name: str,
@@ -160,16 +264,22 @@ def _parse_invocation(
     output_data = record.get("output")
     input_data = input_data if isinstance(input_data, dict) else {}
     output_data = output_data if isinstance(output_data, dict) else {}
-    if not (
+    model_id = str(record.get("modelId") or "unknown")
+    has_token_metadata = (
         "inputTokenCount" in input_data
         or "inputBodyTokenCount" in input_data
         or "outputTokenCount" in output_data
         or "outputBodyTokenCount" in output_data
-    ):
+    )
+    images = _image_count(record, output_data)
+    if not has_token_metadata and images == 0 and not _is_image_model(model_id):
         # The Responses API logs a second, metadata-less record for the
         # same invocation alongside the token-bearing one. A record with
         # no token metadata on either side has nothing to meter; skipping
-        # it also keeps request counts honest.
+        # it also keeps request counts honest. Image models are the
+        # exception: their records legitimately carry no token counts
+        # (verified against a real Nova Canvas record), so they are metered
+        # as one image-generation request and flagged for repair.
         return None
     input_tokens = _non_negative_int(
         input_data.get(
@@ -179,6 +289,19 @@ def _parse_invocation(
     output_tokens = _non_negative_int(
         output_data.get(
             "outputTokenCount", output_data.get("outputBodyTokenCount", 0)
+        )
+    )
+    # Prompt-cache counters live beside inputTokenCount on the input side
+    # (observed shape; also accept a top-level placement defensively).
+    cache_read_tokens = _non_negative_int(
+        input_data.get(
+            "cacheReadInputTokenCount", record.get("cacheReadInputTokenCount", 0)
+        )
+    )
+    cache_write_tokens = _non_negative_int(
+        input_data.get(
+            "cacheWriteInputTokenCount",
+            record.get("cacheWriteInputTokenCount", 0),
         )
     )
     request_id = str(record.get("requestId") or log_event.get("id") or "")
@@ -191,7 +314,6 @@ def _parse_invocation(
     # with the customer's own principal, so the vended-role check below can
     # never claim it, and a vended session invoking a workload profile is
     # deterministically attributed to the workload that pays for it.
-    model_id = str(record.get("modelId") or "unknown")
     workload = (workload_profiles or {}).get(model_id)
     if workload is not None:
         return InvocationUsage(
@@ -205,6 +327,9 @@ def _parse_invocation(
             occurred_at=_timestamp(record, log_event),
             workload_id=workload["workload_id"],
             workload_name=workload["name"],
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+            images=images,
         )
 
     identity = record.get("identity")
@@ -220,6 +345,9 @@ def _parse_invocation(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         occurred_at=_timestamp(record, log_event),
+        cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=cache_write_tokens,
+        images=images,
     )
 
 
@@ -239,34 +367,53 @@ def _normalized_model_id(model_id: str) -> str:
     return model_id
 
 
-def _prices() -> dict[str, tuple[float, float]]:
+def _rates_from_entry(price: dict) -> dict[str, float]:
+    """Normalize one catalog/SSM price entry into ``{dimension: rate}``.
+
+    Accepts the legacy ``{"input_per_mtok", "output_per_mtok"}`` pair, the
+    optional ``cache_read_per_mtok`` / ``cache_write_per_mtok`` /
+    ``per_image`` siblings the resolver now emits, and a nested
+    ``"dimensions": {...}`` map. Unknown keys are ignored so a newer
+    resolver never breaks an older processor.
+    """
+    rates: dict[str, float] = {}
+    nested = price.get("dimensions")
+    if isinstance(nested, dict):
+        for name, rate in nested.items():
+            if name in PRICE_DIMENSIONS and rate is not None:
+                rates[name] = float(rate)
+    for name, legacy_key in _LEGACY_RATE_KEYS.items():
+        if legacy_key in price and price[legacy_key] is not None:
+            rates[name] = float(price[legacy_key])
+    if "input" not in rates or "output" not in rates:
+        raise ValueError("price entry needs input and output token rates")
+    return rates
+
+
+def _prices() -> dict[str, dict[str, float]]:
     raw = os.environ.get("MODEL_PRICES_JSON")
     if not raw:
-        return dict(_DEFAULT_PRICES)
+        return {model: dict(rates) for model, rates in _DEFAULT_PRICES.items()}
     return {
-        model_id: (
-            float(price["input_per_mtok"]),
-            float(price["output_per_mtok"]),
-        )
+        model_id: _rates_from_entry(price)
         for model_id, price in json.loads(raw).items()
     }
 
 
-def _fallback_price() -> tuple[float, float]:
+def _fallback_price() -> dict[str, float]:
     raw = os.environ.get("MODEL_FALLBACK_PRICE_JSON")
     if not raw:
-        return _DEFAULT_FALLBACK_PRICE
-    price = json.loads(raw)
-    return (
-        float(price["input_per_mtok"]),
-        float(price["output_per_mtok"]),
-    )
+        return dict(_DEFAULT_FALLBACK_PRICE)
+    return _rates_from_entry(json.loads(raw))
 
 
-# Refreshed prices live in an SSM parameter written by the scheduled price
-# resolver. The last good parameter value is kept across failed refreshes,
-# so the deployment-time env snapshot is only used before the first
-# successful read: a Parameter Store outage can never stop metering.
+# Prices live in an SSM parameter written at deploy time and rewritten by
+# the scheduled price resolver. The last good parameter value is kept
+# across failed refreshes, so the built-in defaults (``_DEFAULT_PRICES`` or
+# an optional ``MODEL_PRICES_JSON`` env override, kept for tests and local
+# runs) are only used before the first successful read: a Parameter Store
+# outage can never stop metering, and it is alarmed through
+# ``FallbackPricedRequests`` if a cold start had to price an unknown model.
 _PRICE_CACHE_TTL_SECONDS = 900
 _PRICE_RETRY_SECONDS = 60
 _price_cache: dict[str, Any] = {"next_attempt_at": 0.0, "value": None}
@@ -274,7 +421,7 @@ _price_cache: dict[str, Any] = {"next_attempt_at": 0.0, "value": None}
 
 def _parameter_prices(
     ssm, now_epoch: float
-) -> tuple[dict[str, tuple[float, float]], tuple[float, float]] | None:
+) -> tuple[dict[str, dict[str, float]], dict[str, float]] | None:
     parameter_name = os.environ.get("PRICES_PARAMETER_NAME")
     if not parameter_name or ssm is None:
         return None
@@ -285,16 +432,10 @@ def _parameter_prices(
                 ssm.get_parameter(Name=parameter_name)["Parameter"]["Value"]
             )
             models = {
-                model_id: (
-                    float(price["input_per_mtok"]),
-                    float(price["output_per_mtok"]),
-                )
+                model_id: _rates_from_entry(price)
                 for model_id, price in value["models"].items()
             }
-            fallback = (
-                float(value["fallback"]["input_per_mtok"]),
-                float(value["fallback"]["output_per_mtok"]),
-            )
+            fallback = _rates_from_entry(value["fallback"])
             cache["value"] = (models, fallback)
             cache["next_attempt_at"] = now_epoch + _PRICE_CACHE_TTL_SECONDS
         except Exception as exc:  # noqa: BLE001 - availability over freshness
@@ -329,11 +470,11 @@ _PROFILE_PREFIXES = frozenset(
 
 
 def _price_for(
-    prices: dict[str, tuple[float, float]],
-    fallback: tuple[float, float],
+    prices: dict[str, dict[str, float]],
+    fallback: dict[str, float],
     model_id: str,
-) -> tuple[tuple[float, float], str]:
-    """Return ((input_rate, output_rate), price_source) for one model ID."""
+) -> tuple[dict[str, float], str]:
+    """Return ({dimension: rate}, price_source) for one model ID."""
     exact = prices.get(model_id)
     if exact is not None:
         return exact, "snapshot"
@@ -345,15 +486,61 @@ def _price_for(
     return fallback, "fallback"
 
 
+def _round_up_micro(usd: float) -> int:
+    micro = int(usd * MICRO)
+    return micro + 1 if usd * MICRO > micro else micro
+
+
 def _tokens_cost_micro(
-    rates: tuple[float, float], input_tokens: int, output_tokens: int
+    rates: dict[str, float] | tuple[float, float],
+    input_tokens: int,
+    output_tokens: int,
 ) -> int:
-    input_rate, output_rate = rates
+    """Legacy two-dimension helper kept for callers and tests."""
+    if isinstance(rates, tuple):
+        input_rate, output_rate = rates
+    else:
+        input_rate, output_rate = rates["input"], rates["output"]
     usd = (
         input_tokens * input_rate + output_tokens * output_rate
     ) / 1_000_000
-    micro = int(usd * MICRO)
-    return micro + 1 if usd * MICRO > micro else micro
+    return _round_up_micro(usd)
+
+
+def _price_invocation(
+    prices: dict[str, dict[str, float]],
+    fallback: dict[str, float],
+    usage: InvocationUsage,
+) -> PricedInvocation:
+    """Price every dimension the record carries.
+
+    ``cost = sum(count * rate) / 1e6`` for token dimensions plus
+    ``count * rate`` for per-unit dimensions, rounded up to micro-USD. A
+    dimension present in the log with no rate in the resolved entry is
+    priced at the fallback's rate for that dimension when one exists
+    (conservative, like an unknown model) and recorded in
+    ``missing_dimensions`` either way so the ledger can be repaired later.
+    Nothing is ever silently priced at zero.
+    """
+    rates, price_source = _price_for(prices, fallback, usage.model_id)
+    usd = 0.0
+    missing: list[str] = []
+    for name, count in usage.dimension_counts.items():
+        rate = rates.get(name)
+        if rate is None:
+            missing.append(name)
+            rate = fallback.get(name)
+            if rate is None:
+                continue
+        if name in TOKEN_DIMENSIONS:
+            usd += count * rate / 1_000_000
+        else:
+            usd += count * rate
+    return PricedInvocation(
+        cost_micro=_round_up_micro(usd),
+        price_source=price_source,
+        missing_dimensions=tuple(missing),
+    )
 
 
 def _av(value: Any) -> dict:
@@ -369,19 +556,119 @@ def _ttl_epoch(occurred_at: datetime) -> int:
     return int(anchor.timestamp()) + keep_days * 86400
 
 
+def _deployment_thresholds() -> list[dict]:
+    """Thresholds a row without its own list resolves to (deploy default)."""
+    return default_thresholds(float(os.environ.get("WARN_THRESHOLD", "0.8")))
+
+
+def limits_from_item(item: dict) -> dict:
+    return _layer_limits_from_item(
+        item, default_thresholds_list=_deployment_thresholds()
+    )
+
+
+def _apply_rate_usage(
+    usage_table,
+    user_id: str,
+    usage: InvocationUsage,
+    rate_limits: dict[str, int],
+) -> dict[str, object]:
+    """Increment the subject's per-minute counter and return the new totals.
+
+    Rows live in the usage table under ``RATE#<user>`` / ``<UTC minute>``
+    with a short TTL. Counted per *occurrence* minute, so a late-delivered
+    record increments the minute it happened in, never the current one.
+    Only subjects with a positive rpm/tpm pay for this write; the increment
+    itself is not part of the idempotent transaction because a duplicate
+    delivery is already detected before this runs.
+    """
+    key = rate_row_key(user_id, usage.occurred_at)
+    tokens = usage.input_tokens + usage.output_tokens
+    response = usage_table.update_item(
+        Key=key,
+        UpdateExpression=(
+            "ADD requests :one, tokens :t "
+            "SET expires_at = if_not_exists(expires_at, :ttl)"
+        ),
+        ExpressionAttributeValues={
+            ":one": 1,
+            ":t": tokens,
+            # Counter rows only matter for the minute they describe plus a
+            # grace period for late evaluation; keep them briefly.
+            ":ttl": int(usage.occurred_at.timestamp()) + 15 * 60,
+        },
+        ReturnValues="ALL_NEW",
+    )
+    del rate_limits  # evaluation happens in _evaluate_quota
+    return rate_usage_from_item(response.get("Attributes"), usage.occurred_at)
+
+
 def _apply_usage(
     client,
     usage_table_name: str,
     user_id: str,
     usage: InvocationUsage,
     cost_micro: int,
+    *,
+    missing_dimensions: tuple[str, ...] = (),
 ) -> bool:
-    """Apply one invocation exactly once. Returns False for a duplicate."""
+    """Apply one invocation exactly once. Returns False for a duplicate.
+
+    One transaction writes the ``REQUEST#<id>`` idempotency marker, the
+    subject's daily row, and the subject's per-model daily row
+    (``<subject>#model#<model_id>``). The per-model row feeds model-scoped
+    budgets and is written unconditionally (not only when a model budget
+    exists) so a budget added mid-period includes usage already recorded,
+    matching how weekly/monthly limits behave. This doubles ledger writes per
+    request; see DEPLOYMENT.md for the cost note.
+
+    Beyond the quota-bearing counters, the daily rows accumulate the
+    non-limited priced dimensions (cache tokens, images) and an
+    ``unpriced_requests`` count plus a ``missing_dimensions`` string set so
+    an operator can find days whose USD figure is known to be incomplete
+    and repair them later ("flag now, repair later"). Aggregates are never
+    repriced automatically.
+    """
     ttl = _ttl_epoch(usage.occurred_at)
     marker_key = {
         "user_id": _av(f"REQUEST#{usage.request_id}"),
         "window": _av("EVENT"),
     }
+    update_expression = (
+        "ADD cost_micro :c, input_tokens :i, output_tokens :o, "
+        "requests :one, cache_read_tokens :cr, cache_write_tokens :cw, "
+        "images :img, unpriced_requests :unpriced"
+    )
+    values = {
+        ":c": _av(cost_micro),
+        ":i": _av(usage.input_tokens),
+        ":o": _av(usage.output_tokens),
+        ":one": _av(1),
+        ":cr": _av(usage.cache_read_tokens),
+        ":cw": _av(usage.cache_write_tokens),
+        ":img": _av(usage.images),
+        ":unpriced": _av(1 if missing_dimensions else 0),
+        ":ttl": _av(ttl),
+    }
+    if missing_dimensions:
+        # DynamoDB string set: ADD on a set unions the members.
+        update_expression += ", missing_dimensions :md"
+        values[":md"] = {"SS": sorted(set(missing_dimensions))}
+    update_expression += " SET expires_at = if_not_exists(expires_at, :ttl)"
+
+    def ledger_update(subject: str) -> dict:
+        return {
+            "Update": {
+                "TableName": usage_table_name,
+                "Key": {
+                    "user_id": _av(subject),
+                    "window": _av(usage.window),
+                },
+                "UpdateExpression": update_expression,
+                "ExpressionAttributeValues": values,
+            }
+        }
+
     try:
         client.transact_write_items(
             TransactItems=[
@@ -395,27 +682,8 @@ def _apply_usage(
                         "ConditionExpression": "attribute_not_exists(user_id)",
                     }
                 },
-                {
-                    "Update": {
-                        "TableName": usage_table_name,
-                        "Key": {
-                            "user_id": _av(user_id),
-                            "window": _av(usage.window),
-                        },
-                        "UpdateExpression": (
-                            "ADD cost_micro :c, input_tokens :i, "
-                            "output_tokens :o, requests :one "
-                            "SET expires_at = if_not_exists(expires_at, :ttl)"
-                        ),
-                        "ExpressionAttributeValues": {
-                            ":c": _av(cost_micro),
-                            ":i": _av(usage.input_tokens),
-                            ":o": _av(usage.output_tokens),
-                            ":one": _av(1),
-                            ":ttl": _av(ttl),
-                        },
-                    }
-                },
+                ledger_update(user_id),
+                ledger_update(model_ledger_subject(user_id, usage.model_id)),
             ]
         )
         return True
@@ -451,6 +719,7 @@ def _notify(sns, subject: str, payload: dict) -> None:
 
 
 def _current_usage(table, user_id: str, now: datetime) -> dict:
+    """Current calendar totals for one ledger subject (user or user#model#id)."""
     windows = calendar_windows(now)
     start = min(window.start for window in windows.values()).date().isoformat()
     end = windows["daily"].start.date().isoformat()
@@ -485,6 +754,34 @@ def _current_usage(table, user_id: str, now: datetime) -> dict:
     return aggregate_daily_rows(rows, now)
 
 
+def _model_budget_evaluation(usage_table, user: dict, user_id: str, now: datetime):
+    """Evaluate every model-scoped budget on ``user`` against its ledger.
+
+    One strongly consistent range query per configured model budget (only
+    subjects with model budgets pay for it). Returns an empty evaluation
+    when none are configured.
+    """
+    budgets = model_budgets_from_item(
+        user, default_thresholds_list=_deployment_thresholds()
+    )
+    if not budgets:
+        return evaluate_model_budgets({}, {}, now)
+    usage_by_model = {
+        model_id: _current_usage(
+            usage_table, model_ledger_subject(user_id, model_id), now
+        )
+        for model_id in budgets
+    }
+    return evaluate_model_budgets(budgets, usage_by_model, now)
+
+
+def _current_rate_usage(usage_table, user_id: str, now: datetime) -> dict:
+    item = usage_table.get_item(
+        Key=rate_row_key(user_id, now), ConsistentRead=True
+    ).get("Item")
+    return rate_usage_from_item(item, now)
+
+
 def _evaluate_quota(
     client,
     users_table,
@@ -494,7 +791,18 @@ def _evaluate_quota(
     *,
     _attempt: int = 0,
 ) -> str:
-    """Block or warn from all current UTC calendar quota periods."""
+    """Block or warn from all current UTC calendar quota periods.
+
+    Each enabled period carries an ordered thresholds list. Every ``warn``
+    threshold the period's peak utilization has reached sends one SNS
+    warning per calendar window (idempotency marker per threshold, so
+    crossing 50 % then 80 % sends two distinct messages, and a duplicate
+    delivery at 81 % sends none). Only a ``block`` threshold transitions
+    the row to blocked; a period without one is alert-only and can never
+    auto-block, however far over 100 % it runs. Rate-limit (rpm/tpm)
+    breaches use the same blocking path with a distinct reason and, being
+    automatic, lift on their own once the minute is under the limit.
+    """
     now = datetime.now(timezone.utc)
     user = users_table.get_item(
         Key={"user_id": user_id}, ConsistentRead=True
@@ -502,8 +810,24 @@ def _evaluate_quota(
     if not user:
         return "missing-user"
     current_usage = _current_usage(usage_table, user_id, now)
-    evaluation = evaluate_limits(
-        limits_from_item(user), current_usage, now
+    rate_limits = rate_limits_from_item(user)
+    rate_usage = (
+        _current_rate_usage(usage_table, user_id, now)
+        if rate_limits_enabled(rate_limits)
+        else None
+    )
+    evaluation = merge_evaluations(
+        evaluate_limits(
+            limits_from_item(user),
+            current_usage,
+            now,
+            rate_limits=rate_limits,
+            rate_usage=rate_usage,
+        ),
+        # Model-scoped budgets: ANY block breach blocks the subject, because
+        # the deny primitives (SourceIdentity shards, role inline deny) are
+        # subject-wide. Documented limitation; never made model-selective.
+        _model_budget_evaluation(usage_table, user, user_id, now),
     )
     status = str(user.get("status", "active"))
     reason = str(user.get("status_reason", ""))
@@ -606,58 +930,78 @@ def _evaluate_quota(
             # User state and the revocation sentinel committed atomically.
             # Notification remains best-effort and cannot create an
             # authorization gap.
+            first = evaluation.breaches[0]
+            if first.period == RATE_PERIOD:
+                subject_reason = f"reason={first.dimension}"
+            elif first.model_id is not None:
+                subject_reason = (
+                    f"reason=model:{first.model_id}:{first.period}-{first.dimension}"
+                )
+            else:
+                subject_reason = f"reason={first.period}-{first.dimension}"
             _notify(
                 sns,
-                f"[bedrock-spend-controls] BLOCKED {user_id}",
+                f"[bedrock-spend-controls] BLOCKED {user_id} {subject_reason}",
                 {
                     "user_id": user_id,
+                    "reason": auto_reason,
                     "breaches": [
                         {
                             "period": breach.period,
                             "dimension": breach.dimension,
                             "usage": breach.usage,
                             "limit": breach.limit,
+                            "at": breach.at_bps / 10_000,
                             "window_start": breach.window.start.isoformat(),
                             "resets_at": breach.window.end.isoformat(),
+                            **(
+                                {"model_id": breach.model_id}
+                                if breach.model_id is not None
+                                else {}
+                            ),
                         }
                         for breach in evaluation.breaches
                     ],
                     "current_usage": current_usage,
+                    **({"rate_usage": rate_usage} if rate_usage else {}),
                 },
             )
         return "blocked"
 
-    warn_threshold = float(os.environ.get("WARN_THRESHOLD", "0.8"))
     warned = False
-    windows = calendar_windows(now)
-    for period in PERIODS:
-        period_ratios = [
-            ratio
-            for key, ratio in evaluation.ratios.items()
-            if key.startswith(f"{period}.")
-        ]
-        ratio = max(period_ratios, default=0.0)
-        marker = f"warning_sent_{period}_window"
-        period_window = windows[period]
-        if ratio >= warn_threshold and user.get(marker) != period_window.key:
-            users_table.update_item(
-                Key={"user_id": user_id},
-                UpdateExpression=f"SET {marker} = :w",
-                ExpressionAttributeValues={":w": period_window.key},
-            )
-            _notify(
-                sns,
-                f"[bedrock-spend-controls] WARNING {user_id}",
-                {
-                    "user_id": user_id,
-                    "period": period,
-                    "window_start": period_window.start.isoformat(),
-                    "resets_at": period_window.end.isoformat(),
-                    "utilization": ratio,
-                    "usage": current_usage[period],
-                },
-            )
-            warned = True
+    for crossing in evaluation.warnings:
+        marker = crossing.marker
+        if user.get(marker) == crossing.window.key:
+            continue
+        users_table.update_item(
+            Key={"user_id": user_id},
+            UpdateExpression="SET #m = :w",
+            ExpressionAttributeNames={"#m": marker},
+            ExpressionAttributeValues={":w": crossing.window.key},
+        )
+        # Keep the marker set warm locally so two crossings in one pass
+        # (50 % and 80 % reached by the same request) each send exactly once.
+        user[marker] = crossing.window.key
+        scope = f" model {crossing.model_id}" if crossing.model_id else ""
+        _notify(
+            sns,
+            f"[bedrock-spend-controls] WARNING {user_id}{scope} "
+            f"{crossing.period} {crossing.at_bps / 100:g}%",
+            {
+                "user_id": user_id,
+                "period": crossing.period,
+                "threshold": crossing.at_bps / 10_000,
+                "window_start": crossing.window.start.isoformat(),
+                "resets_at": crossing.window.end.isoformat(),
+                "utilization": crossing.ratio,
+                **(
+                    {"model_id": crossing.model_id}
+                    if crossing.model_id is not None
+                    else {"usage": current_usage[crossing.period]}
+                ),
+            },
+        )
+        warned = True
     if warned:
         return "warned"
     return "within-budget"
@@ -668,15 +1012,29 @@ def _emit_emf(
     usage: InvocationUsage,
     cost_micro: int,
     price_source: str,
+    missing_dimensions: tuple[str, ...] = (),
 ) -> None:
     processed_at = datetime.now(timezone.utc)
     detection_lag_ms = max(
         0,
         int((processed_at - usage.occurred_at).total_seconds() * 1_000),
     )
+    # A request is "unpriced" when it used the synthetic fallback rate for
+    # the whole model OR when one of its dimensions had no catalog rate.
+    # Both are operational events (missing snapshot/profile/dimension
+    # mapping), never silent tarification. FallbackPricedRequests keeps its
+    # pre-existing meaning for the alarm; UnpricedDimensionRequests is the
+    # narrower "known model, missing dimension" signal.
+    fallback_priced = price_source == "fallback" or bool(missing_dimensions)
     record = {
         "_aws": {
             "Timestamp": int(processed_at.timestamp() * 1000),
+            # Two metric groups with different dimension sets. CloudWatch
+            # bills per distinct (metric, dimension-set) stream, and the
+            # UserId dimension multiplies each metric by the active-user
+            # count — it is the dominant line in docs/cost-estimate.md. Only
+            # the quota-bearing metrics need per-user resolution; the pricing
+            # observability metrics are per model / service-wide.
             "CloudWatchMetrics": [
                 {
                     "Namespace": METRICS_NAMESPACE,
@@ -695,23 +1053,39 @@ def _emit_emf(
                             "Unit": "Count",
                         },
                     ],
-                }
+                },
+                {
+                    "Namespace": METRICS_NAMESPACE,
+                    "Dimensions": [["Model"], []],
+                    "Metrics": [
+                        {"Name": "CacheReadTokens", "Unit": "Count"},
+                        {"Name": "CacheWriteTokens", "Unit": "Count"},
+                        {"Name": "ImagesGenerated", "Unit": "Count"},
+                        {
+                            "Name": "UnpricedDimensionRequests",
+                            "Unit": "Count",
+                        },
+                    ],
+                },
             ],
         },
         "UserId": user_id,
         "Model": usage.model_id,
         "RequestId": usage.request_id,
         "PriceSource": price_source,
+        "MissingDimensions": list(missing_dimensions),
         "InvocationOccurredAt": usage.occurred_at.isoformat(),
         "ProcessedAt": processed_at.isoformat(),
         "DetectionLagMilliseconds": detection_lag_ms,
         "Requests": 1,
         "InputTokens": usage.input_tokens,
         "OutputTokens": usage.output_tokens,
+        "CacheReadTokens": usage.cache_read_tokens,
+        "CacheWriteTokens": usage.cache_write_tokens,
+        "ImagesGenerated": usage.images,
         "EstimatedCostUSD": round(cost_micro / MICRO, 8),
-        # A non-zero sum means an invocation was priced with the synthetic
-        # conservative rate instead of a resolved model price; alarmable.
-        "FallbackPricedRequests": 1 if price_source == "fallback" else 0,
+        "FallbackPricedRequests": 1 if fallback_priced else 0,
+        "UnpricedDimensionRequests": 1 if missing_dimensions else 0,
     }
     print(json.dumps(record))
 
@@ -726,6 +1100,7 @@ def _default_limit_attributes() -> dict[str, object]:
         )
     )
     attributes: dict[str, object] = {}
+    defaults = _deployment_thresholds()
     for period in PERIODS:
         value = raw.get(period)
         attributes[f"{period}_limits_enabled"] = value is not None
@@ -740,6 +1115,21 @@ def _default_limit_attributes() -> dict[str, object]:
         attributes[f"{period}_output_tokens"] = (
             int(value.get("output_tokens", 0)) if value else 0
         )
+        if value:
+            configured = value.get("thresholds")
+            attributes[f"{period}_thresholds"] = (
+                [
+                    {"at_bps": int(entry["at_bps"]), "action": str(entry["action"])}
+                    for entry in configured
+                ]
+                if configured
+                else [dict(entry) for entry in defaults]
+            )
+        else:
+            attributes[f"{period}_thresholds"] = []
+    rate = raw.get("rate") or {}
+    attributes["rpm"] = int(rate.get("rpm", 0) or 0)
+    attributes["tpm"] = int(rate.get("tpm", 0) or 0)
     return attributes
 
 
@@ -806,6 +1196,7 @@ def handler(
         "duplicates": 0,
         "unresolved_sessions": [],
         "ignored": 0,
+        "unpriced": 0,
     }
     unresolved: set[str] = set()
     workload_profiles = _workload_profiles()
@@ -831,23 +1222,36 @@ def handler(
                 unresolved.add(usage.session_name)
                 continue
             user_id = str(mapping["maps_to"])
-        rates, price_source = _price_for(prices, fallback, usage.model_id)
-        cost_micro = _tokens_cost_micro(
-            rates, usage.input_tokens, usage.output_tokens
-        )
+        priced = _price_invocation(prices, fallback, usage)
         applied = _apply_usage(
-            client, usage_table_name, user_id, usage, cost_micro
+            client,
+            usage_table_name,
+            user_id,
+            usage,
+            priced.cost_micro,
+            missing_dimensions=priced.missing_dimensions,
         )
         if not applied:
             result["duplicates"] += 1
         else:
             result["processed"] += 1
+            if priced.missing_dimensions:
+                result["unpriced"] += 1
             _emit_emf(
                 user_id,
                 usage,
-                cost_micro,
-                price_source=price_source,
+                priced.cost_micro,
+                price_source=priced.price_source,
+                missing_dimensions=priced.missing_dimensions,
             )
+            # Per-minute rate counters only for subjects that configured a
+            # rate limit; read the row once (strongly consistent) to decide.
+            subject = users_table.get_item(
+                Key={"user_id": user_id}, ConsistentRead=True
+            ).get("Item") or {}
+            rate_limits = rate_limits_from_item(subject)
+            if rate_limits_enabled(rate_limits):
+                _apply_rate_usage(usage_table, user_id, usage, rate_limits)
         # A duplicate delivery may be retrying after accounting committed but
         # status convergence failed. Re-evaluate without incrementing or
         # re-emitting usage so the retry repairs enforcement.

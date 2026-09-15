@@ -192,6 +192,86 @@ describe("create user wizard", () => {
 });
 
 describe("user detail drawer", () => {
+  it("lists, adds, and removes per-model budgets with a reason", async () => {
+    const actor = userEvent.setup();
+    const withBudget = adminUser({
+      version: 2,
+      model_budgets: {
+        "us.anthropic.claude-opus-4-7": {
+          daily: { usd: 2, input_tokens: 0, output_tokens: 0, thresholds: [{ at: 1, action: "warn" }] },
+          weekly: null,
+          monthly: null,
+        },
+      },
+    });
+    vi.spyOn(api, "getUser").mockResolvedValue({ data: { user: withBudget, current_usage: currentUsage }, etag: '"2"', requestId: null, status: 200 });
+    vi.spyOn(api, "modelUsage").mockResolvedValue({ user_id: alice.user_id, model_id: "us.anthropic.claude-opus-4-7", current_usage: { ...currentUsage, daily: { ...currentUsage.daily, cost_usd: 1.25 } } });
+    const afterAdd = adminUser({
+      version: 3,
+      model_budgets: {
+        ...withBudget.model_budgets,
+        "openai.gpt-oss-20b": { daily: { usd: 0.5, input_tokens: 1000, output_tokens: 0, thresholds: [{ at: 0.5, action: "warn" }, { at: 1, action: "block" }] }, weekly: null, monthly: null },
+      },
+    });
+    const setModelBudget = vi.spyOn(api, "setModelBudget").mockResolvedValue({ data: { user_id: alice.user_id, model_id: "openai.gpt-oss-20b", updated: true, model_budgets: afterAdd.model_budgets!, user: afterAdd }, etag: '"3"', requestId: null, status: 200 });
+    const afterRemove = adminUser({ version: 4, model_budgets: { "openai.gpt-oss-20b": afterAdd.model_budgets!["openai.gpt-oss-20b"] } });
+    const removeModelBudget = vi.spyOn(api, "removeModelBudget").mockResolvedValue({ data: { user_id: alice.user_id, model_id: "us.anthropic.claude-opus-4-7", removed: true, model_budgets: afterRemove.model_budgets!, user: afterRemove }, etag: '"4"', requestId: null, status: 200 });
+    vi.spyOn(window, "prompt").mockReturnValue("No longer needed");
+
+    render(<DrawerHarness />);
+    await actor.click(screen.getByRole("button", { name: "Open Alice" }));
+    const table = await screen.findByRole("region", { name: "Model budgets" });
+    expect(table).toHaveTextContent("us.anthropic.claude-opus-4-7");
+    expect(table).toHaveTextContent("100:warn");
+    expect(table).toHaveTextContent("alert-only");
+    await waitFor(() => expect(table).toHaveTextContent("$1,25 of $2,00"));
+
+    // Add a new model budget with thresholds and a reason.
+    await actor.click(screen.getByRole("button", { name: "Add model budget" }));
+    await actor.type(screen.getByLabelText("Model budget model ID"), "openai.gpt-oss-20b");
+    const usd = screen.getByLabelText("Model budget daily USD limit");
+    await actor.clear(usd);
+    await actor.type(usd, "0.5");
+    const input = screen.getByLabelText("Model budget daily input token limit");
+    await actor.clear(input);
+    await actor.type(input, "1000");
+    await actor.type(screen.getByLabelText("Model budget daily thresholds"), "50:warn,100:block");
+    await actor.type(screen.getByLabelText("Model budget reason"), "Cheap model, tight cap");
+    await actor.click(screen.getByRole("button", { name: "Add model budget" }));
+
+    await waitFor(() => expect(setModelBudget).toHaveBeenCalledWith(
+      cfg, session, expect.objectContaining({ user_id: alice.user_id, version: 2 }), "openai.gpt-oss-20b",
+      { daily: { usd: 0.5, input_tokens: 1000, output_tokens: 0, thresholds: [{ at: 0.5, action: "warn" }, { at: 1, action: "block" }] }, weekly: null, monthly: null },
+      "Cheap model, tight cap",
+    ));
+    expect(await screen.findByText("openai.gpt-oss-20b")).toBeInTheDocument();
+
+    // Remove the first one; the prompt supplies the audit reason.
+    await actor.click(screen.getByRole("button", { name: "Remove us.anthropic.claude-opus-4-7 budget" }));
+    await waitFor(() => expect(removeModelBudget).toHaveBeenCalledWith(
+      cfg, session, expect.objectContaining({ version: 3 }), "us.anthropic.claude-opus-4-7", "No longer needed",
+    ));
+    await waitFor(() => expect(screen.queryByText("us.anthropic.claude-opus-4-7")).not.toBeInTheDocument());
+  });
+
+  it("rejects an ARN and a malformed thresholds spec in the model budget form", async () => {
+    const actor = userEvent.setup();
+    vi.spyOn(api, "getUser").mockResolvedValue({ data: { user: adminUser(), current_usage: currentUsage }, etag: '"1"', requestId: null, status: 200 });
+    const setModelBudget = vi.spyOn(api, "setModelBudget");
+    render(<DrawerHarness />);
+    await actor.click(screen.getByRole("button", { name: "Open Alice" }));
+    await actor.click(await screen.findByRole("button", { name: "Add model budget" }));
+    await actor.type(screen.getByLabelText("Model budget model ID"), "arn:aws:bedrock:us-east-1::foundation-model/x");
+    await actor.click(screen.getByRole("button", { name: "Add model budget" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("not an ARN");
+    await actor.clear(screen.getByLabelText("Model budget model ID"));
+    await actor.type(screen.getByLabelText("Model budget model ID"), "opus");
+    await actor.type(screen.getByLabelText("Model budget daily thresholds"), "100:block,150:warn");
+    await actor.click(screen.getByRole("button", { name: "Add model budget" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("single trailing block");
+    expect(setModelBudget).not.toHaveBeenCalled();
+  });
+
   it("traps/restores focus, supports arrow-key tabs, and does not load audit before Changes", async () => {
     const actor = userEvent.setup();
     vi.spyOn(api, "getUser").mockResolvedValue({ data: { user: adminUser(), current_usage: currentUsage }, etag: '"1"', requestId: null, status: 200 });
@@ -204,7 +284,9 @@ describe("user detail drawer", () => {
     expect(await screen.findByRole("dialog", { name: "Alice Example" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Close user details" })).toHaveFocus();
     await actor.tab({ shift: true });
-    expect(screen.getByRole("button", { name: "Block user" })).toHaveFocus();
+    // The last focusable element in the overview is now the per-model
+    // budgets "Add" button (it follows the calendar/rate sections).
+    expect(screen.getByRole("button", { name: "Add model budget" })).toHaveFocus();
     await actor.tab();
     expect(screen.getByRole("button", { name: "Close user details" })).toHaveFocus();
     expect(audit).not.toHaveBeenCalled();

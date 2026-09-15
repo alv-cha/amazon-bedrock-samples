@@ -136,15 +136,16 @@ def test_price_snapshot_is_injected_only_into_usage_processor():
             ),
         },
     )
-    processor_env = _environment_with(template, "WARN_THRESHOLD")
+    processor_env = _environment_with(template, "BEDROCK_USER_ROLE_NAME")
     broker_env = _environment_with(template, "BEDROCK_USER_ROLE_ARN")
 
-    assert processor_env["MODEL_PRICES_JSON"]["Fn::GetAtt"][1] == (
-        "ModelPricesJson"
-    )
+    # The full snapshot lives in the SSM parameter (Lambda env is capped at
+    # 4 KB); only the small fallback price rides along in the environment.
+    assert "MODEL_PRICES_JSON" not in processor_env
     assert processor_env["MODEL_FALLBACK_PRICE_JSON"]["Fn::GetAtt"][1] == (
         "FallbackPriceJson"
     )
+    assert processor_env["PRICES_PARAMETER_NAME"]
     assert "MODEL_PRICES_JSON" not in broker_env
     assert processor_env["BEDROCK_USER_ROLE_NAME"]
 
@@ -152,7 +153,7 @@ def test_price_snapshot_is_injected_only_into_usage_processor():
 def test_defaults_are_injected_and_tables_are_destroyable_for_demo():
     template = _template({"manage_invocation_logging": True})
     broker_env = _environment_with(template, "BEDROCK_USER_ROLE_ARN")
-    processor_env = _environment_with(template, "WARN_THRESHOLD")
+    processor_env = _environment_with(template, "BEDROCK_USER_ROLE_NAME")
 
     assert broker_env["AUTO_PROVISION_USERS"] == "true"
     assert json.loads(broker_env["DEFAULT_LIMITS_JSON"]) == {
@@ -227,7 +228,7 @@ def test_production_values_and_table_retention():
         }
     )
     broker_env = _environment_with(template, "BEDROCK_USER_ROLE_ARN")
-    processor_env = _environment_with(template, "WARN_THRESHOLD")
+    processor_env = _environment_with(template, "BEDROCK_USER_ROLE_NAME")
     assert broker_env["AUTO_PROVISION_USERS"] == "false"
     assert json.loads(broker_env["DEFAULT_LIMITS_JSON"])["daily"]["usd"] == 25.0
     assert broker_env["VENDED_CREDENTIAL_TTL_SECONDS"] == "1800"
@@ -528,7 +529,7 @@ def test_admin_ui_remains_opt_in():
         iter(enabled.find_resources("AWS::Lambda::Url").values())
     )
     cors = function_url["Properties"]["Cors"]
-    assert cors["AllowMethods"] == ["GET", "POST", "PUT"]
+    assert cors["AllowMethods"] == ["DELETE", "GET", "POST", "PUT"]
     assert "authorization" in cors["AllowHeaders"]
     assert cors["AllowOrigins"] != ["*"]
     assert "AdminUiDistribution" in json.dumps(cors["AllowOrigins"])
@@ -611,6 +612,11 @@ def test_admin_ui_rejects_unsupported_or_unauthorized_identity_setup():
         ("allowed_model_arns", [], "must not be empty"),
         ("allowed_model_arns", ["openai.model"], "resource ARN"),
         ("invoker_principal_arns", ["not-an-arn"], "principal ARNs"),
+        ("reconciliation_enabled", "yes", "must be true or false"),
+        ("reconcile_lag_days", 0, "positive integer"),
+        ("reconcile_lag_days", 15, "at most 14"),
+        ("reconciliation_alarm_percent", 0, "positive number"),
+        ("reconciliation_alarm_percent", 101, "at most 100"),
     ],
 )
 def test_invalid_deployment_values_fail_synth(key, value, message):
@@ -648,6 +654,127 @@ def test_invalid_default_limits_fail_synth(limits, message):
             {
                 "manage_invocation_logging": True,
                 "default_limits": limits,
+            }
+        )
+
+
+def _daily(**extra) -> dict:
+    return {
+        "daily": {
+            "usd": 1,
+            "input_tokens": 1_000,
+            "output_tokens": 100,
+            **extra,
+        },
+        "weekly": None,
+        "monthly": None,
+    }
+
+
+def test_default_limits_thresholds_and_rate_synthesize_into_env():
+    template = _template(
+        {
+            "manage_invocation_logging": True,
+            "default_limits": {
+                **_daily(
+                    thresholds=[
+                        {"at": 0.5, "action": "warn"},
+                        {"at": 0.8, "action": "warn"},
+                        {"at": 1.2, "action": "block"},
+                    ]
+                ),
+                "weekly": {
+                    "usd": 5,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    # Alert-only: no block entry.
+                    "thresholds": [{"at": 1.0, "action": "warn"}],
+                },
+                "rate": {"rpm": 30, "tpm": 60_000},
+            },
+        }
+    )
+    broker_env = _environment_with(template, "BEDROCK_USER_ROLE_ARN")
+    defaults = json.loads(broker_env["DEFAULT_LIMITS_JSON"])
+    # Storage form (basis points) so the broker, processor, and enforcer
+    # all materialize identical rows.
+    assert defaults["daily"]["thresholds"] == [
+        {"at_bps": 5000, "action": "warn"},
+        {"at_bps": 8000, "action": "warn"},
+        {"at_bps": 12000, "action": "block"},
+    ]
+    assert defaults["weekly"]["thresholds"] == [
+        {"at_bps": 10000, "action": "warn"}
+    ]
+    assert defaults["rate"] == {"rpm": 30, "tpm": 60_000}
+    # Both the broker and the processor receive the same deployment warn
+    # ratio for rows that predate thresholds.
+    processor_env = _environment_with(template, "BEDROCK_USER_ROLE_NAME")
+    assert broker_env["WARN_THRESHOLD"] == processor_env["WARN_THRESHOLD"] == "0.8"
+
+
+def test_default_limits_without_thresholds_or_rate_are_unchanged():
+    template = _template({"manage_invocation_logging": True})
+    defaults = json.loads(
+        _environment_with(template, "BEDROCK_USER_ROLE_ARN")["DEFAULT_LIMITS_JSON"]
+    )
+    assert "thresholds" not in defaults["daily"]
+    assert "rate" not in defaults
+
+
+@pytest.mark.parametrize(
+    ("thresholds", "message"),
+    [
+        (
+            [{"at": 0.8, "action": "block"}, {"at": 1.0, "action": "block"}],
+            "'block' entry must be the last",
+        ),
+        (
+            [{"at": 1.0, "action": "block"}, {"at": 1.5, "action": "warn"}],
+            "'block' entry must be the last",
+        ),
+        (
+            [{"at": 0.8, "action": "warn"}, {"at": 0.8, "action": "block"}],
+            "strictly increasing",
+        ),
+        (
+            [{"at": 0.9, "action": "warn"}, {"at": 0.5, "action": "block"}],
+            "strictly increasing",
+        ),
+        ([{"at": 0, "action": "warn"}], "positive number"),
+        ([{"at": 10.5, "action": "block"}], "at most 10"),
+        ([{"at": 0.5, "action": "alert"}], "action must be one of"),
+        ([{"at": 0.5}], "must contain at and action"),
+        ([{"at": 0.5, "action": "warn", "note": "x"}], "unknown keys"),
+        ([], "non-empty list"),
+        ("0.8", "non-empty list"),
+    ],
+)
+def test_invalid_default_thresholds_fail_synth(thresholds, message):
+    with pytest.raises(ValueError, match=message):
+        _template(
+            {
+                "manage_invocation_logging": True,
+                "default_limits": _daily(thresholds=thresholds),
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("rate", "message"),
+    [
+        ({"rpm": -1}, "non-negative integer"),
+        ({"tpm": 1.5}, "non-negative integer"),
+        ({"rps": 10}, "unknown rps"),
+        ("fast", "must be an object or null"),
+    ],
+)
+def test_invalid_default_rate_limits_fail_synth(rate, message):
+    with pytest.raises(ValueError, match=message):
+        _template(
+            {
+                "manage_invocation_logging": True,
+                "default_limits": {**_daily(), "rate": rate},
             }
         )
 
@@ -781,6 +908,124 @@ def test_model_config_rejects_duplicate_and_non_positive_prices():
         )
 
 
+def _pricing_context(overrides: dict, fallback: dict | None = None) -> dict:
+    return {
+        "manage_invocation_logging": True,
+        "model_config": {
+            "catalog_models": {"catalog": ["provider.model"]},
+            "price_overrides": overrides,
+            "fallback_price": fallback
+            or {"input_per_mtok": 20, "output_per_mtok": 80},
+        },
+    }
+
+
+def test_model_config_accepts_optional_cache_and_image_dimensions():
+    template = _template(
+        _pricing_context(
+            {
+                "provider.cached": {
+                    "input_per_mtok": 1.0,
+                    "output_per_mtok": 5.0,
+                    "cache_read_per_mtok": 0.1,
+                    # $0 cache write is legitimate (observed for Nova).
+                    "cache_write_per_mtok": 0,
+                    "reason": "test",
+                },
+                "provider.image": {
+                    "input_per_mtok": 0,
+                    "output_per_mtok": 0,
+                    "per_image": 0.04,
+                    "reason": "image model has no token rows",
+                },
+            },
+            {
+                "input_per_mtok": 20,
+                "output_per_mtok": 80,
+                "cache_read_per_mtok": 2,
+                "cache_write_per_mtok": 25,
+                "per_image": 0.1,
+            },
+        )
+    )
+    template.has_resource_properties(
+        "Custom::BedrockModelPriceSnapshot",
+        {
+            "PinnedPrices": {
+                "provider.cached": {
+                    "cache_read_per_mtok": 0.1,
+                    "cache_write_per_mtok": 0.0,
+                    "input_per_mtok": 1.0,
+                    "output_per_mtok": 5.0,
+                },
+                "provider.image": {
+                    "input_per_mtok": 0.0,
+                    "output_per_mtok": 0.0,
+                    "per_image": 0.04,
+                },
+            },
+            "FallbackPrice": Match.object_like({"per_image": 0.1}),
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("price", "message"),
+    [
+        (
+            {"input_per_mtok": 1, "output_per_mtok": 2, "video_per_second": 1},
+            "unknown video_per_second",
+        ),
+        ({"input_per_mtok": 1}, "missing output_per_mtok"),
+        (
+            {"input_per_mtok": 1, "output_per_mtok": 2, "cache_read_per_mtok": -1},
+            "non-negative number",
+        ),
+        # Zero token rates are only allowed for an image model (per_image > 0).
+        ({"input_per_mtok": 0, "output_per_mtok": 0}, "positive number"),
+        (
+            {"input_per_mtok": 0, "output_per_mtok": 0, "per_image": 0},
+            "positive number",
+        ),
+    ],
+)
+def test_model_config_rejects_invalid_price_dimensions(price, message):
+    with pytest.raises(ValueError, match=message):
+        _template(
+            _pricing_context({"provider.bad": {**price, "reason": "test"}})
+        )
+
+
+def test_fallback_price_may_not_be_an_image_only_model():
+    with pytest.raises(ValueError, match="fallback_price.input_per_mtok"):
+        _template(
+            _pricing_context(
+                {},
+                {"input_per_mtok": 0, "output_per_mtok": 0, "per_image": 0.5},
+            )
+        )
+
+
+def test_reference_catalog_pins_cache_and_image_dimensions():
+    """The shipped model-pricing.json exercises the new schema."""
+    template = _template({"manage_invocation_logging": True})
+    template.has_resource_properties(
+        "Custom::BedrockModelPriceSnapshot",
+        {
+            "CatalogModels": Match.object_like(
+                {"Nova Canvas": ["amazon.nova-canvas-v1:0"]}
+            ),
+            "PinnedPrices": Match.object_like(
+                {
+                    "anthropic.claude-opus-4-7": Match.object_like(
+                        {"cache_read_per_mtok": 0.5, "cache_write_per_mtok": 6.25}
+                    )
+                }
+            ),
+        },
+    )
+
+
 def test_admin_audit_table_gateway_grant_and_safe_ui_cors():
     template = _template(
         {
@@ -815,7 +1060,7 @@ def test_admin_audit_table_gateway_grant_and_safe_ui_cors():
     ]
 
     broker_env = _environment_with(template, "BEDROCK_USER_ROLE_ARN")
-    processor_env = _environment_with(template, "WARN_THRESHOLD")
+    processor_env = _environment_with(template, "BEDROCK_USER_ROLE_NAME")
     assert broker_env["ADMIN_AUDIT_TABLE"] == {"Ref": audit_logical_id}
     assert broker_env["ADMIN_AUDIT_RETENTION_DAYS"] == "365"
     assert "ADMIN_AUDIT_TABLE" not in processor_env
@@ -1060,10 +1305,15 @@ def test_price_refresh_schedule_parameter_and_fallback_alarm():
     template = _template({"manage_invocation_logging": True})
 
     # The deployment snapshot seeds a runtime SSM parameter combining the
-    # resolved model prices and the conservative fallback.
+    # resolved model prices and the conservative fallback (the other
+    # parameter is the workload roster the admin API reads).
     parameters = template.find_resources("AWS::SSM::Parameter")
-    assert len(parameters) == 1
-    parameter = next(iter(parameters.values()))["Properties"]
+    assert len(parameters) == 2
+    parameter = next(
+        resource["Properties"]
+        for logical_id, resource in parameters.items()
+        if logical_id.startswith("ModelPricesParameter")
+    )
     joined = parameter["Value"]["Fn::Join"][1]
     assert joined[0] == '{"models":'
     assert joined[2] == ',"fallback":'
@@ -1093,10 +1343,11 @@ def test_price_refresh_schedule_parameter_and_fallback_alarm():
         "PRICES_PARAMETER_NAME"
     ]
 
-    # Metering reads the parameter and keeps the env snapshot fallback.
-    processor_env = _environment_with(template, "WARN_THRESHOLD")
+    # Metering reads the parameter; the snapshot is not duplicated into the
+    # (4 KB-capped) environment.
+    processor_env = _environment_with(template, "BEDROCK_USER_ROLE_NAME")
     assert "PRICES_PARAMETER_NAME" in processor_env
-    assert "MODEL_PRICES_JSON" in processor_env
+    assert "MODEL_PRICES_JSON" not in processor_env
 
     # Fallback-priced requests are an alarmed operational event.
     template.has_resource_properties(
@@ -1172,6 +1423,31 @@ _WORKLOADS_CONTEXT = {
 }
 
 
+def _workload_roster_parameter(template: Template) -> dict:
+    parameters = template.find_resources("AWS::SSM::Parameter")
+    matches = [
+        resource
+        for logical_id, resource in parameters.items()
+        if logical_id.startswith("WorkloadRosterParameter")
+    ]
+    assert len(matches) == 1, "exactly one workload roster parameter"
+    return matches[0]["Properties"]
+
+
+def _resolve_roster(value) -> dict:
+    """Render the roster Fn::Join by substituting GetAtt tokens with their
+    logical-id path, then parse the JSON the broker will read."""
+    if isinstance(value, str):
+        return json.loads(value)
+    assert set(value) == {"Fn::Join"}
+    delimiter, parts = value["Fn::Join"]
+    rendered = delimiter.join(
+        part if isinstance(part, str) else "/".join(part["Fn::GetAtt"])
+        for part in parts
+    )
+    return json.loads(rendered)
+
+
 def test_no_workloads_means_no_workload_resources():
     template = _template({"manage_invocation_logging": True})
     template.resource_count_is(
@@ -1179,9 +1455,45 @@ def test_no_workloads_means_no_workload_resources():
     )
     rendered = json.dumps(template.to_json())
     assert "WorkloadEnforcerFn" not in rendered
-    assert "WORKLOAD_ENFORCEMENT_JSON" in rendered  # empty roster, present
-    env = _environment_with(template, "WORKLOAD_ENFORCEMENT_JSON")
-    assert env["WORKLOAD_ENFORCEMENT_JSON"] == "{}"
+    # The roster parameter always exists (empty roster) so the broker has
+    # one code path; the old inline env var is gone.
+    assert "WORKLOAD_ENFORCEMENT_JSON" not in rendered
+    assert _resolve_roster(_workload_roster_parameter(template)["Value"]) == {}
+    env = _environment_with(template, "WORKLOAD_ROSTER_PARAMETER_NAME")
+    assert env["WORKLOAD_TAG_KEY"] == "bedrock-spend-controls-workload"
+
+
+def test_workload_roster_parameter_carries_identity_and_broker_reads_it():
+    template = _template(_WORKLOADS_CONTEXT)
+    parameter = _workload_roster_parameter(template)
+    # Intelligent tiering: a large roster is promoted past the 4 KB
+    # standard-parameter cap instead of failing the deploy.
+    assert parameter["Tier"] == "Intelligent-Tiering"
+    roster = _resolve_roster(parameter["Value"])
+    assert set(roster) == {"workload:payments", "workload:reports"}
+    payments = roster["workload:payments"]
+    assert payments["name"] == "payments"
+    assert payments["model"] == "us.anthropic.claude-opus-4-7"
+    assert payments["role_arn"] == "arn:aws:iam::111122223333:role/payments-app"
+    assert payments["enforcement_ready"] is True
+    # The profile ARN is the deploy-time attribute of the profile resource.
+    assert payments["profile_arn"] == (
+        "WorkloadProfilePayments/InferenceProfileArn"
+    )
+    reports = roster["workload:reports"]
+    assert reports["role_arn"] == ""
+    assert reports["enforcement_ready"] is False
+    # The broker is pointed at the parameter and may read it.
+    broker_env = _environment_with(template, "WORKLOAD_ROSTER_PARAMETER_NAME")
+    assert broker_env["WORKLOAD_ROSTER_PARAMETER_NAME"] == {
+        "Ref": next(
+            logical_id
+            for logical_id in template.find_resources("AWS::SSM::Parameter")
+            if logical_id.startswith("WorkloadRosterParameter")
+        )
+    }
+    policies = json.dumps(template.find_resources("AWS::IAM::Policy"))
+    assert "ssm:GetParameter" in policies
 
 
 def test_workloads_create_profiles_with_tags_and_correct_model_sources():
@@ -1254,8 +1566,8 @@ def test_snippet_workload_emits_policy_output_and_not_ready_flag():
     assert any(
         key.startswith("WorkloadProfileArnPayments") for key in outputs
     )
-    env = _environment_with(template, "WORKLOAD_ENFORCEMENT_JSON")
-    roster = json.loads(env["WORKLOAD_ENFORCEMENT_JSON"])
+    # enforcement_ready is derived from role_arn presence at synth time.
+    roster = _resolve_roster(_workload_roster_parameter(template)["Value"])
     assert roster["workload:payments"]["enforcement_ready"] is True
     assert roster["workload:reports"]["enforcement_ready"] is False
 
@@ -1533,3 +1845,149 @@ def test_admin_ui_byo_issuer_defaults_spa_client_to_the_shared_audience():
     )
     # Same client for data plane and UI: no duplicate audience entry.
     assert broker["JWT_AUDIENCE"] == "shared-client"
+
+
+def test_reconciliation_is_off_by_default_and_leaves_no_trace():
+    template = _template({"manage_invocation_logging": True})
+    rendered = json.dumps(template.to_json())
+    assert "SpendReconciliationFn" not in rendered
+    assert "SpendReconciliationDeltaAlarm" not in rendered
+    assert "SpendReconciliationSchedule" not in rendered
+    assert "ce:GetCostAndUsage" not in rendered
+    assert "ReconciliationDeltaPercent" not in rendered  # no dashboard widget
+    broker_env = _environment_with(template, "BEDROCK_USER_ROLE_ARN")
+    assert broker_env["RECONCILIATION_ENABLED"] == "false"
+    assert "RECONCILE_LAG_DAYS" not in broker_env
+    assert "reconciliation_delta" not in json.dumps(
+        broker_env["OPERATIONS_ALARM_NAMES_JSON"]
+    )
+
+
+def test_reconciliation_enabled_wires_lambda_schedule_alarm_and_least_privilege():
+    template = _template(
+        {
+            **_WORKLOADS_CONTEXT,
+            "reconciliation_enabled": True,
+            "reconcile_lag_days": 3,
+            "reconciliation_alarm_percent": 12.5,
+        }
+    )
+    functions = template.find_resources("AWS::Lambda::Function")
+    name, reconciler = next(
+        (name, resource["Properties"])
+        for name, resource in functions.items()
+        if name.startswith("SpendReconciliationFn")
+    )
+    env = reconciler["Environment"]["Variables"]
+    assert reconciler["Handler"] == "handler.handler"
+    assert env["RECONCILE_LAG_DAYS"] == "3"
+    assert env["USAGE_RETENTION_DAYS"] == "35"
+    assert env["WORKLOAD_TAG_KEY"] == "bedrock-spend-controls-workload"
+    assert env["METRICS_NAMESPACE"] == "BedrockSpendControls"
+    assert "RECONCILE_REGION" in env and "USAGE_TABLE" in env
+    # Same workload roster the processor and enforcer see, so per-workload
+    # comparisons use the tag values the stack actually stamped.
+    assert "payments" in json.dumps(env["WORKLOADS_JSON"])
+    assert "reports" in json.dumps(env["WORKLOADS_JSON"])
+
+    # Once a day, after Cost Explorer's refresh.
+    schedule = next(
+        resource["Properties"]
+        for resource in template.find_resources("AWS::Events::Rule").values()
+        if resource["Properties"].get("ScheduleExpression") == "cron(0 6 * * ? *)"
+    )
+    assert json.dumps(schedule["Targets"][0]["Arn"]).count(name) == 1
+
+    # IAM: Cost Explorer read only (no other ce:* verb), usage table access,
+    # SNS publish. Nothing on the users / audit tables.
+    policies = template.find_resources("AWS::IAM::Policy")
+    reconciler_role_ref = reconciler["Role"]["Fn::GetAtt"][0]
+    reconciler_policy = next(
+        resource["Properties"]["PolicyDocument"]
+        for resource in policies.values()
+        if any(
+            isinstance(role, dict) and role.get("Ref") == reconciler_role_ref
+            for role in resource["Properties"]["Roles"]
+        )
+    )
+    ce_actions = [
+        action
+        for statement in reconciler_policy["Statement"]
+        for action in (
+            statement["Action"]
+            if isinstance(statement["Action"], list)
+            else [statement["Action"]]
+        )
+        if str(action).startswith("ce:")
+    ]
+    assert ce_actions == ["ce:GetCostAndUsage"]
+    policy_text = json.dumps(reconciler_policy)
+    assert "UsageTable" in policy_text
+    assert "UsersTable" not in policy_text
+    assert "AdminAuditTable" not in policy_text
+    assert "sns:Publish" in policy_text
+
+    # Alarm: two consecutive daily breaches over the configured percent.
+    template.has_resource_properties(
+        "AWS::CloudWatch::Alarm",
+        {
+            "MetricName": "ReconciliationDeltaPercent",
+            "Namespace": "BedrockSpendControls",
+            "Statistic": "Maximum",
+            "Period": 86_400,
+            "Threshold": 12.5,
+            "EvaluationPeriods": 2,
+            "ComparisonOperator": "GreaterThanThreshold",
+            "TreatMissingData": "notBreaching",
+        },
+    )
+    broker_env = _environment_with(template, "BEDROCK_USER_ROLE_ARN")
+    assert broker_env["RECONCILIATION_ENABLED"] == "true"
+    assert broker_env["RECONCILE_LAG_DAYS"] == "3"
+    assert "reconciliation_delta" in json.dumps(
+        broker_env["OPERATIONS_ALARM_NAMES_JSON"]
+    )
+    # Dashboard widget shows estimated vs billed with the delta on the right.
+    dashboard = next(
+        iter(template.find_resources("AWS::CloudWatch::Dashboard").values())
+    )["Properties"]["DashboardBody"]
+    dashboard_text = json.dumps(dashboard)
+    assert "ReconciliationEstimatedUSD" in dashboard_text
+    assert "ReconciliationBilledUSD" in dashboard_text
+    assert "ReconciliationDeltaPercent" in dashboard_text
+
+
+
+def test_lambda_environments_stay_under_the_4kb_service_limit():
+    """Lambda rejects UpdateFunctionConfiguration when the environment
+    exceeds 4 KB (seen in production as HTTP 413 once the resolved price
+    snapshot grew cache/image dimensions). Resolve every token to a
+    pessimistic literal (Ref -> 80-char name, GetAtt/Sub -> 128-char ARN)
+    and keep 10% headroom. Real deployed sizes are lower (the broker is
+    ~2.2 KB); the point is to fail synth, not deploy, when a JSON blob is
+    added to an environment."""
+    template = _template(
+        {
+            **_WORKLOADS_CONTEXT,
+            "reconciliation_enabled": True,
+        }
+    )
+
+    def literal_size(value) -> int:
+        if isinstance(value, str):
+            return len(value)
+        if isinstance(value, dict):
+            if "Fn::Join" in value:
+                return sum(literal_size(part) for part in value["Fn::Join"][1])
+            # Ref resolves to a generated name; GetAtt / Sub usually to an ARN.
+            return 80 if "Ref" in value else 128
+        if isinstance(value, list):
+            return sum(literal_size(part) for part in value)
+        return len(str(value))
+
+    budget = int(4096 * 0.9)
+    for name, resource in template.find_resources("AWS::Lambda::Function").items():
+        env = resource["Properties"].get("Environment", {}).get("Variables", {})
+        size = sum(len(key) + literal_size(value) for key, value in env.items())
+        assert size <= budget, f"{name} environment ~{size} bytes exceeds {budget}-byte budget"
+

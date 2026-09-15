@@ -7,6 +7,7 @@ import {
   Database,
   OctagonX,
   RefreshCw,
+  Scale,
   ShieldAlert,
   ShieldCheck,
   SlidersHorizontal,
@@ -21,7 +22,9 @@ import {
   type EmergencyAction,
   type EnforcementConfig,
   type Operations,
+  type ReconciliationResponse,
 } from "./api";
+import { formatDecimal, formatNumber, formatSignedPercent, formatUsd } from "./format";
 import { useModalLifecycle } from "./modal";
 import { LiveLeases } from "./OperationalUi";
 
@@ -49,7 +52,7 @@ function formatDuration(seconds: number): string {
 
 function formatMilliseconds(value: number | null): string {
   if (value === null) return "No data";
-  return value >= 1000 ? `${(value / 1000).toFixed(2)}s` : `${Math.round(value)}ms`;
+  return value >= 1000 ? `${formatDecimal(value / 1000)}s` : `${Math.round(value)}ms`;
 }
 
 function formatTimestamp(value: string | null): string {
@@ -92,19 +95,21 @@ function SuccessMessage({ message, dismiss }: { message: string; dismiss: () => 
 
 function OperationsCard({
   children,
+  className,
   icon,
   status,
   title,
   tone,
 }: {
   children: React.ReactNode;
+  className?: string;
   icon: React.ReactNode;
   status: string;
   title: string;
   tone: string;
 }) {
   return (
-    <article className="operations-card">
+    <article className={className ? `operations-card ${className}` : "operations-card"}>
       <div className="operations-card-heading">
         <div className="operations-card-title">{icon}<strong>{title}</strong></div>
         <span className={`ops-status ops-status-${tone}`}><span aria-hidden="true" />{status}</span>
@@ -116,6 +121,110 @@ function OperationsCard({
 
 function OperationsRow({ label, value }: { label: string; value: string }) {
   return <div><dt>{label}</dt><dd title={value}>{value}</dd></div>;
+}
+
+
+export function reconciliationTone(
+  response: ReconciliationResponse | null,
+  alarmPercent: number | null,
+): string {
+  if (!response || !response.enabled) return "gray";
+  const latest = response.latest ?? response.runs[0] ?? null;
+  if (!latest) return "gray";
+  if (latest.tag_inactive_workloads.length > 0) return "amber";
+  const percent = latest.aggregate.delta_percent;
+  if (percent === null) return "gray";
+  if (alarmPercent !== null && Math.abs(percent) > alarmPercent) return "red";
+  return "green";
+}
+
+// Daily ledger-vs-Cost-Explorer comparison. Reads the stored RECONCILE# rows
+// through GET /admin/reconciliation; the broker never calls Cost Explorer on
+// a page load. Disabled deployments get an explicit "off" card rather than a
+// zero delta that could be mistaken for a clean bill.
+export function SpendReconciliationCard({
+  cfg,
+  session,
+  alarmState,
+  refreshKey,
+}: {
+  cfg: AdminConfig;
+  session: Session;
+  alarmState: string | null;
+  refreshKey?: string;
+}) {
+  const [response, setResponse] = useState<ReconciliationResponse | null>(null);
+  const [loadError, setLoadError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoadError("");
+    api.reconciliation(cfg, session, 14)
+      .then((next) => { if (!cancelled) setResponse(next); })
+      .catch((caught) => { if (!cancelled) setLoadError(apiErrorMessage(caught)); });
+    return () => { cancelled = true; };
+  }, [cfg, session, refreshKey]);
+
+  const icon = <Scale aria-hidden="true" size={19} />;
+  if (loadError) {
+    return (
+      <OperationsCard className="operations-card-wide" icon={icon} status="Unavailable" title="Spend reconciliation" tone="gray">
+        <OperationsRow label="Error" value={loadError} />
+      </OperationsCard>
+    );
+  }
+  if (!response) {
+    return (
+      <OperationsCard className="operations-card-wide" icon={icon} status="Loading" title="Spend reconciliation" tone="gray">
+        <OperationsRow label="Ledger vs bill" value="Loading…" />
+      </OperationsCard>
+    );
+  }
+  if (!response.enabled) {
+    return (
+      <OperationsCard className="operations-card-wide" icon={icon} status="Disabled" title="Spend reconciliation" tone="gray">
+        <OperationsRow label="Ledger vs bill" value="Not compared" />
+        <OperationsRow label="Enable" value="reconciliation_enabled=true in the deployment config" />
+      </OperationsCard>
+    );
+  }
+  const latest = response.latest ?? response.runs[0] ?? null;
+  const tone = alarmState === "ALARM" ? "red" : reconciliationTone(response, null);
+  if (!latest) {
+    return (
+      <OperationsCard className="operations-card-wide" icon={icon} status="No runs yet" title="Spend reconciliation" tone="gray">
+        <OperationsRow label="Schedule" value={`Daily 06:00 UTC · compares day D-${response.lag_days ?? "?"}`} />
+        <OperationsRow label="Ledger vs bill" value="No run stored yet" />
+      </OperationsCard>
+    );
+  }
+  const status = latest.tag_inactive_workloads.length > 0
+    ? "Tag inactive"
+    : alarmState === "ALARM"
+      ? "Drift"
+      : latest.aggregate.delta_percent === null
+        ? "No activity"
+        : "Compared";
+  return (
+    <OperationsCard className="operations-card-wide" icon={icon} status={status} title="Spend reconciliation" tone={tone}>
+      <OperationsRow label="Reconciled day" value={`${latest.day} (D-${response.lag_days ?? "?"})`} />
+      <OperationsRow label="Ledger estimate" value={formatUsd(latest.aggregate.estimated_usd)} />
+      <OperationsRow label="Cost Explorer" value={formatUsd(latest.aggregate.billed_usd)} />
+      <OperationsRow
+        label="Delta (bill − ledger)"
+        value={`${formatUsd(latest.aggregate.delta_usd)} · ${formatSignedPercent(latest.aggregate.delta_percent)}`}
+      />
+      <OperationsRow
+        label="Workloads"
+        value={latest.workloads.length === 0
+          ? "None configured"
+          : latest.tag_inactive_workloads.length > 0
+            ? `Cost-allocation tag inactive: ${latest.tag_inactive_workloads.join(", ")}`
+            : latest.workloads.map((workload) => `${workload.name} ${formatSignedPercent(workload.delta_percent)}`).join(" · ")}
+      />
+      <OperationsRow label="Runs stored" value={`${response.runs.length} · last ${formatTimestamp(latest.run_at)}`} />
+    </OperationsCard>
+  );
 }
 
 // Runtime enforcement dial: reads GET /admin/enforcement (allowed values come
@@ -322,11 +431,13 @@ export function EmergencyStopCard({
   session,
   emergency,
   onApplied,
+  qualification,
 }: {
   cfg: AdminConfig;
   session: Session;
   emergency: Operations["emergency"] | null;
   onApplied: () => void;
+  qualification?: string;
 }) {
   const [dialogAction, setDialogAction] = useState<EmergencyAction | null>(null);
   const [notice, setNotice] = useState("");
@@ -352,6 +463,8 @@ export function EmergencyStopCard({
       {emergency && (
         <dl className="control-meta">
           <div><dt>Converged</dt><dd>{emergency.converged ? "Yes" : "No"}</dd></div>
+          <div><dt>Generation</dt><dd>{emergency.applied_generation} / {emergency.generation}</dd></div>
+          {qualification && <div><dt>Qualification</dt><dd>{formatOperationalLabel(qualification)}</dd></div>}
           <div><dt>Requested</dt><dd>{formatTimestamp(emergency.requested_at)}</dd></div>
           <div><dt>Applied</dt><dd>{formatTimestamp(emergency.applied_at)}</dd></div>
         </dl>
@@ -537,7 +650,7 @@ export function OperationsView({
   const controls = (
     <div className="control-grid" aria-label="Enforcement controls">
       <EnforcementDialCard cfg={cfg} onApplied={onChanged} refreshKey={operations?.as_of} session={session} />
-      <EmergencyStopCard cfg={cfg} emergency={operations?.emergency ?? null} onApplied={onChanged} session={session} />
+      <EmergencyStopCard cfg={cfg} emergency={operations?.emergency ?? null} onApplied={onChanged} qualification={operations?.qualification.emergency_status} session={session} />
     </div>
   );
 
@@ -557,7 +670,6 @@ export function OperationsView({
   }
 
   const config = operations.configuration;
-  const emergency = operations.emergency;
   const metrics = operations.metrics;
   const qualificationTone = stale
     ? "gray"
@@ -566,18 +678,6 @@ export function OperationsView({
       : operations.qualification.status.includes("pending") || operations.qualification.status.includes("experimental")
         ? "amber"
         : "gray";
-  const emergencyQualificationPending =
-    operations.qualification.emergency_status.includes("pending") ||
-    operations.qualification.emergency_status.includes("unknown");
-  const emergencyTone = emergency.state === "active"
-    ? "red"
-    : stale
-      ? "gray"
-      : emergencyQualificationPending
-        ? "amber"
-        : emergency.state === "inactive" && emergency.converged
-          ? "green"
-          : "amber";
   const reconciliationTone = stale
     ? "gray"
     : metrics.reconciliation_status === "current"
@@ -598,7 +698,7 @@ export function OperationsView({
       <div className="panel-heading operations-heading">
         <div>
           <h2 id="operations-title">Operations</h2>
-          <p>Runtime enforcement controls, reconciliation freshness, alarms, and qualification gates.</p>
+          <p>Runtime controls, live leases, component health, and alarms.</p>
         </div>
         <div className="operations-heading-meta">
           <span className={`ops-status ops-status-${stale ? "amber" : "gray"}`}>
@@ -628,26 +728,13 @@ export function OperationsView({
         </OperationsCard>
 
         <OperationsCard
-          icon={<ShieldAlert aria-hidden="true" size={19} />}
-          title="Emergency stop"
-          status={formatOperationalLabel(emergency.state)}
-          tone={emergencyTone}
-        >
-          <OperationsRow label="Converged" value={emergency.converged ? "Yes" : "No"} />
-          <OperationsRow label="Qualification" value={formatOperationalLabel(operations.qualification.emergency_status)} />
-          <OperationsRow label="Generation" value={`${emergency.applied_generation} / ${emergency.generation}`} />
-          <OperationsRow label="Requested" value={formatTimestamp(emergency.requested_at)} />
-          <OperationsRow label="Applied" value={formatTimestamp(emergency.applied_at)} />
-        </OperationsCard>
-
-        <OperationsCard
           icon={<Database aria-hidden="true" size={19} />}
           title="Revocation"
           status={config.revocation_enabled ? formatOperationalLabel(metrics.reconciliation_status) : "Not applicable"}
           tone={reconciliationTone}
         >
-          <OperationsRow label="Policy capacity" value={config.revocation_enabled ? `${config.revocation_policy_shards} × ${config.revocation_policy_max_characters.toLocaleString()} chars` : "Not deployed"} />
-          <OperationsRow label="Desired identities" value={metrics.revoked_identities_desired === null ? "No data" : metrics.revoked_identities_desired.toLocaleString()} />
+          <OperationsRow label="Policy capacity" value={config.revocation_enabled ? `${config.revocation_policy_shards} × ${formatNumber(config.revocation_policy_max_characters)} chars` : "Not deployed"} />
+          <OperationsRow label="Desired identities" value={metrics.revoked_identities_desired === null ? "No data" : formatNumber(metrics.revoked_identities_desired)} />
           <OperationsRow label="Last reconciliation" value={formatTimestamp(metrics.last_reconciliation_at)} />
           <OperationsRow label="Recent failures / overflow" value={`${metrics.recent_sync_failure_count ?? "No data"} / ${metrics.recent_overflow_count ?? "No data"}`} />
         </OperationsCard>
@@ -662,8 +749,15 @@ export function OperationsView({
           <OperationsRow label="Evidence" value={formatOperationalLabel(metrics.telemetry_status)} />
           <OperationsRow label="Metric sample" value={formatTimestamp(metrics.detection_lag_timestamp)} />
           <OperationsRow label="Metric namespace" value={metrics.namespace} />
-          <OperationsRow label="Emergency failures" value={metrics.recent_emergency_failure_count === null ? "No data" : metrics.recent_emergency_failure_count.toLocaleString()} />
+          <OperationsRow label="Emergency failures" value={metrics.recent_emergency_failure_count === null ? "No data" : formatNumber(metrics.recent_emergency_failure_count)} />
         </OperationsCard>
+
+        <SpendReconciliationCard
+          alarmState={operations.alarms.find((alarm) => alarm.key === "reconciliation_delta")?.state ?? null}
+          cfg={cfg}
+          refreshKey={operations.as_of}
+          session={session}
+        />
       </div>
 
       <div className="alarm-strip" aria-label="Operational alarms">

@@ -19,15 +19,30 @@ import boto3
 from boto3.dynamodb.types import TypeSerializer
 from botocore.exceptions import ClientError
 from bedrock_spend_controls.quota_periods import (
+    MODEL_BUDGETS_ATTRIBUTE,
     PERIODS,
+    RATE_DIMENSIONS,
     QuotaEvaluation,
     aggregate_daily_rows,
     calendar_window,
     calendar_windows,
+    default_thresholds,
     evaluate_limits,
-    limits_from_item,
+    evaluate_model_budgets,
+    limit_attributes as _layer_limit_attributes,
+    limits_from_item as _layer_limits_from_item,
+    merge_evaluations,
+    model_budget_attributes as _layer_model_budget_attributes,
+    model_budgets_from_item as _layer_model_budgets_from_item,
+    model_ledger_subject,
     period_for_start,
     quota_reason,
+    rate_limits_enabled,
+    rate_limits_from_item,
+    rate_row_key,
+    rate_usage_from_item,
+    thresholds_from_storage,
+    validate_model_id,
 )
 
 from .config import settings
@@ -42,6 +57,8 @@ RESERVED_USER_ID_PREFIXES = (
     "REVOCATION#",
     "CONFIG#",
     "EMERGENCY_AUDIT#",
+    "RATE#",
+    "RECONCILE#",
 )
 
 # Public namespace for workload-mode quota subjects (apps calling
@@ -73,11 +90,26 @@ def _usd_to_micro(daily_usd: float) -> int:
     return micro
 
 
-def configured_default_limits() -> dict[str, dict[str, float | int] | None]:
+def deployment_default_thresholds() -> list[dict]:
+    """The thresholds list that rows without one resolve to.
+
+    Built from the deployment ``warn_threshold`` so a pre-thresholds row
+    keeps exactly its previous warn-once-then-block-at-100 % behaviour.
+    """
+    return default_thresholds(settings.warn_threshold)
+
+
+def limits_from_item(item: dict) -> dict[str, dict | None]:
+    return _layer_limits_from_item(
+        item, default_thresholds_list=deployment_default_thresholds()
+    )
+
+
+def configured_default_limits() -> dict[str, dict | None]:
     raw = json.loads(settings.default_limits_json)
     if not isinstance(raw, dict):
         raise ValueError("DEFAULT_LIMITS_JSON must contain an object")
-    result: dict[str, dict[str, float | int] | None] = {}
+    result: dict[str, dict | None] = {}
     for period in PERIODS:
         value = raw.get(period)
         if value is None:
@@ -85,35 +117,40 @@ def configured_default_limits() -> dict[str, dict[str, float | int] | None]:
             continue
         if not isinstance(value, dict):
             raise ValueError(f"DEFAULT_LIMITS_JSON.{period} must be an object")
-        result[period] = {
+        entry: dict = {
             "usd": float(value.get("usd", 0)),
             "input_tokens": int(value.get("input_tokens", 0)),
             "output_tokens": int(value.get("output_tokens", 0)),
         }
+        if value.get("thresholds") is not None:
+            entry["thresholds"] = value["thresholds"]
+        result[period] = entry
     if result["daily"] is None:
         raise ValueError("DEFAULT_LIMITS_JSON.daily must be enabled")
+    rate = raw.get("rate")
+    if rate is not None:
+        result["rate"] = {
+            dimension: int(rate.get(dimension, 0)) for dimension in RATE_DIMENSIONS
+        }
     return result
 
 
-def _limit_attributes(
-    limits: dict[str, dict[str, float | int] | None],
-) -> dict[str, object]:
-    attributes: dict[str, object] = {}
-    for period, value in limits.items():
-        if period not in PERIODS:
-            raise ValueError(f"unsupported quota period: {period}")
-        enabled = value is not None
-        attributes[f"{period}_limits_enabled"] = enabled
-        attributes[f"{period}_usd_micro"] = (
-            _usd_to_micro(float(value.get("usd", 0))) if value else 0
-        )
-        attributes[f"{period}_input_tokens"] = (
-            int(value.get("input_tokens", 0)) if value else 0
-        )
-        attributes[f"{period}_output_tokens"] = (
-            int(value.get("output_tokens", 0)) if value else 0
-        )
-    return attributes
+def _limit_attributes(limits: dict[str, dict | None]) -> dict[str, object]:
+    return _layer_limit_attributes(
+        limits, default_thresholds_list=deployment_default_thresholds()
+    )
+
+
+def model_budgets_from_item(item: dict) -> dict[str, dict[str, dict | None]]:
+    return _layer_model_budgets_from_item(
+        item, default_thresholds_list=deployment_default_thresholds()
+    )
+
+
+def model_budget_attributes(limits: dict) -> dict[str, object]:
+    return _layer_model_budget_attributes(
+        limits, default_thresholds_list=deployment_default_thresholds()
+    )
 
 
 def current_window(now: datetime | None = None) -> str:
@@ -154,24 +191,51 @@ class UserRecord:
     lease_refresh_after_epoch: int | None = None
     lease_generation: int | None = None
     lease_duration_seconds: int | None = None
+    # Per-period thresholds in storage form ([{at_bps, action}]); None when
+    # the row predates thresholds and resolves to the deployment default.
+    daily_thresholds: tuple[dict, ...] | None = None
+    weekly_thresholds: tuple[dict, ...] | None = None
+    monthly_thresholds: tuple[dict, ...] | None = None
+    # Subject-level rate limits; 0 = unlimited.
+    rpm: int = 0
+    tpm: int = 0
+    # Model-scoped budgets in storage form: {model_id: {<period attrs>}}.
+    # Evaluated against per-model daily ledger rows; any block breach blocks
+    # the whole subject (enforcement is subject-wide).
+    model_budgets: dict[str, dict] | None = None
 
     @property
-    def period_limits(self) -> dict[str, dict[str, int] | None]:
-        return limits_from_item(
-            {
-                "daily_limits_enabled": self.daily_limits_enabled,
-                "daily_usd_micro": self.daily_usd_micro,
-                "daily_input_tokens": self.daily_input_tokens,
-                "daily_output_tokens": self.daily_output_tokens,
-                "weekly_limits_enabled": self.weekly_limits_enabled,
-                "weekly_usd_micro": self.weekly_usd_micro,
-                "weekly_input_tokens": self.weekly_input_tokens,
-                "weekly_output_tokens": self.weekly_output_tokens,
-                "monthly_limits_enabled": self.monthly_limits_enabled,
-                "monthly_usd_micro": self.monthly_usd_micro,
-                "monthly_input_tokens": self.monthly_input_tokens,
-                "monthly_output_tokens": self.monthly_output_tokens,
-            }
+    def period_limits(self) -> dict[str, dict | None]:
+        item: dict[str, object] = {}
+        for period in PERIODS:
+            item[f"{period}_limits_enabled"] = getattr(
+                self, f"{period}_limits_enabled"
+            )
+            item[f"{period}_usd_micro"] = getattr(self, f"{period}_usd_micro")
+            item[f"{period}_input_tokens"] = getattr(
+                self, f"{period}_input_tokens"
+            )
+            item[f"{period}_output_tokens"] = getattr(
+                self, f"{period}_output_tokens"
+            )
+            thresholds = getattr(self, f"{period}_thresholds")
+            if thresholds is not None:
+                item[f"{period}_thresholds"] = list(thresholds)
+        return limits_from_item(item)
+
+    @property
+    def rate_limits(self) -> dict[str, int]:
+        return {"rpm": self.rpm, "tpm": self.tpm}
+
+    @property
+    def rate_limited(self) -> bool:
+        return rate_limits_enabled(self.rate_limits)
+
+    @property
+    def model_budget_limits(self) -> dict[str, dict[str, dict | None]]:
+        """``{model_id: {period: limits | None}}`` ready for evaluation."""
+        return model_budgets_from_item(
+            {MODEL_BUDGETS_ATTRIBUTE: self.model_budgets or {}}
         )
 
     @property
@@ -1018,23 +1082,27 @@ class QuotaStore:
     @staticmethod
     def _user_snapshot(user: UserRecord) -> dict:
         limits = user.period_limits
-        return {
+        snapshot = {
             "user_id": user.user_id,
             "name": user.name,
             "status": user.status,
             "status_reason": user.status_reason,
             "limits": limits,
+            "rate": user.rate_limits,
             "version": user.version,
             "created_at": user.created_at,
             "updated_at": user.updated_at,
             "status_origin": user.status_origin,
         }
+        if user.model_budgets:
+            snapshot["model_budgets"] = user.model_budget_limits
+        return snapshot
 
     @staticmethod
     def _snapshot_to_user(snapshot: dict) -> UserRecord:
         limits = snapshot.get("limits", {})
+        limit_item: dict[str, object] = {}
         if "daily" in limits:
-            limit_item: dict[str, object] = {}
             for period in PERIODS:
                 value = limits.get(period)
                 limit_item[f"{period}_limits_enabled"] = value is not None
@@ -1047,6 +1115,8 @@ class QuotaStore:
                 limit_item[f"{period}_output_tokens"] = (
                     int(value.get("output_tokens", 0)) if value else 0
                 )
+                if value and value.get("thresholds") is not None:
+                    limit_item[f"{period}_thresholds"] = value["thresholds"]
         else:
             # Audit/idempotency rows created before period limits existed.
             limit_item = {
@@ -1061,46 +1131,46 @@ class QuotaStore:
                 "weekly_limits_enabled": False,
                 "monthly_limits_enabled": False,
             }
-        return UserRecord(
-            user_id=str(snapshot["user_id"]),
-            name=str(snapshot.get("name", "")),
-            status=str(snapshot.get("status", "active")),
-            status_reason=str(snapshot.get("status_reason", "")),
-            daily_usd_micro=int(limit_item.get("daily_usd_micro", 0)),
-            daily_input_tokens=int(
-                limit_item.get("daily_input_tokens", 0)
-            ),
-            daily_output_tokens=int(
-                limit_item.get("daily_output_tokens", 0)
-            ),
-            daily_limits_enabled=bool(
-                limit_item.get("daily_limits_enabled", True)
-            ),
-            weekly_usd_micro=int(limit_item.get("weekly_usd_micro", 0)),
-            weekly_input_tokens=int(
-                limit_item.get("weekly_input_tokens", 0)
-            ),
-            weekly_output_tokens=int(
-                limit_item.get("weekly_output_tokens", 0)
-            ),
-            weekly_limits_enabled=bool(
-                limit_item.get("weekly_limits_enabled", False)
-            ),
-            monthly_usd_micro=int(limit_item.get("monthly_usd_micro", 0)),
-            monthly_input_tokens=int(
-                limit_item.get("monthly_input_tokens", 0)
-            ),
-            monthly_output_tokens=int(
-                limit_item.get("monthly_output_tokens", 0)
-            ),
-            monthly_limits_enabled=bool(
-                limit_item.get("monthly_limits_enabled", False)
-            ),
-            version=int(snapshot.get("version", 0)),
-            created_at=snapshot.get("created_at"),
-            updated_at=snapshot.get("updated_at"),
-            status_origin=str(snapshot.get("status_origin", "legacy")),
-        )
+        rate = snapshot.get("rate") or {}
+        item: dict = {
+            "user_id": str(snapshot["user_id"]),
+            "name": str(snapshot.get("name", "")),
+            "status": str(snapshot.get("status", "active")),
+            "status_reason": str(snapshot.get("status_reason", "")),
+            **limit_item,
+            **{
+                dimension: int(rate.get(dimension, 0) or 0)
+                for dimension in RATE_DIMENSIONS
+            },
+            "version": int(snapshot.get("version", 0)),
+            "created_at": snapshot.get("created_at"),
+            "updated_at": snapshot.get("updated_at"),
+            "status_origin": str(snapshot.get("status_origin", "legacy")),
+        }
+        model_budgets = snapshot.get("model_budgets")
+        if isinstance(model_budgets, dict) and model_budgets:
+            # Snapshot form is {model: {period: limits|None}}; rebuild the
+            # flattened storage map so _to_user reads it like a live row.
+            item[MODEL_BUDGETS_ATTRIBUTE] = {}
+            for model_id, periods in model_budgets.items():
+                attributes: dict[str, object] = {}
+                for period in PERIODS:
+                    value = (periods or {}).get(period)
+                    attributes[f"{period}_limits_enabled"] = value is not None
+                    attributes[f"{period}_usd_micro"] = (
+                        int(value.get("usd_micro", 0)) if value else 0
+                    )
+                    attributes[f"{period}_input_tokens"] = (
+                        int(value.get("input_tokens", 0)) if value else 0
+                    )
+                    attributes[f"{period}_output_tokens"] = (
+                        int(value.get("output_tokens", 0)) if value else 0
+                    )
+                    attributes[f"{period}_thresholds"] = (
+                        list(value.get("thresholds") or []) if value else []
+                    )
+                item[MODEL_BUDGETS_ATTRIBUTE][str(model_id)] = attributes
+        return QuotaStore._to_user(item)
 
     def _idempotency_result(
         self, idempotency_key: str, request_hash: str
@@ -1396,6 +1466,172 @@ class QuotaStore:
             raise
         return AdminMutationResult(user=updated)
 
+    def update_admin_model_budget(
+        self,
+        user_id: str,
+        model_id: str,
+        limits: dict | None,
+        *,
+        reason: str,
+        expected_version: int,
+        actor: str,
+        auth_method: str,
+        idempotency_key: str,
+        request_hash: str,
+        reconciled_status: tuple[str, str, str] | None = None,
+        now: datetime | None = None,
+    ) -> AdminMutationResult:
+        """Set (``limits``) or remove (``limits is None``) one model budget.
+
+        Same versioned, idempotent, audited transaction as
+        ``update_admin_limits``: the users row's ``model_budgets`` map is
+        replaced wholesale under the observed version (DynamoDB map
+        attributes are written atomically), the routine audit event carries
+        before/after snapshots including every model budget, and an
+        optional reconciled status transition rides in the same write.
+        """
+        model_id = validate_model_id(model_id)
+        replay = self._idempotency_result(idempotency_key, request_hash)
+        if replay is not None:
+            return replay
+        current_item = self._get_user_item(user_id)
+        if current_item is None:
+            raise KeyError(user_id)
+        current = self._to_user(current_item)
+        now = now or datetime.now(timezone.utc)
+        budgets = dict(current.model_budgets or {})
+        if limits is None:
+            if model_id not in budgets:
+                raise KeyError(model_id)
+            budgets.pop(model_id)
+        else:
+            budgets[model_id] = model_budget_attributes(limits)
+        values: dict = {
+            ":expected": expected_version,
+            ":next": expected_version + 1,
+            ":updated": now.isoformat(),
+        }
+        sets = ["#version = :next", "updated_at = :updated"]
+        removes: list[str] = []
+        next_item = dict(current_item)
+        if budgets:
+            values[":budgets"] = budgets
+            sets.append("#budgets = :budgets")
+            next_item[MODEL_BUDGETS_ATTRIBUTE] = budgets
+        else:
+            removes.append("#budgets")
+            next_item.pop(MODEL_BUDGETS_ATTRIBUTE, None)
+        status_changed = False
+        if reconciled_status is not None:
+            desired_status, desired_reason, desired_origin = reconciled_status
+            status_changed = (
+                desired_status != current.status
+                or desired_reason != current.status_reason
+                or desired_origin != current.status_origin
+            )
+            if status_changed:
+                values.update(
+                    {
+                        ":status": desired_status,
+                        ":status_reason": desired_reason,
+                        ":status_origin": desired_origin,
+                    }
+                )
+                sets.extend(
+                    [
+                        "#status = :status",
+                        "status_reason = :status_reason",
+                        "status_origin = :status_origin",
+                        "status_changed_at = :updated",
+                    ]
+                )
+                next_item.update(
+                    {
+                        "status": desired_status,
+                        "status_reason": desired_reason,
+                        "status_origin": desired_origin,
+                        "status_changed_at": now.isoformat(),
+                    }
+                )
+        next_item.update(
+            {"version": expected_version + 1, "updated_at": now.isoformat()}
+        )
+        updated = self._to_user(next_item)
+        names = {"#version": "version", "#budgets": MODEL_BUDGETS_ATTRIBUTE}
+        if status_changed:
+            names["#status"] = "status"
+        update_expression = "SET " + ", ".join(sets)
+        if removes:
+            update_expression += " REMOVE " + ", ".join(removes)
+        transaction = [
+            {
+                "Update": {
+                    "TableName": self._users.name,
+                    "Key": self._serialize({"user_id": user_id}),
+                    "UpdateExpression": update_expression,
+                    "ConditionExpression": self._version_condition(
+                        expected_version
+                    ),
+                    "ExpressionAttributeNames": names,
+                    "ExpressionAttributeValues": self._serialize(values),
+                }
+            },
+        ]
+        if status_changed:
+            transaction.append(
+                {
+                    "Put": {
+                        "TableName": self._users.name,
+                        "Item": self._serialize(
+                            {
+                                "user_id": f"REVOCATION#{user_id}",
+                                "maps_to": user_id,
+                                "desired_status": updated.status,
+                                "source_identity": str(
+                                    current_item.get("source_identity", "")
+                                ),
+                                "updated_at": now.isoformat(),
+                                "expires_at": window_ttl_epoch(now),
+                            }
+                        ),
+                    }
+                }
+            )
+        transaction.extend(
+            self._admin_metadata_items(
+                user=updated,
+                before=current,
+                event_type=(
+                    "user.model_budget.removed"
+                    if limits is None
+                    else "user.model_budget.updated"
+                ),
+                actor=actor,
+                auth_method=auth_method,
+                reason=reason,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                now=now,
+            )
+        )
+        try:
+            self._client.transact_write_items(TransactItems=transaction)
+        except ClientError as exc:
+            if not self._is_conditional_failure(exc):
+                raise
+            replay = self._idempotency_result(
+                idempotency_key, request_hash
+            )
+            if replay is not None:
+                return replay
+            latest = self.get_user(user_id)
+            if latest is None:
+                raise KeyError(user_id) from exc
+            if latest.version != expected_version:
+                raise VersionConflict(latest) from exc
+            raise
+        return AdminMutationResult(user=updated)
+
     def update_admin_status(
         self,
         user_id: str,
@@ -1504,6 +1740,11 @@ class QuotaStore:
 
     @staticmethod
     def _to_user(item: dict) -> UserRecord:
+        def _thresholds(period: str) -> tuple[dict, ...] | None:
+            stored = thresholds_from_storage(item.get(f"{period}_thresholds"))
+            return tuple(stored) if stored is not None else None
+
+        rate = rate_limits_from_item(item)
         return UserRecord(
             user_id=str(item["user_id"]),
             name=str(item.get("name", "")),
@@ -1555,6 +1796,21 @@ class QuotaStore:
                 if item.get("lease_duration_seconds") is not None
                 else None
             ),
+            daily_thresholds=_thresholds("daily"),
+            weekly_thresholds=_thresholds("weekly"),
+            monthly_thresholds=_thresholds("monthly"),
+            rpm=rate["rpm"],
+            tpm=rate["tpm"],
+            model_budgets=(
+                {
+                    str(model_id): dict(attributes)
+                    for model_id, attributes in item[MODEL_BUDGETS_ATTRIBUTE].items()
+                    if isinstance(attributes, dict)
+                }
+                if isinstance(item.get(MODEL_BUDGETS_ATTRIBUTE), dict)
+                and item[MODEL_BUDGETS_ATTRIBUTE]
+                else None
+            ),
         )
 
     def get_window_usage(
@@ -1572,6 +1828,13 @@ class QuotaStore:
             "input_tokens": int(item.get("input_tokens", 0)),
             "output_tokens": int(item.get("output_tokens", 0)),
             "requests": int(item.get("requests", 0)),
+            "cache_read_tokens": int(item.get("cache_read_tokens", 0)),
+            "cache_write_tokens": int(item.get("cache_write_tokens", 0)),
+            "images": int(item.get("images", 0)),
+            "unpriced_requests": int(item.get("unpriced_requests", 0)),
+            "missing_dimensions": sorted(
+                str(value) for value in item.get("missing_dimensions", ())
+            ),
         }
 
     def _daily_usage_rows(
@@ -1638,21 +1901,126 @@ class QuotaStore:
         )
         return aggregate_daily_rows(rows, bounds.start)[period]
 
+    def get_rate_usage(
+        self, user_id: str, now: datetime | None = None
+    ) -> dict[str, object]:
+        """Current-minute request/token counters written by the metering
+        processor. Strongly consistent so a vend right after a burst sees
+        the breach."""
+        item = self._usage.get_item(
+            Key=rate_row_key(user_id, now), ConsistentRead=True
+        ).get("Item")
+        return rate_usage_from_item(item, now)
+
+    def get_model_usage(
+        self, user_id: str, model_id: str, now: datetime | None = None
+    ) -> dict[str, dict[str, object]]:
+        """Current calendar totals for one subject × model ledger."""
+        return self.get_current_usage(model_ledger_subject(user_id, model_id), now)
+
+    def list_reconciliation_runs(self, limit: int = 14) -> list[dict]:
+        """Stored daily reconciliation results, newest first.
+
+        The reconciliation Lambda writes one ``RECONCILE#<day>`` row per run
+        into the usage table (see reconciliation_processor/handler.py for why
+        that table). The broker never calls Cost Explorer itself; it only
+        reads these rows so the Operations page stays free of CE charges.
+        """
+        from boto3.dynamodb.conditions import Key
+
+        prefix = "RECONCILE#"
+        kwargs: dict = {
+            "FilterExpression": Key("user_id").begins_with(prefix),
+        }
+        items: list[dict] = []
+        while True:
+            response = self._usage.scan(**kwargs)
+            items.extend(response.get("Items", []))
+            last = response.get("LastEvaluatedKey")
+            if not last:
+                break
+            kwargs["ExclusiveStartKey"] = last
+        items.sort(key=lambda item: str(item.get("window", "")), reverse=True)
+        runs = []
+        for item in items[:limit]:
+            result = self._json_safe(item.get("result", {}))
+            runs.append(
+                {
+                    "day": str(item.get("window", "")),
+                    "run_at": str(item.get("run_at", "")),
+                    **(result if isinstance(result, dict) else {}),
+                }
+            )
+        return runs
+
+    def _model_budget_evaluation(
+        self,
+        user_id: str,
+        budgets: dict[str, dict[str, dict | None]],
+        now: datetime | None = None,
+    ) -> QuotaEvaluation:
+        if not budgets:
+            return evaluate_model_budgets({}, {}, now)
+        usage_by_model = {
+            model_id: self.get_model_usage(user_id, model_id, now)
+            for model_id in budgets
+        }
+        return evaluate_model_budgets(budgets, usage_by_model, now)
+
     def evaluate_user_quota(
         self, user: UserRecord, now: datetime | None = None
     ) -> QuotaEvaluation:
         usage = self.get_current_usage(user.user_id, now)
-        return evaluate_limits(user.period_limits, usage, now)
+        rate_usage = (
+            self.get_rate_usage(user.user_id, now) if user.rate_limited else None
+        )
+        return merge_evaluations(
+            evaluate_limits(
+                user.period_limits,
+                usage,
+                now,
+                rate_limits=user.rate_limits,
+                rate_usage=rate_usage,
+            ),
+            self._model_budget_evaluation(
+                user.user_id, user.model_budget_limits, now
+            ),
+        )
 
     def status_after_limit_change(
         self,
         user: UserRecord,
-        limits: dict[str, dict[str, float | int] | None],
+        limits: dict[str, dict | None],
         now: datetime | None = None,
+        *,
+        model_budgets: dict[str, dict[str, dict | None]] | None = None,
     ) -> tuple[str, str, str]:
-        internal_limits = limits_from_item(_limit_attributes(limits))
-        evaluation = evaluate_limits(
-            internal_limits, self.get_current_usage(user.user_id, now), now
+        attributes = _limit_attributes(limits)
+        internal_limits = limits_from_item(attributes)
+        rate_limits = (
+            rate_limits_from_item(attributes)
+            if "rate" in limits
+            else user.rate_limits
+        )
+        evaluation = merge_evaluations(
+            evaluate_limits(
+                internal_limits,
+                self.get_current_usage(user.user_id, now),
+                now,
+                rate_limits=rate_limits,
+                rate_usage=(
+                    self.get_rate_usage(user.user_id, now)
+                    if rate_limits_enabled(rate_limits)
+                    else None
+                ),
+            ),
+            self._model_budget_evaluation(
+                user.user_id,
+                model_budgets
+                if model_budgets is not None
+                else user.model_budget_limits,
+                now,
+            ),
         )
         automatic = self._automatic_status_owned(user)
         if not user.active and not automatic:
@@ -1736,15 +2104,7 @@ class QuotaStore:
     @staticmethod
     def _is_sentinel(item: dict) -> bool:
         user_id = str(item.get("user_id", ""))
-        return user_id.startswith(
-            (
-                "SESSION#",
-                "VEND#",
-                "REVOCATION#",
-                "CONFIG#",
-                "EMERGENCY_AUDIT#",
-            )
-        )
+        return user_id.startswith(RESERVED_USER_ID_PREFIXES)
 
     def list_users(self) -> list[UserRecord]:
         users: list[UserRecord] = []
