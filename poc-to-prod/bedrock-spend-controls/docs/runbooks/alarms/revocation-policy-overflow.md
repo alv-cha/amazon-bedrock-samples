@@ -89,4 +89,4 @@ newly blocked identity with no IAM cut.
 
 - [revocation-sync-failure.md](revocation-sync-failure.md)
 - Component: [components/revocation-processor.md](../components/revocation-processor.md)
-- Threat model: T-13 (shard overflow as an enforcement-degradation vector) in [../threat-model.md](../../threat-model.md)
+- Threat model: T-17 (shard overflow as an enforcement-degradation vector) in [../threat-model.md](../../threat-model.md)

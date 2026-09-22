@@ -250,8 +250,9 @@ def scheduled_handler(event, _context, *, pricing_client=None, ssm_client=None):
     without a redeploy. The metering Lambda keeps the last good parameter
     value (and the deployment-time env snapshot before the first read), so
     a failed refresh (this function raising) leaves the previous value in
-    place and alarms via the Lambda error metric instead of silently
-    mispricing.
+    place and surfaces through this function's Lambda ``Errors`` metric
+    instead of silently mispricing. The stack does not alarm on that metric
+    by default; see docs/runbooks/components/pricing-resolver.md.
     """
     parameter_name = os.environ["PRICES_PARAMETER_NAME"]
     pricing = pricing_client or boto3.client(

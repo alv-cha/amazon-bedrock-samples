@@ -1,15 +1,34 @@
 """CDK stack for Bedrock Spend Controls: runtime-only Amazon Bedrock quotas.
 
 Resources:
-- DynamoDB: users table (limits/status per JWT subject), usage table (TTL)
-- Broker/admin Lambda: FastAPI behind an AWS_IAM Lambda Function URL
-- Short-lived STS role restricted to configured bedrock-runtime model ARNs
+- DynamoDB: users table (limits, status, leases, ``SESSION#``/``REVOCATION#``/
+  ``CONFIG#`` sentinels; streamed), usage table (daily ledger, per-model
+  ledger, ``RATE#`` counters, ``REQUEST#`` idempotency, ``RECONCILE#`` runs;
+  TTL), admin audit table (routine mutation audit + idempotency, 365 days)
+- Broker/admin Lambda: FastAPI behind an AWS_IAM Lambda Function URL, with a
+  shared quota-periods layer
+- ``BedrockUserRole``: short-lived STS role restricted to configured
+  bedrock-runtime model ARNs by inline policy and permissions boundary
+- Layered enforcement, always deployed: permission-lease session policies
+  (runtime dial 60/300/900 s), 19 ``aws:SourceIdentity`` deny shards kept in
+  sync by the revocation processor, and the operator emergency-stop policy
+  driven by the emergency processor; one stream dispatcher fans users-table
+  changes out to the revocation processor and the workload enforcer
+- Workload mode (optional): one application inference profile per workload,
+  invoke policy pinned to that profile, inline IAM Deny enforcement, roster
+  in Parameter Store
+- Metering: CloudWatch Logs subscription on the model-invocation log group
+  into the usage processor, prices resolved at deploy from AWS Price List
+  into a daily-refreshed SSM parameter
+- Nightly auto-block sweeper and optional daily ledger-vs-Cost-Explorer
+  reconciliation
 - JWT identity: bring your own OIDC issuer via ``-c jwt_issuer=...``
   (optionally ``-c jwt_audience=...``), or let the stack create a demo
   Cognito User Pool
-- Admin key in Secrets Manager
-- CloudWatch Logs subscription processor for event-driven metering + SNS
-- CloudWatch dashboard over broker and metering EMF metrics
+- Optional admin UI: S3 + CloudFront static console, Identity Pool
+  federation, OIDC provider for a corporate issuer
+- Routine admin key and break-glass emergency key in Secrets Manager
+- CloudWatch alarms and dashboard, SNS alert topic
 """
 
 import hashlib

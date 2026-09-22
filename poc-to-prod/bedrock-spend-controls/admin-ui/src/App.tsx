@@ -209,7 +209,7 @@ function Login({ cfg, initialError }: { cfg: AdminConfig; initialError: string }
         <div className="login-heading">
           <p className="eyebrow">Administration</p>
           <h1 id="login-title">Sign in to quota controls</h1>
-          <p>Continue to the Cognito managed login for your organization account.</p>
+          <p>Continue to your organization&apos;s sign-in page to authenticate.</p>
         </div>
 
         {error && <ErrorMessage message={error} />}
